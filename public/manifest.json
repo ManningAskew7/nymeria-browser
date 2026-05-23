@@ -1,0 +1,32 @@
+{
+  "manifest_version": 3,
+  "name": "Nymeria Browser",
+  "version": "0.1.0",
+  "description": "Bridges the local browser to the Nymeria personal assistant API.",
+  "permissions": ["storage", "alarms"],
+  "optional_permissions": [],
+  "host_permissions": [],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://localhost/*",
+    "http://127.0.0.1/*"
+  ],
+  "background": {
+    "service_worker": "background.js",
+    "type": "module"
+  },
+  "action": {
+    "default_popup": "src/popup/index.html",
+    "default_title": "Nymeria",
+    "default_icon": {
+      "16": "icon-16.png",
+      "48": "icon-48.png",
+      "128": "icon-128.png"
+    }
+  },
+  "icons": {
+    "16": "icon-16.png",
+    "48": "icon-48.png",
+    "128": "icon-128.png"
+  }
+}
