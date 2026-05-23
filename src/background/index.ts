@@ -1,11 +1,42 @@
 import { backgroundLogger as logger } from '../utils/logger'
 import { clearConfig, ensureClientId, getConfig, setConfig } from '../utils/storage'
 import { HttpError, ping, whoami } from './api'
+import { setDispatchHooks } from './commands'
+import { ingestConsoleEntry } from './commands/console'
 import { ensureConnected, startConnection, stopConnection } from './connection'
-import { getSnapshot, loadFromStorage, resetSnapshot, setStatus } from './state'
+import { activeTabs as activeDebuggerTabs } from './debuggerSession'
+import { clear as clearRefs } from './snapshotRefs'
+import { forgetHook as forgetConsoleHook } from './consoleBuffer'
+import {
+  getSnapshot,
+  loadFromStorage,
+  recordCommand,
+  recordDebuggerTabs,
+  resetSnapshot,
+  setStatus,
+} from './state'
 import type { PopupRequest, PopupResponse } from '../shared/messages'
 
 const HEARTBEAT_NAME = 'nymeria-heartbeat'
+
+setDispatchHooks({
+  onResult: (event) => {
+    void recordCommand(event.command_type)
+    void recordDebuggerTabs(activeDebuggerTabs())
+  },
+})
+
+// When a tab navigates we invalidate per-tab caches: ref IDs are stale and
+// the console-capture hook must be re-injected.
+chrome.webNavigation?.onCommitted.addListener?.((details) => {
+  if (details.frameId !== 0) return
+  clearRefs(details.tabId)
+  forgetConsoleHook(details.tabId)
+})
+chrome.tabs.onRemoved.addListener((tabId) => {
+  clearRefs(tabId)
+  forgetConsoleHook(tabId)
+})
 
 async function bootstrap(): Promise<void> {
   logger.log('bootstrap')
@@ -66,7 +97,19 @@ async function handleForget(): Promise<PopupResponse> {
   return { ok: true }
 }
 
-chrome.runtime.onMessage.addListener((raw, _sender, sendResponse) => {
+chrome.runtime.onMessage.addListener((raw, sender, sendResponse) => {
+  // Console-entry messages come from content-script wrappers (no `kind`
+  // field, custom `kind: 'nymeria-console-entry'`). Handle synchronously
+  // so we don't pretend to return a value.
+  const consoleEntry = raw as { kind?: string; level?: string; text?: string; ts?: number }
+  if (consoleEntry?.kind === 'nymeria-console-entry') {
+    const tabId = sender.tab?.id
+    if (typeof tabId === 'number') {
+      ingestConsoleEntry(tabId, consoleEntry)
+    }
+    return false
+  }
+
   const msg = raw as PopupRequest
   ;(async () => {
     try {

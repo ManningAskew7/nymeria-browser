@@ -1,5 +1,6 @@
 import { backgroundLogger as logger } from '../utils/logger'
-import type { MeResponse } from '../shared/types'
+import { getConfig } from '../utils/storage'
+import type { CommandResult, MeResponse } from '../shared/types'
 
 export class HttpError extends Error {
   readonly status: number
@@ -53,6 +54,38 @@ export async function whoami(args: { baseUrl: string; token: string; clientId: s
     throw new HttpError(resp.status, await resp.text().catch(() => ''))
   }
   return (await resp.json()) as MeResponse
+}
+
+/**
+ * POST the outcome of a browser_command back to the Nymeria API. The
+ * backend resolves the awaiting tool's future and emits a
+ * browser_command_result observability event.
+ *
+ * delivered=false in the response means the agent already moved on (the
+ * command had been resolved by timeout, sweep, or a previous POST).
+ */
+export async function postCommandResult(commandId: string, result: CommandResult): Promise<{ delivered: boolean }> {
+  const { baseUrl, token, clientId } = await getConfig()
+  if (!baseUrl || !token) {
+    throw new Error('postCommandResult called without configured baseUrl/token')
+  }
+  const resp = await nymFetch({
+    baseUrl,
+    token,
+    clientId,
+    path: `/browser-commands/${encodeURIComponent(commandId)}/result`,
+    init: {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(result),
+    },
+  })
+  if (!resp.ok) {
+    const text = await resp.text().catch(() => '')
+    throw new HttpError(resp.status, text)
+  }
+  const body = (await resp.json().catch(() => ({}))) as { delivered?: boolean }
+  return { delivered: body.delivered !== false }
 }
 
 export { nymFetch }

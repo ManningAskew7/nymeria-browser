@@ -1,14 +1,24 @@
 import { backgroundLogger as logger } from '../utils/logger'
 import { BROADCAST_CHANNEL } from '../shared/messages'
-import type { AutonomousEvent, BackgroundSnapshot, ConnectionStatus } from '../shared/types'
+import type {
+  AutonomousEvent,
+  BackgroundSnapshot,
+  CommandType,
+  ConnectionStatus,
+} from '../shared/types'
 
 const SNAPSHOT_KEY = 'snapshot'
 
-let current: BackgroundSnapshot = {
+const INITIAL_SNAPSHOT: BackgroundSnapshot = {
   status: { kind: 'unconfigured' },
   lastEvent: null,
   eventCount: 0,
+  commandCount: 0,
+  lastCommandType: null,
+  debuggerTabs: [],
 }
+
+let current: BackgroundSnapshot = { ...INITIAL_SNAPSHOT }
 
 export function getSnapshot(): BackgroundSnapshot {
   return current
@@ -17,7 +27,12 @@ export function getSnapshot(): BackgroundSnapshot {
 export async function loadFromStorage(): Promise<void> {
   const stored = (await chrome.storage.local.get([SNAPSHOT_KEY])) as { snapshot?: BackgroundSnapshot }
   if (stored.snapshot) {
-    current = { ...stored.snapshot, status: { kind: 'unconfigured' } }
+    current = {
+      ...INITIAL_SNAPSHOT,
+      ...stored.snapshot,
+      status: { kind: 'unconfigured' },
+      debuggerTabs: [],
+    }
   }
 }
 
@@ -48,8 +63,24 @@ export async function recordEvent(event: AutonomousEvent): Promise<void> {
   broadcast()
 }
 
+export async function recordCommand(commandType: CommandType): Promise<void> {
+  current = {
+    ...current,
+    commandCount: current.commandCount + 1,
+    lastCommandType: commandType,
+  }
+  await persist()
+  broadcast()
+}
+
+export async function recordDebuggerTabs(tabs: number[]): Promise<void> {
+  current = { ...current, debuggerTabs: tabs }
+  await persist()
+  broadcast()
+}
+
 export async function resetSnapshot(): Promise<void> {
-  current = { status: { kind: 'unconfigured' }, lastEvent: null, eventCount: 0 }
+  current = { ...INITIAL_SNAPSHOT }
   await persist()
   broadcast()
 }

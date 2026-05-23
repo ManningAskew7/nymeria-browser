@@ -32,6 +32,16 @@ function makeStorageArea(): StorageArea {
   return area
 }
 
+interface TabRecord {
+  id: number
+  url?: string
+  title?: string
+  active?: boolean
+  windowId?: number
+  index?: number
+  status?: string
+}
+
 interface MockChrome {
   runtime: {
     id: string
@@ -43,6 +53,28 @@ interface MockChrome {
   storage: { local: StorageArea; sync: StorageArea }
   alarms: { create: ReturnType<typeof vi.fn>; onAlarm: { addListener: ReturnType<typeof vi.fn> } }
   permissions: { request: ReturnType<typeof vi.fn> }
+  tabs: {
+    query: ReturnType<typeof vi.fn>
+    create: ReturnType<typeof vi.fn>
+    update: ReturnType<typeof vi.fn>
+    remove: ReturnType<typeof vi.fn>
+    reload: ReturnType<typeof vi.fn>
+    get: ReturnType<typeof vi.fn>
+    captureVisibleTab: ReturnType<typeof vi.fn>
+    onUpdated: { addListener: ReturnType<typeof vi.fn>; removeListener: ReturnType<typeof vi.fn> }
+    onRemoved: { addListener: ReturnType<typeof vi.fn> }
+    _tabs: TabRecord[]
+  }
+  scripting: { executeScript: ReturnType<typeof vi.fn> }
+  debugger: {
+    attach: ReturnType<typeof vi.fn>
+    detach: ReturnType<typeof vi.fn>
+    sendCommand: ReturnType<typeof vi.fn>
+    onEvent: { addListener: ReturnType<typeof vi.fn> }
+  }
+  windows: { update: ReturnType<typeof vi.fn> }
+  webNavigation?: { onCommitted: { addListener: ReturnType<typeof vi.fn> } }
+  notifications?: { create: ReturnType<typeof vi.fn> }
 }
 
 function makeMockChrome(): MockChrome {
@@ -57,6 +89,59 @@ function makeMockChrome(): MockChrome {
     storage: { local: makeStorageArea(), sync: makeStorageArea() },
     alarms: { create: vi.fn(), onAlarm: { addListener: vi.fn() } },
     permissions: { request: vi.fn().mockResolvedValue(true) },
+    tabs: {
+      _tabs: [
+        { id: 1, url: 'https://example.com', title: 'Example', active: true, windowId: 100, index: 0, status: 'complete' },
+        { id: 2, url: 'about:blank', title: 'New Tab', active: false, windowId: 100, index: 1, status: 'complete' },
+      ],
+      query: vi.fn(async function (this: MockChrome['tabs']) {
+        return this._tabs.slice()
+      }),
+      create: vi.fn(async function (this: MockChrome['tabs'], props: { url: string }) {
+        const tab: TabRecord = {
+          id: 100 + this._tabs.length,
+          url: props.url,
+          title: 'created',
+          active: true,
+          windowId: 100,
+          index: this._tabs.length,
+          status: 'complete',
+        }
+        this._tabs.push(tab)
+        return tab
+      }),
+      update: vi.fn(async function (this: MockChrome['tabs'], tabId: number, props: Partial<TabRecord>) {
+        const tab = this._tabs.find((t) => t.id === tabId)
+        if (!tab) throw new Error('no such tab')
+        Object.assign(tab, props)
+        return tab
+      }),
+      remove: vi.fn(async function (this: MockChrome['tabs'], tabId: number) {
+        const idx = this._tabs.findIndex((t) => t.id === tabId)
+        if (idx >= 0) this._tabs.splice(idx, 1)
+      }),
+      reload: vi.fn(async () => undefined),
+      get: vi.fn(async function (this: MockChrome['tabs'], tabId: number) {
+        const tab = this._tabs.find((t) => t.id === tabId)
+        if (!tab) throw new Error('no such tab')
+        return tab
+      }),
+      captureVisibleTab: vi.fn(async () => 'data:image/png;base64,aGVsbG8='),
+      onUpdated: { addListener: vi.fn(), removeListener: vi.fn() },
+      onRemoved: { addListener: vi.fn() },
+    },
+    scripting: {
+      executeScript: vi.fn(async () => [{ result: { found: true, text: 'mock text' } }]),
+    },
+    debugger: {
+      attach: vi.fn(async () => undefined),
+      detach: vi.fn(async () => undefined),
+      sendCommand: vi.fn(async () => ({})),
+      onEvent: { addListener: vi.fn() },
+    },
+    windows: { update: vi.fn(async () => undefined) },
+    webNavigation: { onCommitted: { addListener: vi.fn() } },
+    notifications: { create: vi.fn() },
   }
 }
 
@@ -69,3 +154,5 @@ install()
 beforeEach(() => {
   install()
 })
+
+export type { MockChrome }

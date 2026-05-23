@@ -1,5 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { getSnapshot, loadFromStorage, recordEvent, resetSnapshot, setStatus } from './state'
+import {
+  getSnapshot,
+  loadFromStorage,
+  recordCommand,
+  recordDebuggerTabs,
+  recordEvent,
+  resetSnapshot,
+  setStatus,
+} from './state'
 
 beforeEach(async () => {
   vi.useFakeTimers()
@@ -62,9 +70,29 @@ describe('snapshot state machine', () => {
 
   it('reset clears everything', async () => {
     await recordEvent({ type: 'x' })
+    await recordCommand('navigate')
+    await recordDebuggerTabs([42])
     await resetSnapshot()
     const snap = getSnapshot()
     expect(snap.eventCount).toBe(0)
     expect(snap.lastEvent).toBeNull()
+    expect(snap.commandCount).toBe(0)
+    expect(snap.lastCommandType).toBeNull()
+    expect(snap.debuggerTabs).toEqual([])
+  })
+
+  it('recordCommand bumps the counter and tracks last type', async () => {
+    await recordCommand('navigate')
+    await recordCommand('snapshot')
+    const snap = getSnapshot()
+    expect(snap.commandCount).toBe(2)
+    expect(snap.lastCommandType).toBe('snapshot')
+  })
+
+  it('recordDebuggerTabs reflects active debugger sessions', async () => {
+    await recordDebuggerTabs([7, 12])
+    expect(getSnapshot().debuggerTabs).toEqual([7, 12])
+    await recordDebuggerTabs([])
+    expect(getSnapshot().debuggerTabs).toEqual([])
   })
 })

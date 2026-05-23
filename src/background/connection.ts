@@ -1,9 +1,10 @@
 import { backgroundLogger as logger } from '../utils/logger'
 import { getConfig } from '../utils/storage'
 import { HttpError, whoami } from './api'
+import { dispatchBrowserCommand } from './commands'
 import { frameToData, parseSseFrames } from './sse'
 import { recordEvent, setStatus } from './state'
-import type { AutonomousEvent, MeResponse } from '../shared/types'
+import type { AutonomousEvent, BrowserCommandEvent, MeResponse } from '../shared/types'
 
 const MIN_BACKOFF_MS = 1_000
 const MAX_BACKOFF_MS = 60_000
@@ -120,6 +121,10 @@ async function connectOnce(): Promise<void> {
         try {
           const event = JSON.parse(data) as AutonomousEvent
           await recordEvent(event)
+          if (event.type === 'browser_command') {
+            // Fire-and-forget; per-command try/catch is inside the dispatcher.
+            void dispatchBrowserCommand(event as BrowserCommandEvent)
+          }
         } catch (error) {
           logger.warn('failed to parse SSE frame:', error, data.slice(0, 200))
         }

@@ -160,7 +160,7 @@ export function Popup() {
     <div className="container">
       <div className="header">
         <h1>Nymeria Browser</h1>
-        <div className="version">v0.1.0 · Phase 1</div>
+        <div className="version">v0.2.0 · Phase 2 (chrome_* tools)</div>
       </div>
       <div className="body">
         <StatusCard status={snapshot?.status ?? { kind: 'unconfigured' }} now={now} />
@@ -206,6 +206,20 @@ export function Popup() {
               <label>Events received</label>
               <div className="status-value" style={{ textAlign: 'left' }}>{snapshot?.eventCount ?? 0}</div>
             </div>
+            <div className="field">
+              <label>Commands executed</label>
+              <div className="status-value" style={{ textAlign: 'left' }}>
+                {snapshot?.commandCount ?? 0}
+                {snapshot?.lastCommandType ? ` (last: ${snapshot.lastCommandType})` : ''}
+              </div>
+            </div>
+            {snapshot && snapshot.debuggerTabs.length > 0 && (
+              <div className="alert" style={{ background: 'rgba(250, 175, 50, 0.15)', color: '#caa040' }}>
+                <span className="dot amber" /> Chrome debugger active on
+                {' tab'}{snapshot.debuggerTabs.length === 1 ? '' : 's'}{' '}
+                {snapshot.debuggerTabs.join(', ')}
+              </div>
+            )}
             <div className="field">
               <label>Last event</label>
               {lastEventText ? (
