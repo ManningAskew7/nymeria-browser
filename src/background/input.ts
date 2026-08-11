@@ -48,10 +48,22 @@ export function modifierMask(mods?: string[]): number {
  * Translate user-facing key names to the CDP `Input.dispatchKeyEvent` subset.
  * CDP wants a Windows virtual-key code for many control keys.
  */
-export const KEY_TABLE: Record<string, { code: string; key?: string; windowsVirtualKeyCode?: number }> = {
-  Enter: { code: 'Enter', key: 'Enter', windowsVirtualKeyCode: 13 },
+/**
+ * `text` is the CHARACTER the key produces, which is not the key's name.
+ *
+ * Most of these produce no character at all: Escape and the arrows move or
+ * dismiss, they do not insert. Only Enter (a carriage return), Tab and Space
+ * do. CDP rejects a `text` longer than one character outright, so sending the
+ * NAME ("Enter") fails with `-32602 Invalid 'text' parameter` and the key
+ * never reaches the page. Omitting `text` here is meaningful, not lazy.
+ */
+export const KEY_TABLE: Record<
+  string,
+  { code: string; key: string; windowsVirtualKeyCode: number; text?: string }
+> = {
+  Enter: { code: 'Enter', key: 'Enter', windowsVirtualKeyCode: 13, text: '\r' },
   Escape: { code: 'Escape', key: 'Escape', windowsVirtualKeyCode: 27 },
-  Tab: { code: 'Tab', key: 'Tab', windowsVirtualKeyCode: 9 },
+  Tab: { code: 'Tab', key: 'Tab', windowsVirtualKeyCode: 9, text: '\t' },
   Backspace: { code: 'Backspace', key: 'Backspace', windowsVirtualKeyCode: 8 },
   ArrowUp: { code: 'ArrowUp', key: 'ArrowUp', windowsVirtualKeyCode: 38 },
   ArrowDown: { code: 'ArrowDown', key: 'ArrowDown', windowsVirtualKeyCode: 40 },
@@ -62,8 +74,11 @@ export const KEY_TABLE: Record<string, { code: string; key?: string; windowsVirt
   Home: { code: 'Home', key: 'Home', windowsVirtualKeyCode: 36 },
   End: { code: 'End', key: 'End', windowsVirtualKeyCode: 35 },
   Delete: { code: 'Delete', key: 'Delete', windowsVirtualKeyCode: 46 },
-  Space: { code: 'Space', key: ' ', windowsVirtualKeyCode: 32 },
+  Space: { code: 'Space', key: ' ', windowsVirtualKeyCode: 32, text: ' ' },
 }
+
+/** CDP modifier bits. Shift still produces a character; the others do not. */
+const SHIFT_BIT = 8
 
 export async function callOn<T = unknown>(
   target: Cdp,
@@ -262,25 +277,33 @@ export async function insertText(target: Cdp, text: string): Promise<void> {
   await sendCommand(target, 'Input.insertText', { text })
 }
 
+/**
+ * One keystroke: `keyDown` then `keyUp`, and nothing in between.
+ *
+ * Chrome derives the character insertion from `text` on the keyDown itself, so
+ * a separate `char` event is not a belt-and-braces addition, it is a second
+ * insertion: typing "hi" that way lands "hhii" in the field. A key that
+ * produces no character uses `rawKeyDown`, which is how Chrome distinguishes
+ * "a key was pressed" from "a character was entered".
+ */
 export async function dispatchKey(target: Cdp, key: string, modifiers = 0): Promise<void> {
   const entry = KEY_TABLE[key]
-  const text = entry ? entry.key ?? '' : key.length === 1 ? key : ''
-  const code = entry ? entry.code : key.length === 1 ? `Key${key.toUpperCase()}` : key
-  const keyName = entry ? entry.key ?? key : key
+  const isChar = !entry && key.length === 1
+  // A chord (ctrl+a) presses the key without entering its character; shift is
+  // the exception, since shift is how you enter the uppercase one.
+  const suppressed = (modifiers & ~SHIFT_BIT) !== 0
+  const text = suppressed ? '' : entry ? (entry.text ?? '') : isChar ? key : ''
   const common = {
     modifiers,
-    text,
-    key: keyName,
-    code,
-    ...(entry?.windowsVirtualKeyCode != null
-      ? { windowsVirtualKeyCode: entry.windowsVirtualKeyCode }
-      : {}),
+    key: entry ? entry.key : key,
+    code: entry ? entry.code : isChar ? `Key${key.toUpperCase()}` : key,
+    ...(entry ? { windowsVirtualKeyCode: entry.windowsVirtualKeyCode } : {}),
   }
-  await sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyDown', ...common })
-  // A modified chord (ctrl+a) must not emit a character.
-  if (text && modifiers === 0) {
-    await sendCommand(target, 'Input.dispatchKeyEvent', { type: 'char', ...common })
-  }
+  await sendCommand(target, 'Input.dispatchKeyEvent', {
+    type: text ? 'keyDown' : 'rawKeyDown',
+    ...common,
+    ...(text ? { text } : {}),
+  })
   await sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common })
 }
 
