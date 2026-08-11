@@ -69,10 +69,8 @@ interface ActArgs {
   direction?: 'up' | 'down' | 'left' | 'right'
   amount_px?: number
   to_ref?: string
-  to_coordinate?: [number, number]
   wait_for?: WaitFor
   timeout_ms?: number
-  settle?: boolean
   // upload
   file_name?: string
   file_mime?: string
@@ -97,6 +95,9 @@ const NEEDS_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
   'drag',
   'upload',
 ])
+
+/** Actions that focus a target first when given one, but work without. */
+const OPTIONAL_TARGET: ReadonlySet<ActionName> = new Set<ActionName>(['type', 'key'])
 
 type TargetResolution =
   /** `session` is the CDP addressee that OWNS the node: a cross-origin frame
@@ -371,9 +372,9 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // frame swaps this for that frame's session.
   let elementSession: Cdp = tabId
   let elementFrameId: string | undefined
-  if (NEEDS_TARGET.has(a.action)) {
+  if (NEEDS_TARGET.has(a.action) || (OPTIONAL_TARGET.has(a.action) && target)) {
     const explicitPoint = pointFrom(a.coordinate)
-    if (!target && !explicitPoint) {
+    if (NEEDS_TARGET.has(a.action) && !target && !explicitPoint) {
       return { ok: false, status: 'error', error: `action "${a.action}" requires ref or coordinate` }
     }
     if (target) {
@@ -466,7 +467,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
             inputMode = 'trusted'
           } else {
             await callOn(
-              tabId,
+              elementSession,
               objectId,
               'function(){ this.dispatchEvent(new MouseEvent("mouseover", {bubbles:true})); this.dispatchEvent(new MouseEvent("mouseenter", {bubbles:true})); }',
             )
@@ -553,10 +554,18 @@ export async function execAct(args: unknown): Promise<CommandResult> {
           const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
             const ht = await hitTest(elementSession, objectId, geo.point)
-            if (ht.hit) {
-              await trustedClick(tabId, await dispatchPoint(geo.point), { modifiers })
-              inputMode = 'trusted'
+            if (!ht.hit) {
+              return {
+                ok: false,
+                status: 'error',
+                error:
+                  `the ${a.action} point for ${target} is covered by ${ht.blocker ?? 'another element'}. ` +
+                  'Dismiss the overlay and retry.',
+                data: { intercepted_by: ht.blocker ?? null },
+              }
             }
+            await trustedClick(tabId, await dispatchPoint(geo.point), { modifiers })
+            inputMode = 'trusted'
           }
           const now = await readValue(elementSession, objectId)
           if (now !== String(want)) {
@@ -648,17 +657,24 @@ export async function execAct(args: unknown): Promise<CommandResult> {
           ? (await elementGeometry(elementSession, objectId))?.point ?? null
           : pointFrom(a.coordinate)
         const from = localFrom ? await dispatchPoint(localFrom) : null
-        let to = pointFrom(a.to_coordinate)
-        if (!to && a.to_ref) {
+        let to: Point | null = null
+        if (a.to_ref) {
           const dest = await resolveTarget(tabId, a.to_ref, urlBefore)
           if (!dest.ok) return { ok: false, status: 'error', error: `drag destination: ${dest.error}` }
-          to = (await elementGeometry(tabId, dest.objectId))?.point ?? null
+          const destLocal = (await elementGeometry(dest.session, dest.objectId))?.point ?? null
+          if (destLocal && dest.sessionId) {
+            const destFrame = frameSessions(tabId).find((f) => f.sessionId === dest.sessionId)
+            const offset = destFrame ? await frameOffset(tabId, destFrame.targetId) : { x: 0, y: 0 }
+            to = { x: destLocal.x + offset.x, y: destLocal.y + offset.y }
+          } else {
+            to = destLocal
+          }
         }
         if (!from || !to) {
           return {
             ok: false,
             status: 'error',
-            error: 'drag needs a resolvable source and destination (ref/coordinate to to_ref/to_coordinate)',
+            error: 'drag needs a resolvable source (ref or coordinate) and a to_ref destination',
           }
         }
         await trustedDrag(tabId, from, to, modifiers)
@@ -672,7 +688,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     return { ok: false, status: 'error', error: `${a.action} failed: ${String(e)}` }
   }
 
-  const settleResult = a.settle === false ? null : await settle(tabId)
+  const settleResult = await settle(tabId)
   const data = await buildVerification({
     action: a.action,
     target,

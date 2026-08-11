@@ -20,8 +20,6 @@ export type CommandType =
   | 'snapshot'
   | 'act'
   | 'batch'
-  | 'press_key'
-  | 'scroll'
   | 'extract_text'
   | 'screenshot'
   | 'console'

@@ -2,11 +2,10 @@ import { backgroundLogger as logger } from '../utils/logger'
 import { clearConfig, ensureClientId, getConfig, setConfig } from '../utils/storage'
 import { HttpError, ping, whoami } from './api'
 import { setDispatchHooks } from './commands'
-import { ingestConsoleEntry } from './commands/console'
 import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs } from './debuggerSession'
 import { clear as clearRefs } from './snapshotRefs'
-import { forgetHook as forgetConsoleHook, installCdpConsoleCapture } from './consoleBuffer'
+import { installCdpConsoleCapture } from './consoleBuffer'
 import { clear as clearNetwork, installCdpNetworkCapture } from './networkBuffer'
 import {
   getSnapshot,
@@ -34,18 +33,15 @@ setDispatchHooks({
 installCdpConsoleCapture()
 installCdpNetworkCapture()
 
-// When a tab navigates we invalidate per-tab caches: ref IDs are stale and
-// the console-capture hook must be re-injected. Network history is kept
+// A committed navigation invalidates the tab's refs. Network history is kept
 // deliberately: the requests a navigation itself fired are often the answer
 // to "why did that go wrong".
 chrome.webNavigation?.onCommitted.addListener?.((details) => {
   if (details.frameId !== 0) return
   clearRefs(details.tabId)
-  forgetConsoleHook(details.tabId)
 })
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearRefs(tabId)
-  forgetConsoleHook(tabId)
   clearNetwork(tabId)
 })
 
@@ -110,19 +106,7 @@ async function handleForget(): Promise<PopupResponse> {
   return { ok: true }
 }
 
-chrome.runtime.onMessage.addListener((raw, sender, sendResponse) => {
-  // Console-entry messages come from content-script wrappers (no `kind`
-  // field, custom `kind: 'nymeria-console-entry'`). Handle synchronously
-  // so we don't pretend to return a value.
-  const consoleEntry = raw as { kind?: string; level?: string; text?: string; ts?: number }
-  if (consoleEntry?.kind === 'nymeria-console-entry') {
-    const tabId = sender.tab?.id
-    if (typeof tabId === 'number') {
-      ingestConsoleEntry(tabId, consoleEntry)
-    }
-    return false
-  }
-
+chrome.runtime.onMessage.addListener((raw, _sender, sendResponse) => {
   const msg = raw as PopupRequest
   ;(async () => {
     try {

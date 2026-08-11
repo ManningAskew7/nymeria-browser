@@ -27,13 +27,7 @@ export interface Point {
   y: number
 }
 
-export interface ElementGeometry {
-  point: Point
-  width: number
-  height: number
-}
-
-export type MouseButton = 'left' | 'right' | 'middle'
+export type MouseButton = 'left' | 'right'
 
 const MODIFIER_BITS: Record<string, number> = {
   Alt: 1,
@@ -102,7 +96,7 @@ export async function scrollIntoView(target: Cdp, objectId: string): Promise<voi
  * back to synthetic dispatch rather than to fail: hidden file inputs are a
  * legitimate target and have no box by design.
  */
-export async function elementGeometry(target: Cdp, objectId: string): Promise<ElementGeometry | null> {
+export async function elementGeometry(target: Cdp, objectId: string): Promise<{ point: Point } | null> {
   const rect = await callOn<{ x: number; y: number; w: number; h: number } | null>(
     target,
     objectId,
@@ -113,7 +107,7 @@ export async function elementGeometry(target: Cdp, objectId: string): Promise<El
     }`,
   )
   if (!rect) return null
-  return { point: { x: rect.x, y: rect.y }, width: rect.w, height: rect.h }
+  return { point: { x: rect.x, y: rect.y } }
 }
 
 /**
@@ -193,18 +187,26 @@ export async function hitTest(target: Cdp, objectId: string, point: Point): Prom
   )
 }
 
+/** Bitfield of buttons currently HELD, which is not the same as the button
+ *  this event is about. 1 = left, 2 = right, 4 = middle. */
+const BUTTON_BIT: Record<string, number> = { left: 1, right: 2, middle: 4, none: 0 }
+
 async function mouseEvent(
   target: Cdp,
   type: 'mouseMoved' | 'mousePressed' | 'mouseReleased',
   point: Point,
-  opts: { button?: MouseButton; clickCount?: number; modifiers?: number } = {},
+  opts: { button?: MouseButton; clickCount?: number; modifiers?: number; held?: MouseButton } = {},
 ): Promise<void> {
+  const button = opts.button ?? (type === 'mouseMoved' ? 'none' : 'left')
+  // Held during a press, and during a drag's intermediate moves; released by
+  // definition on mouseReleased.
+  const held = opts.held ?? (type === 'mousePressed' ? button : 'none')
   await sendCommand(target, 'Input.dispatchMouseEvent', {
     type,
     x: Math.round(point.x),
     y: Math.round(point.y),
-    button: opts.button ?? (type === 'mouseMoved' ? 'none' : 'left'),
-    buttons: type === 'mousePressed' ? 1 : 0,
+    button,
+    buttons: BUTTON_BIT[held] ?? 0,
     clickCount: opts.clickCount ?? (type === 'mouseMoved' ? 0 : 1),
     modifiers: opts.modifiers ?? 0,
   })
@@ -241,7 +243,7 @@ export async function trustedDrag(target: Cdp, from: Point, to: Point, modifiers
       target,
       'mouseMoved',
       { x: from.x + ((to.x - from.x) * i) / steps, y: from.y + ((to.y - from.y) * i) / steps },
-      { button: 'left', modifiers },
+      { button: 'left', held: 'left', modifiers },
     )
   }
   await mouseEvent(target, 'mouseReleased', to, { button: 'left', clickCount: 1, modifiers })
@@ -304,5 +306,3 @@ export async function selectAllIn(target: Cdp, objectId: string): Promise<void> 
     }`,
   )
 }
-
-export const __test = { MODIFIER_BITS }

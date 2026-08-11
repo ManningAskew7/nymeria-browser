@@ -15,10 +15,10 @@ import { sendCommand } from './debuggerSession'
  * resolves once the document is `complete` and has been quiet for `quietMs`,
  * or when the deadline passes.
  *
- * Network quiescence is deliberately NOT part of this yet: it wants the CDP
- * Network domain enabled per attach, which arrives with the network-capture
- * work. DOM quiet plus readyState covers the re-render race, which is the
- * failure that actually bites.
+ * Network quiescence is deliberately not folded in. The Network domain IS
+ * enabled per attach now, but in-flight-request counting adds a second
+ * stalling condition (long-poll, streaming, telemetry beacons) for a race that
+ * DOM quiet plus readyState already covers.
  */
 
 export type SettleReason = 'quiet' | 'deadline' | 'navigated' | 'unavailable'
@@ -130,5 +130,3 @@ export async function settle(
     return { settled: false, reason: 'unavailable', ms: elapsed() }
   }
 }
-
-export const __test = { isContextGone, probeExpression }

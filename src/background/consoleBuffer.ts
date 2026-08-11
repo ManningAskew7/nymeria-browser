@@ -1,14 +1,10 @@
 /**
  * Per-tab ring buffer of console messages + uncaught exceptions.
  *
- * Two producers feed it:
- *
- *  - CDP (`Runtime.consoleAPICalled` / `Runtime.exceptionThrown`), which is
- *    the primary path. It rides `chrome.debugger`, so it needs NO host
- *    permission and works on any origin the agent can reach.
- *  - A `chrome.scripting`-injected MAIN-world wrapper, kept as a fallback for
- *    tabs where the debugger is not attached. It needs host permission for
- *    the origin, so it is not always available.
+ * Fed by CDP (`Runtime.consoleAPICalled` / `Runtime.exceptionThrown`), which
+ * rides `chrome.debugger` and so needs NO host permission: it works on any
+ * origin the agent can reach. An earlier page-injected wrapper was removed
+ * because it needed one and failed on every ungranted origin.
  *
  * The buffer is what makes a silently failed action visible: a click that
  * "succeeded" while its fetch threw is otherwise indistinguishable from one
@@ -30,7 +26,6 @@ export interface ConsoleEntry {
 const MAX_PER_TAB = 200
 
 const buffers = new Map<number, ConsoleEntry[]>()
-const hookInstalled = new Set<number>()
 
 export function push(tabId: number, entry: ConsoleEntry): void {
   const buf = buffers.get(tabId) ?? []
@@ -70,18 +65,6 @@ export function readSince(
 
 export function clear(tabId: number): void {
   buffers.delete(tabId)
-}
-
-export function isHookInstalled(tabId: number): boolean {
-  return hookInstalled.has(tabId)
-}
-
-export function markHookInstalled(tabId: number): void {
-  hookInstalled.add(tabId)
-}
-
-export function forgetHook(tabId: number): void {
-  hookInstalled.delete(tabId)
 }
 
 const CDP_LEVELS: Record<string, ConsoleEntry['level']> = {
@@ -167,8 +150,5 @@ export function installCdpConsoleCapture(): () => void {
 
 export function resetForTests(): void {
   buffers.clear()
-  hookInstalled.clear()
   cdpCaptureInstalled = false
 }
-
-export const __test = { remoteObjectToText, cdpTimestamp, CDP_LEVELS }

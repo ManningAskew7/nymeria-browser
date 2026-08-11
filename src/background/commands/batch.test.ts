@@ -46,13 +46,19 @@ describe('execBatch', () => {
 
   it('stops at the first failure and leaves the tail unrun', async () => {
     const run = vi.fn(async (type: string) =>
-      type === 'boom' ? failResult('element not found') : okResult(),
+      type === 'navigate' ? failResult('element not found') : okResult(),
     )
 
     const result = await execBatch(
       {
         tab_id: TAB,
-        actions: [{ type: 'a' }, { type: 'b' }, { type: 'boom' }, { type: 'd' }, { type: 'e' }],
+        actions: [
+          { type: 'act' },
+          { type: 'act' },
+          { type: 'navigate' },
+          { type: 'act' },
+          { type: 'snapshot' },
+        ],
       },
       run,
     )
@@ -61,7 +67,7 @@ describe('execBatch', () => {
     const data = result.data as { completed: number; remaining: number; aborted: string }
     expect(data.completed).toBe(2)
     expect(data.remaining).toBe(2)
-    expect(data.aborted).toMatch(/action 3 \("boom"\) failed/)
+    expect(data.aborted).toMatch(/action 3 \("navigate"\) failed/)
     expect(result.error).toMatch(/2 completed, 2 not run/)
     // Actions 4 and 5 were never attempted.
     expect(run).toHaveBeenCalledTimes(3)
@@ -76,7 +82,7 @@ describe('execBatch', () => {
     const run = vi.fn(async () => okResult())
 
     const result = await execBatch(
-      { tab_id: TAB, actions: [{ type: 'a' }, { type: 'b' }, { type: 'c' }, { type: 'd' }] },
+      { tab_id: TAB, actions: [{ type: 'act' }, { type: 'act' }, { type: 'act' }, { type: 'act' }] },
       run,
     )
 
@@ -92,7 +98,7 @@ describe('execBatch', () => {
     scriptUrls(['https://example.com/cart', 'https://example.com/thanks'])
     const run = vi.fn(async () => okResult())
 
-    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'submit' }] }, run)
+    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }] }, run)
 
     expect(result.ok).toBe(true)
     expect((result.data as { aborted?: string }).aborted).toBeUndefined()
@@ -109,7 +115,7 @@ describe('execBatch', () => {
     const result = await execBatch(
       {
         tab_id: TAB,
-        actions: [{ type: 'a' }, { type: 'b' }],
+        actions: [{ type: 'act' }, { type: 'act' }],
         continue_on_url_change: true,
       },
       run,
@@ -136,7 +142,7 @@ describe('execBatch', () => {
       throw new Error('debugger detached')
     })
 
-    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }, { type: 'b' }] }, run)
+    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }, { type: 'act' }] }, run)
 
     expect(result.ok).toBe(false)
     const data = result.data as { results: { error?: string }[] }
@@ -144,11 +150,25 @@ describe('execBatch', () => {
     expect(run).toHaveBeenCalledTimes(1)
   })
 
+  it('refuses the privileged command types outright, not just nested batches', async () => {
+    const run = vi.fn(async () => okResult())
+
+    // chrome_cdp is classified SENSITIVE and deliberately left out of the
+    // browser-control kit. If a batch step can name it, the kit's exclusion is
+    // decorative: the MODERATE chrome_batch becomes a route to raw CDP.
+    for (const type of ['cdp', 'dialog', 'console', 'network']) {
+      const result = await execBatch({ tab_id: TAB, actions: [{ type }] }, run)
+      expect(result.ok, `${type} should be refused`).toBe(false)
+      expect(result.error).toMatch(/cannot run inside a batch/)
+    }
+    expect(run).not.toHaveBeenCalled()
+  })
+
   it('refuses a nested batch', async () => {
     const run = vi.fn(async () => okResult())
     const result = await execBatch({ tab_id: TAB, actions: [{ type: 'batch' }] }, run)
     expect(result.ok).toBe(false)
-    expect(result.error).toMatch(/cannot be nested/)
+    expect(result.error).toMatch(/cannot run inside a batch/)
     expect(run).not.toHaveBeenCalled()
   })
 

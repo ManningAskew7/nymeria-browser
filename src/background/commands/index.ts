@@ -10,9 +10,7 @@ import { execExtractText } from './extract_text'
 import { execHistory } from './history'
 import { execNavigate } from './navigate'
 import { execNetwork } from './network'
-import { execPressKey } from './press_key'
 import { execScreenshot } from './screenshot'
-import { execScroll } from './scroll'
 import { execSnapshot } from './snapshot'
 import { execTabs } from './tabs'
 
@@ -43,8 +41,6 @@ export const EXECUTORS: Record<CommandType, Executor> = {
   snapshot: execSnapshot,
   act: execAct,
   batch: (args) => execBatch(args, runSingle),
-  press_key: execPressKey,
-  scroll: execScroll,
   extract_text: execExtractText,
   screenshot: execScreenshot,
   console: execConsole,
@@ -121,5 +117,3 @@ export async function dispatchBrowserCommand(event: BrowserCommandEvent): Promis
     logger.error(`failed to POST result for ${command_id}:`, e)
   }
 }
-
-export const __test = { capResult, MAX_RESULT_BYTES }

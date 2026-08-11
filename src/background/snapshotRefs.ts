@@ -35,6 +35,8 @@ export interface RefTarget {
 interface TabRefs {
   byRef: Map<Ref, RefTarget>
   urlAtSnapshot: string | null
+  /** The rendered tree these refs were minted from. */
+  tree: string
   /** Bumped on every snapshot so callers can detect a re-read mid-sequence. */
   generation: number
 }
@@ -48,10 +50,33 @@ export type RefResolution =
 const cache = new Map<number, TabRefs>()
 let generationCounter = 0
 
-export function set(tabId: number, refs: Map<Ref, RefTarget>, url: string | null = null): number {
+export function set(
+  tabId: number,
+  refs: Map<Ref, RefTarget>,
+  url: string | null = null,
+  tree = '',
+): number {
   generationCounter += 1
-  cache.set(tabId, { byRef: new Map(refs), urlAtSnapshot: url, generation: generationCounter })
+  cache.set(tabId, {
+    byRef: new Map(refs),
+    urlAtSnapshot: url,
+    tree,
+    generation: generationCounter,
+  })
   return generationCounter
+}
+
+/**
+ * The last rendered tree for a tab, if it was read from the URL the tab is
+ * still on. Lets a query reuse that read rather than taking a fresh snapshot:
+ * re-reading renumbers every ref from @e1, which would silently invalidate
+ * refs the caller is still holding.
+ */
+export function cachedTree(tabId: number, currentUrl?: string | null): string | null {
+  const entry = cache.get(tabId)
+  if (!entry || !entry.tree) return null
+  if (currentUrl && entry.urlAtSnapshot && currentUrl !== entry.urlAtSnapshot) return null
+  return entry.tree
 }
 
 /**

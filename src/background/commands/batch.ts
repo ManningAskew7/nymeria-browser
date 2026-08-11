@@ -34,8 +34,24 @@ export type SingleRunner = (type: string, args: unknown) => Promise<CommandResul
 
 export const MAX_BATCH_ACTIONS = 20
 
-/** Nesting a batch inside a batch has no use and unbounded blast radius. */
-const FORBIDDEN_IN_BATCH = new Set(['batch'])
+/**
+ * What a batch may run, as an ALLOWLIST.
+ *
+ * A denylist here was a privilege-escalation hole: `chrome_cdp` is classified
+ * SENSITIVE and deliberately left out of the browser-control kit, but a batch
+ * step of `{type: "cdp"}` reached the same executor from the MODERATE
+ * `chrome_batch`, skipping every safeguard the typed tools add. Batching is
+ * for ordinary page work; diagnostics and escape hatches are single calls.
+ */
+const ALLOWED_IN_BATCH = new Set([
+  'act',
+  'navigate',
+  'snapshot',
+  'extract_text',
+  'screenshot',
+  'tabs',
+  'history',
+])
 
 async function urlOf(tabId: number | undefined): Promise<string | null> {
   if (typeof tabId !== 'number') return null
@@ -64,8 +80,14 @@ export async function execBatch(args: unknown, run: SingleRunner): Promise<Comma
     if (!action || typeof action.type !== 'string') {
       return { ok: false, status: 'error', error: 'each action needs a string "type"' }
     }
-    if (FORBIDDEN_IN_BATCH.has(action.type)) {
-      return { ok: false, status: 'error', error: `"${action.type}" cannot be nested inside a batch` }
+    if (!ALLOWED_IN_BATCH.has(action.type)) {
+      return {
+        ok: false,
+        status: 'error',
+        error:
+          `"${action.type}" cannot run inside a batch. Allowed: ` +
+          `${Array.from(ALLOWED_IN_BATCH).sort().join(', ')}. Run it as a single command.`,
+      }
     }
   }
 

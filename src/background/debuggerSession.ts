@@ -289,21 +289,6 @@ export async function withSession<T>(tabId: number, fn: () => Promise<T>): Promi
   }
 }
 
-/**
- * Send `<domain>.enable` once per attach.
- *
- * Must be called inside an `acquire`d session (`withSession` or another
- * `sendCommand`), because the enable is only remembered for as long as the
- * current attach lives.
- */
-export async function ensureDomain(tabId: number, domain: string): Promise<void> {
-  const s = sessions.get(tabId)
-  if (s?.domains.has(domain)) return
-  await sendCommand(tabId, `${domain}.enable`, {})
-  // Re-read: the session may have been recreated during the await.
-  sessions.get(tabId)?.domains.add(domain)
-}
-
 export function activeTabs(): number[] {
   return Array.from(sessions.entries())
     .filter(([, s]) => s.attached)
@@ -312,10 +297,6 @@ export function activeTabs(): number[] {
 
 export function isAttached(tabId: number): boolean {
   return sessions.get(tabId)?.attached === true
-}
-
-export function enabledDomains(tabId: number): string[] {
-  return Array.from(sessions.get(tabId)?.domains ?? [])
 }
 
 export function resetForTests(): void {

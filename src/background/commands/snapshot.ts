@@ -1,6 +1,11 @@
 import type { CommandResult } from '../../shared/types'
 import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
-import { resolve as resolveRef, set as setRefs, type RefTarget } from '../snapshotRefs'
+import {
+  cachedTree,
+  resolve as resolveRef,
+  set as setRefs,
+  type RefTarget,
+} from '../snapshotRefs'
 
 interface SnapshotArgs {
   tab_id: number
@@ -8,6 +13,10 @@ interface SnapshotArgs {
   /** Re-root the tree at a previously minted ref, e.g. "@e12". */
   scope_ref?: string
   scope_selector?: string
+  /** Return the last read for this tab (if still on the same URL) instead of
+   *  re-reading. Reuse does not renumber refs, so refs already handed out
+   *  stay valid. */
+  reuse?: boolean
 }
 
 interface AXValue {
@@ -229,6 +238,18 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   }
   const detail = a.detail ?? 'interactive'
 
+  if (a.reuse && !a.scope_ref && !a.scope_selector) {
+    const tab = await chrome.tabs.get(a.tab_id).catch(() => null)
+    const cached = cachedTree(a.tab_id, tab?.url ?? null)
+    if (cached) {
+      return {
+        ok: true,
+        status: 'success',
+        data: { tree: cached, detail, url: tab?.url ?? null, reused: true },
+      }
+    }
+  }
+
   // Scope, when asked for, is resolved to a real backend node and used as the
   // tree root. The previous implementation only probed that a selector
   // matched something and then returned the whole page anyway, which quietly
@@ -290,13 +311,14 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
 
   const tab = await chrome.tabs.get(a.tab_id).catch(() => null)
   const url = tab?.url ?? null
-  setRefs(a.tab_id, allRefs, url)
+  const rendered = sections.join('\n')
+  setRefs(a.tab_id, allRefs, url, rendered)
 
   return {
     ok: true,
     status: 'success',
     data: {
-      tree: sections.join('\n'),
+      tree: rendered,
       ref_count: allRefs.size,
       detail,
       url,

@@ -1,5 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { clear as clearRefs } from '../snapshotRefs'
+import { waitForTabComplete } from '../settle'
 
 interface NavigateArgs {
   tab_id: number
@@ -28,22 +29,9 @@ export async function execNavigate(args: unknown): Promise<CommandResult> {
   const tab = await chrome.tabs.update(a.tab_id, { url: a.url })
   clearRefs(a.tab_id)
 
-  // Wait until the tab finishes loading (or 25s, whichever first).
-  const finalTab = await new Promise<chrome.tabs.Tab | null>((resolve) => {
-    let resolved = false
-    const finish = (t: chrome.tabs.Tab | null) => {
-      if (resolved) return
-      resolved = true
-      chrome.tabs.onUpdated.removeListener(listener)
-      clearTimeout(timer)
-      resolve(t)
-    }
-    const listener = (changedId: number, info: { status?: string }, t: chrome.tabs.Tab) => {
-      if (changedId === a.tab_id && info.status === 'complete') finish(t)
-    }
-    chrome.tabs.onUpdated.addListener(listener)
-    const timer = setTimeout(() => finish(null), 25_000)
-  })
+  // Shared with history.ts so the two cannot drift on what "loaded" means.
+  const complete = await waitForTabComplete(a.tab_id, 25_000)
+  const finalTab = await chrome.tabs.get(a.tab_id).catch(() => null)
 
   return {
     ok: true,
@@ -52,7 +40,7 @@ export async function execNavigate(args: unknown): Promise<CommandResult> {
       tab_id: a.tab_id,
       url: (finalTab ?? tab)?.url,
       title: (finalTab ?? tab)?.title,
-      complete: finalTab !== null,
+      complete,
     },
   }
 }

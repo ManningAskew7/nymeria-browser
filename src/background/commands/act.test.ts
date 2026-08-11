@@ -259,33 +259,6 @@ describe('verification payload', () => {
     expect((result.data as { settled: { reason: string } }).settled.reason).toBe('deadline')
   })
 
-  it('skips settling when settle is disabled', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    installCdpMock()
-
-    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1', settle: false })
-
-    expect((result.data as { settled?: unknown }).settled).toBeUndefined()
-  })
-})
-
-describe('wait', () => {
-  it('returns as soon as the awaited text is present', async () => {
-    installCdpMock({ bodyText: 'Order confirmed' })
-
-    const result = await execAct({
-      tab_id: TAB,
-      action: 'wait',
-      wait_for: { text: 'Order confirmed' },
-      timeout_ms: 1000,
-    })
-
-    expect(result.ok).toBe(true)
-    const data = result.data as { found: boolean; condition: string }
-    expect(data.found).toBe(true)
-    expect(data.condition).toBe('text:Order confirmed')
-  })
-
   it('reports not-found on timeout instead of claiming success', async () => {
     installCdpMock({ bodyText: 'still loading' })
 
@@ -387,5 +360,48 @@ describe('argument handling', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/no option matching/)
+  })
+})
+
+describe('execAct target resolution', () => {
+  it('focuses the ref before typing instead of typing wherever focus happened to be', async () => {
+    // `type` and `key` advertise a `ref`, and the failure mode when it is
+    // ignored is invisible: the characters land in whatever was already
+    // focused (the previous field, the page's search box) and the command
+    // still reports ok:true. Nothing downstream can tell the difference.
+    const mock = installCdpMock()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 77 }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    const methods = methodsOf(mock)
+    expect(methods).toContain('DOM.resolveNode')
+    const focusAt = methods.indexOf('DOM.focus')
+    const typedAt = methods.indexOf('Input.dispatchKeyEvent')
+    expect(focusAt, 'the ref must be focused').toBeGreaterThanOrEqual(0)
+    expect(typedAt, 'keystrokes must follow the focus, not precede it').toBeGreaterThan(focusAt)
+  })
+
+  it('refuses to check a box whose click point is covered, rather than forcing the property', async () => {
+    // Forcing `.checked` on an intercepted element sets the property without
+    // the page's own change handler running, so the agent sees success while
+    // the state the site actually reads never moved. `click` already refuses
+    // here; check must not be the soft path around that refusal.
+    const mock = installCdpMock({ hit: { hit: false, blocker: 'div.cookie-banner' }, value: null })
+    setRefs(TAB, new Map([['e1', { backendNodeId: 77 }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/covered by div\.cookie-banner/)
+    const forced = mock.mock.calls.some(
+      (c) =>
+        c[1] === 'Runtime.callFunctionOn' &&
+        String((c[2] as { functionDeclaration?: string }).functionDeclaration ?? '').includes(
+          'this.checked =',
+        ),
+    )
+    expect(forced, 'must not fall back to forcing the property').toBe(false)
   })
 })
