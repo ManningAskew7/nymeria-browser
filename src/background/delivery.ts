@@ -14,8 +14,17 @@ import { callOn } from './input'
  * Measured live: a tab holding Chrome's password-breach warning recorded ZERO
  * events at a document capture listener while a fresh tab recorded all of them,
  * and both reported `input: "trusted"`, `settled: "quiet"`. The suppression is
- * per tab and rides through reloads and same-tab navigation, so only a fresh
- * tab recovers.
+ * per tab and rides through reloads.
+ *
+ * Recovery is PER CLASS, measured 2026-08-11, and NOT "only a fresh tab" as
+ * this comment used to say: navigating the same tab elsewhere fully clears an
+ * HTTP auth prompt, but leaves input dead after an `alert`, which needs the tab
+ * closed. The suppression can also OUTLIVE the dialog, so a tab can discard
+ * input with nothing left on screen to explain it.
+ *
+ * Whether the page can run script AT ALL is a different question and is not
+ * asked here: `settle.ts::rendererResponsive` owns it, and the caller checks it
+ * once up front rather than per probe.
  *
  * There is no CDP getter for that flag, and `Page.javascriptDialogOpening`
  * fires only for renderer-originated dialogs, so the cause cannot be checked

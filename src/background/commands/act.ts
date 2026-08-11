@@ -21,7 +21,7 @@ import {
 } from '../input'
 import { failuresSince as networkFailuresSince } from '../networkBuffer'
 import { resolve as resolveRef, type StaleReason } from '../snapshotRefs'
-import { settle, type SettleResult } from '../settle'
+import { rendererResponsive, settle, type SettleResult } from '../settle'
 
 /**
  * The one action executor.
@@ -147,12 +147,78 @@ const PROBE_EVENTS: Partial<Record<ActionName, readonly string[]>> = {
 function undeliveredError(action: ActionName): string {
   return (
     `the ${action} was dispatched but the page received no event, so it did nothing. ` +
-    'Input to this tab may be suppressed by a browser dialog (a password warning, ' +
-    'an HTTP auth prompt, a "Leave site?" confirmation), which is invisible to ' +
-    'page-level tools and to screenshots. Reloading does NOT clear it: open a fresh ' +
-    'tab and redo the work there, and do not dismiss browser security UI yourself. ' +
-    'If no dialog is present, the target may be disabled or the page may be ' +
+    'Input to this tab is most likely suppressed, which a browser dialog causes (a ' +
+    'password warning, an HTTP auth prompt) and which can OUTLIVE the dialog: the ' +
+    'tab keeps discarding input with nothing left on screen to explain it, so do ' +
+    'not go looking for one. Recovery, in order: navigate this tab somewhere else, ' +
+    'which clears it when a browser dialog is the cause, and if input is still not ' +
+    'delivered after that, close the tab and redo the work in a fresh one, which ' +
+    'always clears it. Reloading does not help, and never dismiss browser security ' +
+    'UI yourself. If the page is fine, the target may instead be disabled or ' +
     'swallowing the event.'
+  )
+}
+
+/**
+ * What to tell an agent whose page will not run a script.
+ *
+ * Separate from `undeliveredError` because the cause and the recovery both
+ * differ: nothing was dispatched here, the page is suspended rather than
+ * discarding, and navigating away does NOT reliably fix it (measured
+ * 2026-08-11: after navigating away from an `alert()`, scripts ran again but
+ * input stayed undelivered).
+ *
+ * Both candidates are named and neither is asserted. A dialog and a
+ * long-running script are indistinguishable from out here, and the compared
+ * Chrome extension's equivalent messages each assert one wrong cause
+ * ("showing error page", "page still loading"), which its own operator had to
+ * decode. Say what was observed, list what does it, give both recoveries.
+ */
+/**
+ * The evidence a stalled page cannot stop us collecting.
+ *
+ * Console lines and failed requests come from local buffers fed by CDP events,
+ * so they need nothing from the suspended renderer. They are also the only
+ * thing that separates the two causes the stall message refuses to choose
+ * between: an uncaught page error next to a stall points at a script, silence
+ * points at a dialog. A failure that drops them is a worse trade than the
+ * silent success this whole mechanism replaced.
+ */
+function localDiagnostics(tabId: number, startedAt: number): Record<string, unknown> {
+  const errors = consoleSince(tabId, startedAt, { only_errors: true, limit: MAX_CONSOLE_IN_RESULT })
+  const failedRequests = networkFailuresSince(tabId, startedAt, MAX_CONSOLE_IN_RESULT)
+  return {
+    ...(errors.length ? { console_errors: errors } : {}),
+    ...(failedRequests.length ? { failed_requests: failedRequests } : {}),
+  }
+}
+
+/**
+ * What to tell an agent whose action landed and then killed the page.
+ *
+ * Distinct from `stalledError` in the one way that matters: the input WAS
+ * dispatched, so the action may well have taken effect. Telling the agent
+ * nothing was sent would invite a retry that double-submits.
+ */
+function dispatchedThenStalledError(action: ActionName): string {
+  return (
+    `the ${action} was sent, and the page then stopped running scripts, so what it ` +
+    'did could not be verified. The usual cause is that the action itself raised a ' +
+    'dialog (a "Leave site?" on a form with unsaved changes, or a confirm() in the ' +
+    'page\'s own handler). DO NOT simply retry: the action may already have taken ' +
+    'effect, and repeating it could submit twice. Read the tab in a fresh one, or ' +
+    'ask the user what is on their screen.'
+  )
+}
+
+function stalledError(action: ActionName): string {
+  return (
+    `the ${action} was NOT sent: this tab did not run a script for several seconds, ` +
+    'so it could not have received input. Two things do that. A dialog the PAGE ' +
+    'raised (alert, confirm, prompt, or a "Leave site?" on navigation) suspends it ' +
+    'until answered, and chrome_dialog cannot clear it: close the tab and redo the ' +
+    'work in a fresh one. A long-running script suspends it temporarily: wait a few ' +
+    'seconds and retry, and if the retry reports this again it is the dialog.'
   )
 }
 
@@ -398,6 +464,25 @@ export async function execAct(args: unknown): Promise<CommandResult> {
 
   const tabId = a.tab_id
   const startedAt = Date.now()
+
+  // FIRST, before anything that touches the renderer.
+  //
+  // A dialog the page raised suspends the renderer, and every step below queues
+  // behind it: target resolution (`DOM.resolveNode`, or a bare `Runtime.evaluate`
+  // for a `css=`/`xpath=` selector), the delivery arm, and settle, whose own
+  // deadline is IN-PAGE and therefore never ticks. Each would wait out its share
+  // of the transport timeout to learn the same thing, so the check is worthless
+  // anywhere but here. It covers every action, not just the ones with probeable
+  // events.
+  if (!(await rendererResponsive(tabId))) {
+    return {
+      ok: false,
+      status: 'error',
+      error: stalledError(a.action),
+      data: { action: a.action, ...localDiagnostics(tabId, startedAt) },
+    }
+  }
+
   const urlBefore = await currentUrl(tabId)
   const modifiers = modifierMask(a.modifiers)
   const target = a.ref ?? null
@@ -761,6 +846,21 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // `this.click()`) produce no trusted event by definition, and `type ""`
   // dispatches nothing at all; probing either would manufacture a failure for a
   // page with nothing wrong with it.
+  // The pre-flight cleared the page BEFORE the action. An action can raise a
+  // dialog itself (a click on a submit button with a `beforeunload` handler, a
+  // handler that calls `confirm()`), and that case is at least as common as
+  // acting into a tab that was already blocked. Everything below here is
+  // renderer-bound, including settle, whose own deadline is IN-PAGE and so
+  // never ticks on a suspended page. Ask again before spending any of it.
+  if (!(await rendererResponsive(tabId))) {
+    return {
+      ok: false,
+      status: 'error',
+      error: dispatchedThenStalledError(a.action),
+      data: { action: a.action, url: urlBefore, input: inputMode, ...localDiagnostics(tabId, startedAt) },
+    }
+  }
+
   let delivered: DeliveryOutcome | null = null
   if (probe && inputMode === 'trusted') {
     delivered = await probe.read()

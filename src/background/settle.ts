@@ -1,4 +1,4 @@
-import { sendCommand } from './debuggerSession'
+import { acquire, sendCommand } from './debuggerSession'
 
 /**
  * Wait for a page to stop changing after an action.
@@ -92,6 +92,90 @@ export async function waitForTabComplete(tabId: number, timeoutMs: number): Prom
     chrome.tabs.onUpdated.addListener(listener)
     const timer = setTimeout(() => finish(false), timeoutMs)
   })
+}
+
+/**
+ * How long the renderer gets to answer a trivial expression before we call the
+ * page suspended.
+ *
+ * Generous on purpose. On a healthy page the probe returns in single-digit
+ * milliseconds, so the deadline costs nothing there and is only ever paid by a
+ * page that is genuinely stuck. A page doing a couple of seconds of synchronous
+ * work is not rare, and calling it suspended would refuse an action that was
+ * about to succeed, which is the expensive mistake here.
+ *
+ * Deliberately a single attempt, not a retry loop: a retried evaluate queues
+ * behind the same blocked main thread, so two attempts at N ms decide exactly
+ * what one attempt at 2N ms decides, while leaving a second abandoned call
+ * behind.
+ */
+const RESPONSIVE_DEADLINE_MS = 4_000
+
+/** Resolve `work`, or report a timeout, whichever comes first. */
+function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => resolve(null), ms)
+    work.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      () => {
+        clearTimeout(timer)
+        resolve(null)
+      },
+    )
+  })
+}
+
+/**
+ * Is this tab's renderer running script at all?
+ *
+ * A dialog the PAGE raised (alert/confirm/prompt/beforeunload) suspends the
+ * renderer, and EVERY renderer-bound CDP call then queues behind it:
+ * `Runtime.evaluate`, `DOM.resolveNode`, the settle probe above, whose own
+ * deadline is in-page and therefore never ticks. A command against such a tab
+ * used to ride its full transport timeout and come back with a bare failure,
+ * which is both slow and uninformative.
+ *
+ * One trivial evaluate, raced against a wall-clock deadline. It belongs here
+ * rather than inside the delivery probe because it is a PRE-condition about the
+ * page, not a verdict about an action: `navigate`, `snapshot` and the text
+ * readers hit the same wall, and tying it to the delivery counter would scope
+ * it to the handful of verbs that happen to have probeable events.
+ *
+ * A false is NOT proof of a dialog: a long-running script blocks identically
+ * and then finishes. Callers must name both causes and assert neither.
+ *
+ * Errors count as responsive. A rejected evaluate (target closed, detached
+ * session) is a different failure with its own honest message downstream, and
+ * reporting it as a dialog would send the agent hunting for one.
+ */
+export async function rendererResponsive(
+  tabId: number,
+  ms: number = RESPONSIVE_DEADLINE_MS,
+): Promise<boolean> {
+  // Attach FIRST, outside the budget. A cold attach also enables the capture
+  // domains, and on a loaded machine that is not free; spending it inside the
+  // deadline would let a slow attach read as a suspended page and refuse a
+  // healthy action. Attaching does not need the renderer, so it cannot hang on
+  // the condition being measured.
+  try {
+    await acquire(tabId)
+  } catch {
+    // Nothing to measure without a session. Downstream calls will fail with
+    // their own honest error rather than being blamed on a dialog.
+    return true
+  }
+
+  const probe = sendCommand(tabId, 'Runtime.evaluate', {
+    expression: '1',
+    returnByValue: true,
+  }).then(
+    () => true,
+    () => true,
+  )
+  return (await withDeadline(probe, ms)) === true
 }
 
 export async function settle(

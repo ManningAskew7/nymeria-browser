@@ -23,6 +23,14 @@ interface MockOptions {
   deliveryCount?: number
   /** Thrown by the probe read, to model a context that died mid-action. */
   deliveryReadThrows?: string
+  /**
+   * true models a renderer suspended by a page dialog: EVERY renderer-bound
+   * call queues behind it, not just one. Hanging a single method would model a
+   * slow call and would pass even if the liveness check were removed.
+   */
+  rendererHangs?: boolean
+  /** true models an action that RAISES a dialog: healthy until input lands. */
+  rendererHangsAfterDispatch?: boolean
   /** true models a document containing iframes, where the probe sees one only. */
   pageHasFrames?: boolean
   /** false models a target inside an iframe the probe never watched. */
@@ -46,12 +54,30 @@ function installCdpMock(opts: MockOptions = {}) {
     deliveryWorld = true,
     deliveryCount = 1,
     deliveryReadThrows,
+    rendererHangs,
+    rendererHangsAfterDispatch,
     pageHasFrames = false,
     targetInTopDocument = true,
   } = opts
   const PROBE_CONTEXT = 77
+  let dispatched = false
+
+  // Every method that needs the renderer's main thread. A page suspended by its
+  // own dialog answers NONE of them, which is what makes a single-method hang
+  // the wrong model: it would pass with the liveness check deleted.
+  const RENDERER_BOUND = new Set([
+    'Runtime.evaluate',
+    'Runtime.callFunctionOn',
+    'DOM.resolveNode',
+    'Page.createIsolatedWorld',
+  ])
 
   const sendCommand = vi.fn(async (_target: unknown, method: string, params: Record<string, unknown> = {}) => {
+    if (rendererHangs && RENDERER_BOUND.has(method)) return new Promise<never>(() => {})
+    if (method.startsWith('Input.')) dispatched = true
+    if (rendererHangsAfterDispatch && dispatched && RENDERER_BOUND.has(method)) {
+      return new Promise<never>(() => {})
+    }
     if (method === 'DOM.resolveNode') {
       return resolveNode ? { object: { objectId: 'obj-1' } } : { object: {} }
     }
@@ -463,17 +489,158 @@ describe('input delivery', () => {
     expect(result.error).toMatch(/received no event/)
   })
 
-  it('names the fresh-tab recovery and rules out reloading', async () => {
+  it('gives both recoveries in cheapest-first order and rules out reloading', async () => {
     // The agent cannot see browser UI: not in the tree, not in the console, not
     // in a screenshot. Told only that the click failed it will retry the same
     // dead tab forever, which is exactly what happened live.
+    //
+    // The ORDER is measured, not stylistic (2026-08-11). Navigating away DID
+    // recover a tab held by an HTTP auth prompt, so leading with "open a fresh
+    // tab" throws away the cheap fix and the work already done in that tab. It
+    // did NOT recover a tab poisoned by an alert(), so closing has to remain the
+    // fallback that always works.
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    expect(result.error).toMatch(/fresh tab/i)
-    expect(result.error).toMatch(/reloading does not clear it/i)
+    const error = String(result.error)
+    expect(error).toMatch(/navigate this tab/i)
+    expect(error).toMatch(/close the tab/i)
+    expect(error.search(/navigate this tab/i)).toBeLessThan(error.search(/close the tab/i))
+    expect(error).toMatch(/reloading does not help/i)
+  })
+
+  it('warns that the suppression can outlive the dialog that caused it', async () => {
+    // Measured 2026-08-11 and genuinely counter-intuitive: after an alert() was
+    // dismissed by navigating away, the tab ran scripts again (a page read
+    // returned real content in under a second) while input stayed undelivered.
+    // So there can be NOTHING on screen to find. An agent told only "a dialog
+    // may be blocking you" looks, sees a clean page, concludes the tool is
+    // wrong, and retries the dead tab.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.error).toMatch(/outlive/i)
+  })
+
+  it('fails when the action itself suspends the page, and says the input LANDED', async () => {
+    // The commoner dialog case, and the one a pre-flight alone cannot see: the
+    // click raises the dialog. Everything after dispatch is renderer-bound,
+    // including settle, whose deadline is in-page and never ticks. Telling the
+    // agent nothing was sent here would invite a retry that double-submits.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ rendererHangsAfterDispatch: true })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      const error = String(result.error)
+      expect(error).toMatch(/was sent/i)
+      expect(error).toMatch(/not simply retry/i)
+      expect(error).not.toMatch(/was NOT sent/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('fails fast on a css= target too, where nothing is armed at all', async () => {
+    // The seam this sits at matters. Target resolution runs BEFORE any delivery
+    // probe and a `css=` selector resolves through a bare `Runtime.evaluate`, so
+    // a check placed after arming never runs on this path and the command hangs
+    // its full transport timeout. Review finding, 2026-08-11.
+    vi.useFakeTimers()
+    try {
+      const cdp = installCdpMock({ rendererHangs: true })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: 'css=#go' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/did not run a script/i)
+      expect(methodsOf(cdp)).not.toContain('Input.dispatchMouseEvent')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('fails fast on a verb with no probeable events, like hover', async () => {
+    // Coverage must not be decided by PROBE_EVENTS, which excludes hover and
+    // scroll for reasons about event coalescing that have nothing to do with
+    // noticing a dead renderer.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ rendererHangs: true })
+
+      const pending = execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/did not run a script/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('fails fast WITHOUT dispatching when the page will not run a script', async () => {
+    // A page dialog suspends the renderer, so arming never returns. Before the
+    // deadline this rode the 30s transport timeout and came back with no payload
+    // and no action-scoped reason: measured live 2026-08-11 against a real
+    // alert(). The tool-layer message names the dialog cause since 71a41e7b;
+    // what was missing is failing FAST and per action.
+    //
+    // The not-dispatched assertion is the point. Sending input into a suspended
+    // page cannot work, and every step after it (dispatch, settle, verification)
+    // also runs in-page and would each wait out their own share of the timeout
+    // to learn the same thing.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      const cdp = installCdpMock({ rendererHangs: true })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(methodsOf(cdp)).not.toContain('Input.dispatchMouseEvent')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('names both causes of a stall and asserts neither', async () => {
+    // A dialog and a long-running script are indistinguishable from out here.
+    // The compared Chrome extension's equivalent messages each assert one wrong
+    // cause ("showing error page", "page still loading") and its own operator
+    // had to decode them, so this one lists both and commits to neither.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ rendererHangs: true })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      const error = String(result.error)
+      expect(error).toMatch(/did not run a script/i)
+      expect(error).toMatch(/alert, confirm, prompt/i)
+      expect(error).toMatch(/long-running script/i)
+      // Must not claim delivery failed: nothing was sent, so there is no verdict.
+      expect(error).not.toMatch(/received no event/i)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('keeps the whole verification payload on the failure', async () => {
