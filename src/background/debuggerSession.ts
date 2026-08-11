@@ -23,6 +23,9 @@ import { backgroundLogger as logger } from '../utils/logger'
 const DEBUGGER_VERSION = '1.3'
 const DETACH_LINGER_MS = 10_000
 
+/** Domains enabled on every attach so their event streams are never late. */
+const CAPTURE_DOMAINS = ['Runtime', 'Network'] as const
+
 interface Session {
   refCount: number
   detachTimer: ReturnType<typeof setTimeout> | null
@@ -104,15 +107,18 @@ export async function acquire(tabId: number): Promise<void> {
     s.attached = true
     s.domains.clear()
     logger.log(`debugger attached tab=${tabId}`)
-    // Runtime carries console messages and uncaught exceptions, which the
-    // post-action verification payload reports. Enable it eagerly and
-    // best-effort so capture is running before the first action, and send it
-    // raw rather than through sendCommand to avoid re-entering the refcount.
-    void Promise.resolve(chrome.debugger.sendCommand({ tabId }, 'Runtime.enable', {}))
-      .then(() => {
-        sessions.get(tabId)?.domains.add('Runtime')
-      })
-      .catch((e: unknown) => logger.warn(`Runtime.enable failed tab=${tabId}:`, e))
+    // Runtime carries console messages and uncaught exceptions; Network
+    // carries request failures. Both feed the post-action verification
+    // payload, so both are enabled eagerly: capture that starts when you
+    // first ASK is capture that is always empty the first time you ask.
+    // Sent raw rather than through sendCommand to avoid re-entering refcount.
+    for (const domain of CAPTURE_DOMAINS) {
+      void Promise.resolve(chrome.debugger.sendCommand({ tabId }, `${domain}.enable`, {}))
+        .then(() => {
+          sessions.get(tabId)?.domains.add(domain)
+        })
+        .catch((e: unknown) => logger.warn(`${domain}.enable failed tab=${tabId}:`, e))
+    }
   }
 }
 

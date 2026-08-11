@@ -7,6 +7,7 @@ import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs } from './debuggerSession'
 import { clear as clearRefs } from './snapshotRefs'
 import { forgetHook as forgetConsoleHook, installCdpConsoleCapture } from './consoleBuffer'
+import { clear as clearNetwork, installCdpNetworkCapture } from './networkBuffer'
 import {
   getSnapshot,
   loadFromStorage,
@@ -31,9 +32,12 @@ setDispatchHooks({
 // the top level: the buffer must already be filling before the first action,
 // or the post-action verification has nothing to report.
 installCdpConsoleCapture()
+installCdpNetworkCapture()
 
 // When a tab navigates we invalidate per-tab caches: ref IDs are stale and
-// the console-capture hook must be re-injected.
+// the console-capture hook must be re-injected. Network history is kept
+// deliberately: the requests a navigation itself fired are often the answer
+// to "why did that go wrong".
 chrome.webNavigation?.onCommitted.addListener?.((details) => {
   if (details.frameId !== 0) return
   clearRefs(details.tabId)
@@ -42,6 +46,7 @@ chrome.webNavigation?.onCommitted.addListener?.((details) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearRefs(tabId)
   forgetConsoleHook(tabId)
+  clearNetwork(tabId)
 })
 
 async function bootstrap(): Promise<void> {

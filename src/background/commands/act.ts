@@ -17,6 +17,7 @@ import {
   typeText,
   type Point,
 } from '../input'
+import { failuresSince as networkFailuresSince } from '../networkBuffer'
 import { resolve as resolveRef, type StaleReason } from '../snapshotRefs'
 import { settle, type SettleResult } from '../settle'
 
@@ -48,6 +49,7 @@ export type ActionName =
   | 'scroll'
   | 'scroll_to'
   | 'drag'
+  | 'upload'
   | 'wait'
 
 interface WaitFor {
@@ -70,6 +72,10 @@ interface ActArgs {
   wait_for?: WaitFor
   timeout_ms?: number
   settle?: boolean
+  // upload
+  file_name?: string
+  file_mime?: string
+  file_base64?: string
 }
 
 const DEFAULT_WAIT_MS = 5_000
@@ -88,6 +94,7 @@ const NEEDS_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
   'uncheck',
   'scroll_to',
   'drag',
+  'upload',
 ])
 
 type TargetResolution =
@@ -226,6 +233,9 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
     only_errors: true,
     limit: MAX_CONSOLE_IN_RESULT,
   })
+  // A request that came back 500 without throwing is the commonest silent
+  // failure on a real site, and it never reaches the console.
+  const failedRequests = networkFailuresSince(v.tabId, v.startedAt, MAX_CONSOLE_IN_RESULT)
   return {
     action: v.action,
     ...(v.target ? { target: v.target } : {}),
@@ -237,6 +247,7 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
     input: v.inputMode,
     ...(v.settleResult ? { settled: v.settleResult } : {}),
     ...(errors.length ? { console_errors: errors } : {}),
+    ...(failedRequests.length ? { failed_requests: failedRequests } : {}),
     ...(v.extra ?? {}),
   }
 }
@@ -532,6 +543,48 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       case 'scroll_to': {
         if (!objectId) return { ok: false, status: 'error', error: 'scroll_to requires ref' }
         await scrollIntoView(tabId, objectId)
+        break
+      }
+      case 'upload': {
+        if (!objectId) return { ok: false, status: 'error', error: 'upload requires ref' }
+        if (!a.file_base64 || !a.file_name) {
+          return { ok: false, status: 'error', error: 'upload requires file_name and file_base64' }
+        }
+        // Necessarily synthetic: CDP's DOM.setFileInputFiles takes a path on
+        // the machine running the browser, and the file lives in the user's
+        // Nymeria workspace, which may be on a different host entirely. So the
+        // bytes ride the wire and a File is constructed in the page. This also
+        // reaches display:none inputs, which coordinates never could.
+        const outcome = await callOn<{ ok: boolean; mode: string } | null>(
+          tabId,
+          objectId,
+          `function(b64, name, mime){
+            const bin = atob(b64);
+            const bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const file = new File([bytes], name, { type: mime || 'application/octet-stream' });
+            const dt = new DataTransfer();
+            dt.items.add(file);
+            if (this.tagName === 'INPUT' && this.type === 'file') {
+              this.files = dt.files;
+              this.dispatchEvent(new Event('input', { bubbles: true }));
+              this.dispatchEvent(new Event('change', { bubbles: true }));
+              return { ok: true, mode: 'file-input' };
+            }
+            const opts = { bubbles: true, cancelable: true, dataTransfer: dt };
+            this.dispatchEvent(new DragEvent('dragenter', opts));
+            this.dispatchEvent(new DragEvent('dragover', opts));
+            this.dispatchEvent(new DragEvent('drop', opts));
+            return { ok: true, mode: 'drop-target' };
+          }`,
+          [a.file_base64, a.file_name, a.file_mime ?? ''],
+        )
+        if (!outcome?.ok) {
+          return { ok: false, status: 'error', error: 'upload did not take on that element' }
+        }
+        inputMode = 'synthetic'
+        extra.uploaded = { file_name: a.file_name, mode: outcome.mode }
+        extra.synthetic_reason = 'file contents must be injected; CDP file input needs a local path'
         break
       }
       case 'scroll': {
