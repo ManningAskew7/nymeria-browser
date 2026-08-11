@@ -160,7 +160,7 @@ export function Popup() {
     <div className="container">
       <div className="header">
         <h1>Nymeria Browser</h1>
-        <div className="version">v0.2.0 · Phase 2 (chrome_* tools)</div>
+        <div className="version">v0.2.0</div>
       </div>
       <div className="body">
         <StatusCard status={snapshot?.status ?? { kind: 'unconfigured' }} now={now} />
