@@ -90,7 +90,7 @@ beforeEach(() => {
 
 describe('trusted input', () => {
   it('clicks through browser-level input events, not page-synthesized ones', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -106,7 +106,7 @@ describe('trusted input', () => {
   })
 
   it('double_click presses twice with an increasing click count', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock()
 
     await execAct({ tab_id: TAB, action: 'double_click', ref: '@e1' })
@@ -118,7 +118,7 @@ describe('trusted input', () => {
   })
 
   it('falls back to synthetic dispatch when the element has no layout box, and says so', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock({ geometry: null })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -131,7 +131,7 @@ describe('trusted input', () => {
   })
 
   it('refuses the click when another element covers the point, and names it', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock({ hit: { hit: false, blocker: 'div#cookie-banner' } })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -144,7 +144,7 @@ describe('trusted input', () => {
   })
 
   it('fills by inserting text into the focused element and reports the previous value', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock({ value: 'before@example.com' })
 
     const result = await execAct({
@@ -166,7 +166,7 @@ describe('trusted input', () => {
 
 describe('ref lifecycle', () => {
   it('refuses to act on a ref minted on a different URL and says to re-read', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), 'https://example.com/checkout')
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), 'https://example.com/checkout')
     const cdp = installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -188,7 +188,7 @@ describe('ref lifecycle', () => {
   })
 
   it('reports unknown-ref for a ref that was never minted', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e99' })
@@ -198,7 +198,7 @@ describe('ref lifecycle', () => {
   })
 
   it('reports a ref that resolves to nothing as stale rather than acting', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock({ resolveNode: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -211,7 +211,7 @@ describe('ref lifecycle', () => {
 
 describe('verification payload', () => {
   it('surfaces console errors raised since the action started', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock()
     // An error from before the action must not be attributed to it.
     pushConsole(TAB, { level: 'error', text: 'stale earlier error', ts: Date.now() - 60_000 })
@@ -225,7 +225,7 @@ describe('verification payload', () => {
   })
 
   it('reports a URL change caused by the action', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock()
     const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
     get.mockImplementationOnce(async () => ({ id: TAB, url: TAB_URL }))
@@ -239,7 +239,7 @@ describe('verification payload', () => {
   })
 
   it('waits for the page to settle and reports the outcome', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock({ settleValue: 'quiet' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -250,7 +250,7 @@ describe('verification payload', () => {
   })
 
   it('reports a deadline settle without failing the action', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock({ settleValue: 'deadline' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -260,7 +260,7 @@ describe('verification payload', () => {
   })
 
   it('skips settling when settle is disabled', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1', settle: false })
@@ -327,7 +327,7 @@ describe('argument handling', () => {
   })
 
   it('requires a value for fill', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock()
     const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1' })
     expect(result.ok).toBe(false)
@@ -366,7 +366,7 @@ describe('argument handling', () => {
   })
 
   it('selects by visible label, not just by option value', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock({ selectMatches: true })
 
     const result = await execAct({ tab_id: TAB, action: 'select', ref: '@e1', value: 'Express shipping' })
@@ -380,7 +380,7 @@ describe('argument handling', () => {
   })
 
   it('fails a select whose value matches no option', async () => {
-    setRefs(TAB, new Map([['e1', 100]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock({ selectMatches: false })
 
     const result = await execAct({ tab_id: TAB, action: 'select', ref: '@e1', value: 'Teleport' })

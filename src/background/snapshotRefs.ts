@@ -17,10 +17,23 @@
  */
 
 type Ref = string // "e1", "e2", ...
-type BackendNodeId = number
+
+/**
+ * Where a ref actually lives.
+ *
+ * `backendNodeId` is a PROCESS-global counter, not a page-global one, so the
+ * same number identifies different elements in the main document and in a
+ * cross-origin iframe. Storing the owning session alongside it is what stops
+ * an iframe ref from silently resolving to an unrelated main-frame element.
+ */
+export interface RefTarget {
+  backendNodeId: number
+  /** Undefined means the root page session. */
+  sessionId?: string
+}
 
 interface TabRefs {
-  byRef: Map<Ref, BackendNodeId>
+  byRef: Map<Ref, RefTarget>
   urlAtSnapshot: string | null
   /** Bumped on every snapshot so callers can detect a re-read mid-sequence. */
   generation: number
@@ -29,13 +42,13 @@ interface TabRefs {
 export type StaleReason = 'no-snapshot' | 'unknown-ref' | 'navigated'
 
 export type RefResolution =
-  | { ok: true; backendNodeId: number; generation: number }
+  | { ok: true; backendNodeId: number; sessionId?: string; generation: number }
   | { ok: false; reason: StaleReason; detail: string }
 
 const cache = new Map<number, TabRefs>()
 let generationCounter = 0
 
-export function set(tabId: number, refs: Map<Ref, BackendNodeId>, url: string | null = null): number {
+export function set(tabId: number, refs: Map<Ref, RefTarget>, url: string | null = null): number {
   generationCounter += 1
   cache.set(tabId, { byRef: new Map(refs), urlAtSnapshot: url, generation: generationCounter })
   return generationCounter
@@ -65,15 +78,20 @@ export function resolve(tabId: number, target: string, currentUrl?: string | nul
       detail: `page moved from ${entry.urlAtSnapshot} to ${currentUrl} since the snapshot (re-read the page)`,
     }
   }
-  const backendNodeId = entry.byRef.get(ref)
-  if (backendNodeId == null) {
+  const refTarget = entry.byRef.get(ref)
+  if (refTarget == null) {
     return {
       ok: false,
       reason: 'unknown-ref',
       detail: `unknown ref @${ref} (re-read the page to refresh refs)`,
     }
   }
-  return { ok: true, backendNodeId, generation: entry.generation }
+  return {
+    ok: true,
+    backendNodeId: refTarget.backendNodeId,
+    sessionId: refTarget.sessionId,
+    generation: entry.generation,
+  }
 }
 
 export function clear(tabId: number): void {

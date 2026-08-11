@@ -59,6 +59,8 @@ interface MockChrome {
     update: ReturnType<typeof vi.fn>
     remove: ReturnType<typeof vi.fn>
     reload: ReturnType<typeof vi.fn>
+    goBack: ReturnType<typeof vi.fn>
+    goForward: ReturnType<typeof vi.fn>
     get: ReturnType<typeof vi.fn>
     captureVisibleTab: ReturnType<typeof vi.fn>
     onUpdated: { addListener: ReturnType<typeof vi.fn>; removeListener: ReturnType<typeof vi.fn> }
@@ -122,6 +124,8 @@ function makeMockChrome(): MockChrome {
         if (idx >= 0) this._tabs.splice(idx, 1)
       }),
       reload: vi.fn(async () => undefined),
+      goBack: vi.fn(async () => undefined),
+      goForward: vi.fn(async () => undefined),
       get: vi.fn(async function (this: MockChrome['tabs'], tabId: number) {
         const tab = this._tabs.find((t) => t.id === tabId)
         if (!tab) throw new Error('no such tab')

@@ -35,8 +35,8 @@ describe('formatTree', () => {
     expect(text).toMatch(/RootWebArea "Test page"/)
     expect(text).toMatch(/button "Submit" \[ref=@e1\]/)
     expect(text).toMatch(/textbox "Email" \[ref=@e2\]/)
-    expect(refs.get('e1')).toBe(100)
-    expect(refs.get('e2')).toBe(200)
+    expect(refs.get('e1')).toEqual({ backendNodeId: 100, sessionId: undefined })
+    expect(refs.get('e2')).toEqual({ backendNodeId: 200, sessionId: undefined })
   })
 
   it('skips ignored nodes', () => {

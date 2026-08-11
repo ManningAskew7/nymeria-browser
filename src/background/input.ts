@@ -1,4 +1,4 @@
-import { sendCommand } from './debuggerSession'
+import { sendCommand, type Cdp } from './debuggerSession'
 
 /**
  * Trusted input primitives.
@@ -72,12 +72,12 @@ export const KEY_TABLE: Record<string, { code: string; key?: string; windowsVirt
 }
 
 export async function callOn<T = unknown>(
-  tabId: number,
+  target: Cdp,
   objectId: string,
   fn: string,
   args: unknown[] = [],
 ): Promise<T> {
-  const r = await sendCommand<{ result: { value?: T } }>(tabId, 'Runtime.callFunctionOn', {
+  const r = await sendCommand<{ result: { value?: T } }>(target, 'Runtime.callFunctionOn', {
     objectId,
     functionDeclaration: fn,
     arguments: args.map((v) => ({ value: v })),
@@ -88,9 +88,9 @@ export async function callOn<T = unknown>(
 }
 
 /** Scroll the element into view. Best-effort: a detached node just fails. */
-export async function scrollIntoView(tabId: number, objectId: string): Promise<void> {
+export async function scrollIntoView(target: Cdp, objectId: string): Promise<void> {
   await callOn(
-    tabId,
+    target,
     objectId,
     'function(){ this.scrollIntoView({block: "center", inline: "center", behavior: "instant"}); }',
   )
@@ -102,9 +102,9 @@ export async function scrollIntoView(tabId: number, objectId: string): Promise<v
  * back to synthetic dispatch rather than to fail: hidden file inputs are a
  * legitimate target and have no box by design.
  */
-export async function elementGeometry(tabId: number, objectId: string): Promise<ElementGeometry | null> {
+export async function elementGeometry(target: Cdp, objectId: string): Promise<ElementGeometry | null> {
   const rect = await callOn<{ x: number; y: number; w: number; h: number } | null>(
-    tabId,
+    target,
     objectId,
     `function(){
       const r = this.getBoundingClientRect();
@@ -114,6 +114,52 @@ export async function elementGeometry(tabId: number, objectId: string): Promise<
   )
   if (!rect) return null
   return { point: { x: rect.x, y: rect.y }, width: rect.w, height: rect.h }
+}
+
+/**
+ * Origin of a cross-origin frame in ROOT viewport coordinates.
+ *
+ * An element inside an iframe reports a rect relative to that frame's own
+ * viewport, but `Input.*` is dispatched on the root session in root
+ * coordinates (Chrome hit-tests and routes the event into the frame's widget
+ * for us). The two must be composed or every click inside a frame lands at
+ * the wrong place on the page.
+ *
+ * Handles one level of nesting: a frame whose parent is the main document.
+ * Deeper nesting would need the chain walked, which no real checkout has
+ * needed so far; the offset simply degrades to the outermost frame.
+ */
+export async function frameOffset(tabId: number, frameId: string): Promise<Point> {
+  const zero = { x: 0, y: 0 }
+  try {
+    const owner = await sendCommand<{ backendNodeId?: number }>(tabId, 'DOM.getFrameOwner', {
+      frameId,
+    })
+    if (!owner.backendNodeId) return zero
+    const resolved = await sendCommand<{ object?: { objectId?: string } }>(
+      tabId,
+      'DOM.resolveNode',
+      { backendNodeId: owner.backendNodeId },
+    )
+    const objectId = resolved.object?.objectId
+    if (!objectId) return zero
+    const offset = await callOn<Point | null>(
+      tabId,
+      objectId,
+      `function(){
+        const r = this.getBoundingClientRect();
+        const cs = getComputedStyle(this);
+        const px = (v) => parseFloat(v || '0') || 0;
+        return {
+          x: r.left + px(cs.paddingLeft) + px(cs.borderLeftWidth),
+          y: r.top + px(cs.paddingTop) + px(cs.borderTopWidth),
+        };
+      }`,
+    )
+    return offset ?? zero
+  } catch {
+    return zero
+  }
 }
 
 export interface HitTest {
@@ -129,9 +175,9 @@ export interface HitTest {
  * overlay and reported success". Naming the interceptor lets the agent
  * dismiss it instead of retrying blindly.
  */
-export async function hitTest(tabId: number, objectId: string, point: Point): Promise<HitTest> {
+export async function hitTest(target: Cdp, objectId: string, point: Point): Promise<HitTest> {
   return callOn<HitTest>(
-    tabId,
+    target,
     objectId,
     `function(x, y){
       const top = document.elementFromPoint(x, y);
@@ -148,12 +194,12 @@ export async function hitTest(tabId: number, objectId: string, point: Point): Pr
 }
 
 async function mouseEvent(
-  tabId: number,
+  target: Cdp,
   type: 'mouseMoved' | 'mousePressed' | 'mouseReleased',
   point: Point,
   opts: { button?: MouseButton; clickCount?: number; modifiers?: number } = {},
 ): Promise<void> {
-  await sendCommand(tabId, 'Input.dispatchMouseEvent', {
+  await sendCommand(target, 'Input.dispatchMouseEvent', {
     type,
     x: Math.round(point.x),
     y: Math.round(point.y),
@@ -165,44 +211,44 @@ async function mouseEvent(
 }
 
 /** Move the pointer first so hover handlers fire before the press. */
-export async function trustedHover(tabId: number, point: Point, modifiers = 0): Promise<void> {
-  await mouseEvent(tabId, 'mouseMoved', point, { modifiers })
+export async function trustedHover(target: Cdp, point: Point, modifiers = 0): Promise<void> {
+  await mouseEvent(target, 'mouseMoved', point, { modifiers })
 }
 
 export async function trustedClick(
-  tabId: number,
+  target: Cdp,
   point: Point,
   opts: { button?: MouseButton; clickCount?: number; modifiers?: number } = {},
 ): Promise<void> {
   const button = opts.button ?? 'left'
   const modifiers = opts.modifiers ?? 0
   const clickCount = opts.clickCount ?? 1
-  await mouseEvent(tabId, 'mouseMoved', point, { modifiers })
+  await mouseEvent(target, 'mouseMoved', point, { modifiers })
   for (let n = 1; n <= clickCount; n += 1) {
-    await mouseEvent(tabId, 'mousePressed', point, { button, clickCount: n, modifiers })
-    await mouseEvent(tabId, 'mouseReleased', point, { button, clickCount: n, modifiers })
+    await mouseEvent(target, 'mousePressed', point, { button, clickCount: n, modifiers })
+    await mouseEvent(target, 'mouseReleased', point, { button, clickCount: n, modifiers })
   }
 }
 
-export async function trustedDrag(tabId: number, from: Point, to: Point, modifiers = 0): Promise<void> {
-  await mouseEvent(tabId, 'mouseMoved', from, { modifiers })
-  await mouseEvent(tabId, 'mousePressed', from, { button: 'left', clickCount: 1, modifiers })
+export async function trustedDrag(target: Cdp, from: Point, to: Point, modifiers = 0): Promise<void> {
+  await mouseEvent(target, 'mouseMoved', from, { modifiers })
+  await mouseEvent(target, 'mousePressed', from, { button: 'left', clickCount: 1, modifiers })
   // A couple of intermediate moves: drag implementations that listen for
   // movement deltas ignore a single teleporting move.
   const steps = 4
   for (let i = 1; i <= steps; i += 1) {
     await mouseEvent(
-      tabId,
+      target,
       'mouseMoved',
       { x: from.x + ((to.x - from.x) * i) / steps, y: from.y + ((to.y - from.y) * i) / steps },
       { button: 'left', modifiers },
     )
   }
-  await mouseEvent(tabId, 'mouseReleased', to, { button: 'left', clickCount: 1, modifiers })
+  await mouseEvent(target, 'mouseReleased', to, { button: 'left', clickCount: 1, modifiers })
 }
 
-export async function focusElement(tabId: number, objectId: string): Promise<void> {
-  await sendCommand(tabId, 'DOM.focus', { objectId })
+export async function focusElement(target: Cdp, objectId: string): Promise<void> {
+  await sendCommand(target, 'DOM.focus', { objectId })
 }
 
 /**
@@ -210,11 +256,11 @@ export async function focusElement(tabId: number, objectId: string): Promise<voi
  * key events, so it is fast and reliable for ordinary fields. Use
  * `typeText` for widgets that listen for keydown.
  */
-export async function insertText(tabId: number, text: string): Promise<void> {
-  await sendCommand(tabId, 'Input.insertText', { text })
+export async function insertText(target: Cdp, text: string): Promise<void> {
+  await sendCommand(target, 'Input.insertText', { text })
 }
 
-export async function dispatchKey(tabId: number, key: string, modifiers = 0): Promise<void> {
+export async function dispatchKey(target: Cdp, key: string, modifiers = 0): Promise<void> {
   const entry = KEY_TABLE[key]
   const text = entry ? entry.key ?? '' : key.length === 1 ? key : ''
   const code = entry ? entry.code : key.length === 1 ? `Key${key.toUpperCase()}` : key
@@ -228,25 +274,25 @@ export async function dispatchKey(tabId: number, key: string, modifiers = 0): Pr
       ? { windowsVirtualKeyCode: entry.windowsVirtualKeyCode }
       : {}),
   }
-  await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyDown', ...common })
+  await sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyDown', ...common })
   // A modified chord (ctrl+a) must not emit a character.
   if (text && modifiers === 0) {
-    await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'char', ...common })
+    await sendCommand(target, 'Input.dispatchKeyEvent', { type: 'char', ...common })
   }
-  await sendCommand(tabId, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common })
+  await sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common })
 }
 
 /** Per-character key events, for widgets that need keydown/keyup per key. */
-export async function typeText(tabId: number, text: string): Promise<void> {
+export async function typeText(target: Cdp, text: string): Promise<void> {
   for (const ch of text) {
-    await dispatchKey(tabId, ch)
+    await dispatchKey(target, ch)
   }
 }
 
 /** Select the whole current value so the next insert replaces it. */
-export async function selectAllIn(tabId: number, objectId: string): Promise<void> {
+export async function selectAllIn(target: Cdp, objectId: string): Promise<void> {
   await callOn(
-    tabId,
+    target,
     objectId,
     `function(){
       if (typeof this.select === 'function') { this.select(); return; }

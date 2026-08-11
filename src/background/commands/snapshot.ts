@@ -1,10 +1,12 @@
 import type { CommandResult } from '../../shared/types'
-import { sendCommand } from '../debuggerSession'
-import { set as setRefs } from '../snapshotRefs'
+import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
+import { resolve as resolveRef, set as setRefs, type RefTarget } from '../snapshotRefs'
 
 interface SnapshotArgs {
   tab_id: number
   detail?: 'interactive' | 'full' | 'minimal'
+  /** Re-root the tree at a previously minted ref, e.g. "@e12". */
+  scope_ref?: string
   scope_selector?: string
 }
 
@@ -126,17 +128,19 @@ function renderValue(node: AXNode): string {
 
 interface FormattedSnapshot {
   text: string
-  refs: Map<string, number>
+  refs: Map<string, RefTarget>
+  nextCounter: number
 }
 
 function formatTree(
   nodes: AXNode[],
   rootIds: string[],
   detail: 'interactive' | 'full' | 'minimal',
+  opts: { sessionId?: string; startCounter?: number } = {},
 ): FormattedSnapshot {
   const byId = new Map<string, AXNode>(nodes.map((n) => [n.nodeId, n]))
-  const refs = new Map<string, number>()
-  let refCounter = 0
+  const refs = new Map<string, RefTarget>()
+  let refCounter = opts.startCounter ?? 0
   const lines: string[] = []
 
   function walk(id: string, depth: number): void {
@@ -152,7 +156,9 @@ function formatTree(
       if (isInteractive(node) && typeof node.backendDOMNodeId === 'number') {
         refCounter += 1
         const refId = `e${refCounter}`
-        refs.set(refId, node.backendDOMNodeId)
+        // The session is stored with the id: backendNodeId is process-global,
+        // so the same number means different elements in different frames.
+        refs.set(refId, { backendNodeId: node.backendDOMNodeId, sessionId: opts.sessionId })
         refMarker = ` [ref=@${refId}]`
       }
       line = `${'  '.repeat(depth)}- ${role}${name}${value}${refMarker}`
@@ -163,7 +169,57 @@ function formatTree(
   }
 
   for (const id of rootIds) walk(id, 0)
-  return { text: lines.join('\n'), refs }
+  return { text: lines.join('\n'), refs, nextCounter: refCounter }
+}
+
+/** Roots of an AX node list: the nodes whose parent is not in the list. */
+function rootsOf(nodes: AXNode[]): string[] {
+  const ids = new Set(nodes.map((n) => n.nodeId))
+  return nodes.filter((n) => !n.parentId || !ids.has(n.parentId)).map((n) => n.nodeId)
+}
+
+async function treeFor(target: Cdp): Promise<AXNode[]> {
+  const resp = await sendCommand<{ nodes: AXNode[] }>(
+    target,
+    'Accessibility.getFullAXTree',
+    {},
+  )
+  return resp.nodes ?? []
+}
+
+/** Resolve a scope ref or selector to a backendNodeId to re-root the tree at. */
+async function resolveScopeNode(
+  tabId: number,
+  scopeRef?: string,
+  scopeSelector?: string,
+): Promise<{ backendNodeId: number | null; error?: string }> {
+  if (scopeRef) {
+    const tab = await chrome.tabs.get(tabId).catch(() => null)
+    const resolution = resolveRef(tabId, scopeRef, tab?.url ?? null)
+    if (!resolution.ok) return { backendNodeId: null, error: resolution.detail }
+    return { backendNodeId: resolution.backendNodeId }
+  }
+  const evald = await sendCommand<{ result?: { objectId?: string; subtype?: string } }>(
+    tabId,
+    'Runtime.evaluate',
+    {
+      expression: `document.querySelector(${JSON.stringify(scopeSelector)})`,
+      returnByValue: false,
+    },
+  )
+  if (!evald.result?.objectId || evald.result.subtype === 'null') {
+    return { backendNodeId: null, error: `scope selector matched no element: ${scopeSelector}` }
+  }
+  const described = await sendCommand<{ node?: { backendNodeId?: number } }>(
+    tabId,
+    'DOM.describeNode',
+    { objectId: evald.result.objectId },
+  )
+  const backendNodeId = described.node?.backendNodeId
+  if (backendNodeId == null) {
+    return { backendNodeId: null, error: 'could not resolve the scope element' }
+  }
+  return { backendNodeId }
 }
 
 export async function execSnapshot(args: unknown): Promise<CommandResult> {
@@ -173,52 +229,80 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   }
   const detail = a.detail ?? 'interactive'
 
-  // Resolve scope to a sanity check if a scope_selector was provided.
-  // Full AX scoping would need a CDP DOM.querySelector +
-  // Accessibility.getPartialAXTree round-trip; for now we just confirm
-  // the element exists and fetch the full tree.
-  if (a.scope_selector) {
-    try {
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId: a.tab_id },
-        func: (sel: string) => Boolean(document.querySelector(sel)),
-        args: [a.scope_selector],
-      })
-      if (!result) {
-        return {
-          ok: true,
-          status: 'success',
-          data: { tree: '', note: 'scope_selector matched no element' },
-        }
+  // Scope, when asked for, is resolved to a real backend node and used as the
+  // tree root. The previous implementation only probed that a selector
+  // matched something and then returned the whole page anyway, which quietly
+  // made every scoped read a full read.
+  let scopeNodeId: number | null = null
+  if (a.scope_ref || a.scope_selector) {
+    const scoped = await resolveScopeNode(a.tab_id, a.scope_ref, a.scope_selector)
+    if (scoped.error) return { ok: false, status: 'error', error: scoped.error }
+    scopeNodeId = scoped.backendNodeId
+  }
+
+  const nodes = await treeFor(a.tab_id)
+  let rootIds = rootsOf(nodes)
+
+  if (scopeNodeId != null) {
+    const scopeNode = nodes.find((n) => n.backendDOMNodeId === scopeNodeId)
+    if (!scopeNode) {
+      return {
+        ok: false,
+        status: 'error',
+        error: 'that element is not in the accessibility tree (it may be hidden from assistive tech)',
       }
-    } catch (e) {
-      return { ok: false, status: 'error', error: `scope_selector failed: ${String(e)}` }
+    }
+    rootIds = [scopeNode.nodeId]
+  }
+
+  const main = formatTree(nodes, rootIds, detail)
+  const allRefs = new Map<string, RefTarget>(main.refs)
+  const sections = [main.text]
+  let counter = main.nextCounter
+
+  // Cross-origin iframes run in their own process and are absent from the
+  // page's own tree: the <iframe> node appears with an empty subtree and no
+  // error. Reading each attached frame session is what makes a payment field
+  // or a consent dialog reachable at all. A scoped read stays in its scope.
+  if (scopeNodeId == null) {
+    for (const frame of frameSessions(a.tab_id)) {
+      try {
+        const frameNodes = await treeFor({ tabId: a.tab_id, sessionId: frame.sessionId })
+        if (!frameNodes.length) continue
+        const formatted = formatTree(frameNodes, rootsOf(frameNodes), detail, {
+          sessionId: frame.sessionId,
+          startCounter: counter,
+        })
+        if (!formatted.text.trim()) continue
+        counter = formatted.nextCounter
+        for (const [refId, target] of formatted.refs) allRefs.set(refId, target)
+        const indented = formatted.text
+          .split('\n')
+          .map((line) => `  ${line}`)
+          .join('\n')
+        sections.push(`- iframe "${frame.url}"\n${indented}`)
+      } catch {
+        // One unreadable frame must not cost the whole page read.
+        sections.push(`- iframe "${frame.url}" [unreadable]`)
+      }
     }
   }
 
-  const resp = await sendCommand<{ nodes: AXNode[] }>(a.tab_id, 'Accessibility.getFullAXTree', {})
-  const nodes = resp.nodes ?? []
-  // Find the root(s): nodes whose parentId is missing from the map.
-  const ids = new Set(nodes.map((n) => n.nodeId))
-  const rootIds = nodes.filter((n) => !n.parentId || !ids.has(n.parentId)).map((n) => n.nodeId)
-
-  const { text, refs } = formatTree(nodes, rootIds, detail)
-  // Record the URL the refs were minted on: it is the backstop that stops a
-  // ref surviving a navigation the invalidation hooks missed.
   const tab = await chrome.tabs.get(a.tab_id).catch(() => null)
   const url = tab?.url ?? null
-  setRefs(a.tab_id, refs, url)
+  setRefs(a.tab_id, allRefs, url)
 
   return {
     ok: true,
     status: 'success',
     data: {
-      tree: text,
-      ref_count: refs.size,
+      tree: sections.join('\n'),
+      ref_count: allRefs.size,
       detail,
       url,
+      frames: frameSessions(a.tab_id).length,
     },
   }
 }
 
-export const __test = { formatTree, isInteractive, strVal }
+export const __test = { formatTree, isInteractive, strVal, rootsOf }

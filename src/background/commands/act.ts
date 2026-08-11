@@ -1,6 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { readSince as consoleSince } from '../consoleBuffer'
-import { sendCommand } from '../debuggerSession'
+import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
 import {
   callOn,
   dispatchKey,
@@ -9,6 +9,7 @@ import {
   hitTest,
   insertText,
   modifierMask,
+  frameOffset,
   scrollIntoView,
   selectAllIn,
   trustedClick,
@@ -98,7 +99,9 @@ const NEEDS_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
 ])
 
 type TargetResolution =
-  | { ok: true; objectId: string }
+  /** `session` is the CDP addressee that OWNS the node: a cross-origin frame
+   *  has its own session, and its objectIds are meaningless anywhere else. */
+  | { ok: true; objectId: string; session: Cdp; sessionId?: string }
   | { ok: false; error: string; stale?: StaleReason }
 
 async function currentUrl(tabId: number): Promise<string | null> {
@@ -130,10 +133,15 @@ async function resolveTarget(
     if (!resolution.ok) {
       return { ok: false, error: resolution.detail, stale: resolution.reason }
     }
+    const session: Cdp = resolution.sessionId
+      ? { tabId, sessionId: resolution.sessionId }
+      : tabId
     try {
-      const resp = await sendCommand<{ object?: { objectId?: string } }>(tabId, 'DOM.resolveNode', {
-        backendNodeId: resolution.backendNodeId,
-      })
+      const resp = await sendCommand<{ object?: { objectId?: string } }>(
+        session,
+        'DOM.resolveNode',
+        { backendNodeId: resolution.backendNodeId },
+      )
       const objectId = resp.object?.objectId
       if (!objectId) {
         return {
@@ -142,7 +150,7 @@ async function resolveTarget(
           stale: 'unknown-ref',
         }
       }
-      return { ok: true, objectId }
+      return { ok: true, objectId, session, sessionId: resolution.sessionId }
     } catch (e) {
       return {
         ok: false,
@@ -165,7 +173,7 @@ async function resolveTarget(
     if (!evald.result.objectId || evald.result.subtype === 'null') {
       return { ok: false, error: `${isCss ? 'css selector' : 'xpath'} matched no element: ${query}` }
     }
-    return { ok: true, objectId: evald.result.objectId }
+    return { ok: true, objectId: evald.result.objectId, session: tabId }
   }
   return {
     ok: false,
@@ -200,10 +208,10 @@ async function describeFocused(tabId: number): Promise<FocusedDescription | null
   }
 }
 
-async function stillConnected(tabId: number, objectId: string | null): Promise<boolean | null> {
+async function stillConnected(session: Cdp, objectId: string | null): Promise<boolean | null> {
   if (!objectId) return null
   try {
-    return await callOn<boolean>(tabId, objectId, 'function(){ return this.isConnected === true; }')
+    return await callOn<boolean>(session, objectId, 'function(){ return this.isConnected === true; }')
   } catch {
     // The context went away (navigation). Not an error, just unknowable.
     return null
@@ -217,6 +225,7 @@ interface VerificationInput {
   startedAt: number
   urlBefore: string | null
   objectId: string | null
+  elementSession: Cdp
   inputMode: 'trusted' | 'synthetic' | 'none'
   settleResult: SettleResult | null
   previousValue?: string | null
@@ -226,7 +235,7 @@ interface VerificationInput {
 async function buildVerification(v: VerificationInput): Promise<Record<string, unknown>> {
   const urlAfter = await currentUrl(v.tabId)
   const [targetExists, focused] = await Promise.all([
-    stillConnected(v.tabId, v.objectId),
+    stillConnected(v.elementSession, v.objectId),
     describeFocused(v.tabId),
   ])
   const errors = consoleSince(v.tabId, v.startedAt, {
@@ -260,10 +269,10 @@ function pointFrom(coordinate?: [number, number]): Point | null {
 }
 
 /** Read the current value of a form control before we change it. */
-async function readValue(tabId: number, objectId: string): Promise<string | null> {
+async function readValue(session: Cdp, objectId: string): Promise<string | null> {
   try {
     return await callOn<string | null>(
-      tabId,
+      session,
       objectId,
       `function(){
         if (this.type === 'checkbox' || this.type === 'radio') return String(this.checked);
@@ -349,6 +358,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       startedAt,
       urlBefore,
       objectId: null,
+      elementSession: tabId,
       inputMode: 'none',
       settleResult: null,
       extra: { condition, found, waited_ms: Date.now() - startedAt },
@@ -357,6 +367,10 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   }
 
   let objectId: string | null = null
+  // Default addressee is the root page session; a ref inside a cross-origin
+  // frame swaps this for that frame's session.
+  let elementSession: Cdp = tabId
+  let elementFrameId: string | undefined
   if (NEEDS_TARGET.has(a.action)) {
     const explicitPoint = pointFrom(a.coordinate)
     if (!target && !explicitPoint) {
@@ -373,7 +387,27 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         }
       }
       objectId = resolution.objectId
+      elementSession = resolution.session
+      if (resolution.sessionId) {
+        elementFrameId = frameSessions(tabId).find(
+          (f) => f.sessionId === resolution.sessionId,
+        )?.targetId
+      }
     }
+  }
+
+  /**
+   * Where to dispatch a pointer event for the resolved element.
+   *
+   * Geometry is read in the element's own session (frame-local for an
+   * iframe), but Input.* goes in on the ROOT session in root coordinates:
+   * Chrome hit-tests the point and routes the event into the right widget.
+   * So a frame element's rect must be composed with the frame's offset.
+   */
+  const dispatchPoint = async (local: Point): Promise<Point> => {
+    if (!elementFrameId) return local
+    const offset = await frameOffset(tabId, elementFrameId)
+    return { x: local.x + offset.x, y: local.y + offset.y }
   }
 
   let inputMode: 'trusted' | 'synthetic' | 'none' = 'none'
@@ -389,10 +423,10 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         const clickCount = a.action === 'double_click' ? 2 : 1
         const explicitPoint = pointFrom(a.coordinate)
         if (objectId) {
-          await scrollIntoView(tabId, objectId)
-          const geo = await elementGeometry(tabId, objectId)
+          await scrollIntoView(elementSession, objectId)
+          const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
-            const ht = await hitTest(tabId, objectId, geo.point)
+            const ht = await hitTest(elementSession, objectId, geo.point)
             if (!ht.hit) {
               return {
                 ok: false,
@@ -403,12 +437,16 @@ export async function execAct(args: unknown): Promise<CommandResult> {
                 data: { intercepted_by: ht.blocker ?? null },
               }
             }
-            await trustedClick(tabId, geo.point, { button, clickCount, modifiers })
+            await trustedClick(tabId, await dispatchPoint(geo.point), {
+              button,
+              clickCount,
+              modifiers,
+            })
             inputMode = 'trusted'
           } else {
             // No layout box (hidden, zero-size). Synthetic dispatch is the only
             // way in, and the result says so rather than implying a real click.
-            await callOn(tabId, objectId, 'function(){ this.click(); }')
+            await callOn(elementSession, objectId, 'function(){ this.click(); }')
             inputMode = 'synthetic'
             extra.synthetic_reason = 'element has no layout box (hidden or zero-size)'
           }
@@ -421,10 +459,10 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       case 'hover': {
         const explicitPoint = pointFrom(a.coordinate)
         if (objectId) {
-          await scrollIntoView(tabId, objectId)
-          const geo = await elementGeometry(tabId, objectId)
+          await scrollIntoView(elementSession, objectId)
+          const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
-            await trustedHover(tabId, geo.point, modifiers)
+            await trustedHover(tabId, await dispatchPoint(geo.point), modifiers)
             inputMode = 'trusted'
           } else {
             await callOn(
@@ -443,10 +481,10 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       case 'fill': {
         if (a.value == null) return { ok: false, status: 'error', error: 'fill requires value' }
         if (!objectId) return { ok: false, status: 'error', error: 'fill requires ref' }
-        previousValue = await readValue(tabId, objectId)
-        await scrollIntoView(tabId, objectId)
-        await focusElement(tabId, objectId)
-        await selectAllIn(tabId, objectId)
+        previousValue = await readValue(elementSession, objectId)
+        await scrollIntoView(elementSession, objectId)
+        await focusElement(elementSession, objectId)
+        await selectAllIn(elementSession, objectId)
         await insertText(tabId, a.value)
         inputMode = 'trusted'
         break
@@ -454,8 +492,8 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       case 'type': {
         if (a.value == null) return { ok: false, status: 'error', error: 'type requires value' }
         if (objectId) {
-          await focusElement(tabId, objectId)
-          previousValue = await readValue(tabId, objectId)
+          await focusElement(elementSession, objectId)
+          previousValue = await readValue(elementSession, objectId)
         }
         await typeText(tabId, a.value)
         inputMode = 'trusted'
@@ -463,7 +501,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       }
       case 'key': {
         if (!a.value) return { ok: false, status: 'error', error: 'key requires value (the key name)' }
-        if (objectId) await focusElement(tabId, objectId)
+        if (objectId) await focusElement(elementSession, objectId)
         await dispatchKey(tabId, a.value, modifiers)
         inputMode = 'trusted'
         break
@@ -471,12 +509,12 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       case 'select': {
         if (a.value == null) return { ok: false, status: 'error', error: 'select requires value' }
         if (!objectId) return { ok: false, status: 'error', error: 'select requires ref' }
-        previousValue = await readValue(tabId, objectId)
+        previousValue = await readValue(elementSession, objectId)
         // Native <select> popups cannot be driven through CDP input, so this
         // is a deliberate synthetic path. Match on option value first, then on
         // visible label, which is what a human is reading.
         const matched = await callOn<boolean>(
-          tabId,
+          elementSession,
           objectId,
           `function(v){
             const options = Array.from(this.options || []);
@@ -506,21 +544,21 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       case 'uncheck': {
         if (!objectId) return { ok: false, status: 'error', error: `${a.action} requires ref` }
         const want = a.action === 'check'
-        previousValue = await readValue(tabId, objectId)
+        previousValue = await readValue(elementSession, objectId)
         const already = previousValue === String(want)
         if (!already) {
           // Click it like a person would; only force the property if the real
           // click did not take (some custom widgets swallow it).
-          await scrollIntoView(tabId, objectId)
-          const geo = await elementGeometry(tabId, objectId)
+          await scrollIntoView(elementSession, objectId)
+          const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
-            const ht = await hitTest(tabId, objectId, geo.point)
+            const ht = await hitTest(elementSession, objectId, geo.point)
             if (ht.hit) {
-              await trustedClick(tabId, geo.point, { modifiers })
+              await trustedClick(tabId, await dispatchPoint(geo.point), { modifiers })
               inputMode = 'trusted'
             }
           }
-          const now = await readValue(tabId, objectId)
+          const now = await readValue(elementSession, objectId)
           if (now !== String(want)) {
             await callOn(
               tabId,
@@ -542,7 +580,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       }
       case 'scroll_to': {
         if (!objectId) return { ok: false, status: 'error', error: 'scroll_to requires ref' }
-        await scrollIntoView(tabId, objectId)
+        await scrollIntoView(elementSession, objectId)
         break
       }
       case 'upload': {
@@ -556,7 +594,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         // bytes ride the wire and a File is constructed in the page. This also
         // reaches display:none inputs, which coordinates never could.
         const outcome = await callOn<{ ok: boolean; mode: string } | null>(
-          tabId,
+          elementSession,
           objectId,
           `function(b64, name, mime){
             const bin = atob(b64);
@@ -606,9 +644,10 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         break
       }
       case 'drag': {
-        const from = objectId
-          ? (await elementGeometry(tabId, objectId))?.point ?? null
+        const localFrom = objectId
+          ? (await elementGeometry(elementSession, objectId))?.point ?? null
           : pointFrom(a.coordinate)
+        const from = localFrom ? await dispatchPoint(localFrom) : null
         let to = pointFrom(a.to_coordinate)
         if (!to && a.to_ref) {
           const dest = await resolveTarget(tabId, a.to_ref, urlBefore)
@@ -641,6 +680,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     startedAt,
     urlBefore,
     objectId,
+    elementSession,
     inputMode,
     settleResult,
     previousValue,

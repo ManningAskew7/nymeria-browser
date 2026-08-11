@@ -26,11 +26,51 @@ const DETACH_LINGER_MS = 10_000
 /** Domains enabled on every attach so their event streams are never late. */
 const CAPTURE_DOMAINS = ['Runtime', 'Network'] as const
 
+/**
+ * A CDP addressee: a tab (the root page session) or one flattened frame
+ * session inside it.
+ *
+ * Cross-origin iframes run in their own renderer process and are NOT in the
+ * page's tree: `Page.getFrameTree` skips them and `getFullAXTree({frameId})`
+ * cannot resolve them. The only route from an extension is auto-attach with
+ * `flatten: true`, addressing each frame by `sessionId`. That matters because
+ * payment fields and consent dialogs almost always live in one.
+ */
+export interface CdpTarget {
+  tabId: number
+  sessionId?: string
+}
+
+export type Cdp = number | CdpTarget
+
+export function tabOf(target: Cdp): number {
+  return typeof target === 'number' ? target : target.tabId
+}
+
+export function sessionOf(target: Cdp): string | undefined {
+  return typeof target === 'number' ? undefined : target.sessionId
+}
+
+function debuggee(target: Cdp): chrome.debugger.Debuggee {
+  const tabId = tabOf(target)
+  const sessionId = sessionOf(target)
+  return (sessionId ? { tabId, sessionId } : { tabId }) as chrome.debugger.Debuggee
+}
+
+export interface FrameSession {
+  sessionId: string
+  /** Also the frame's Page.FrameId: both are the devtools frame token. */
+  targetId: string
+  url: string
+}
+
 interface Session {
   refCount: number
   detachTimer: ReturnType<typeof setTimeout> | null
   attached: boolean
   domains: Set<string>
+  /** Flattened out-of-process iframe sessions, keyed by sessionId. */
+  frames: Map<string, FrameSession>
 }
 
 const sessions = new Map<number, Session>()
@@ -89,10 +129,80 @@ chrome.debugger.onDetach?.addListener?.((source) => {
 function getOrCreate(tabId: number): Session {
   let s = sessions.get(tabId)
   if (!s) {
-    s = { refCount: 0, detachTimer: null, attached: false, domains: new Set() }
+    s = {
+      refCount: 0,
+      detachTimer: null,
+      attached: false,
+      domains: new Set(),
+      frames: new Map(),
+    }
     sessions.set(tabId, s)
   }
   return s
+}
+
+/**
+ * Ask a session to auto-attach to its out-of-process child frames.
+ *
+ * Auto-attach is NOT recursive: each newly attached child must be armed in
+ * turn or grandchild frames never appear. `waitForDebuggerOnStart` must stay
+ * false; true is reported to hang iframes when driven from an extension.
+ */
+async function armAutoAttach(target: Cdp): Promise<void> {
+  try {
+    await chrome.debugger.sendCommand(debuggee(target), 'Target.setAutoAttach', {
+      autoAttach: true,
+      waitForDebuggerOnStart: false,
+      flatten: true,
+      filter: [{ type: 'iframe', exclude: false }],
+    })
+  } catch (e) {
+    // Older Chrome, or a frame type that refuses: frame reach degrades to the
+    // main document rather than the whole command failing.
+    logger.warn('Target.setAutoAttach failed:', e)
+  }
+}
+
+let frameTrackingInstalled = false
+
+/**
+ * Track flattened frame sessions as Chrome hands them to us. Idempotent, and
+ * re-armed by `resetForTests`, since clearing the handler set would otherwise
+ * silently drop frame discovery for the rest of the process.
+ */
+export function installFrameTracking(): void {
+  if (frameTrackingInstalled) return
+  frameTrackingInstalled = true
+  onCdpEvent((tabId, method, params) => {
+    if (method === 'Target.attachedToTarget') {
+      const p = params as {
+        sessionId?: string
+        targetInfo?: { targetId?: string; type?: string; url?: string }
+      }
+      if (!p.sessionId || p.targetInfo?.type !== 'iframe') return
+      const session = sessions.get(tabId)
+      if (!session) return
+      session.frames.set(p.sessionId, {
+        sessionId: p.sessionId,
+        targetId: p.targetInfo.targetId ?? '',
+        url: p.targetInfo.url ?? '',
+      })
+      // Arm the child so ITS out-of-process children surface too.
+      void armAutoAttach({ tabId, sessionId: p.sessionId })
+      return
+    }
+    if (method === 'Target.detachedFromTarget') {
+      const p = params as { sessionId?: string }
+      if (p.sessionId) sessions.get(tabId)?.frames.delete(p.sessionId)
+    }
+  })
+}
+
+installFrameTracking()
+
+/** Flattened cross-origin frame sessions currently known for a tab. */
+export function frameSessions(tabId: number): FrameSession[] {
+  return Array.from(sessions.get(tabId)?.frames.values() ?? [])
 }
 
 export async function acquire(tabId: number): Promise<void> {
@@ -119,6 +229,10 @@ export async function acquire(tabId: number): Promise<void> {
         })
         .catch((e: unknown) => logger.warn(`${domain}.enable failed tab=${tabId}:`, e))
     }
+    // Start discovering cross-origin frames immediately: they attach
+    // asynchronously, so arming at attach time means they are usually known
+    // by the time the first page read happens.
+    void armAutoAttach(tabId)
   }
 }
 
@@ -152,13 +266,14 @@ async function detachNow(tabId: number): Promise<void> {
 }
 
 export async function sendCommand<T = unknown>(
-  tabId: number,
+  target: Cdp,
   method: string,
   params: Record<string, unknown> = {},
 ): Promise<T> {
+  const tabId = tabOf(target)
   await acquire(tabId)
   try {
-    const result = await chrome.debugger.sendCommand({ tabId }, method, params)
+    const result = await chrome.debugger.sendCommand(debuggee(target), method, params)
     return result as T
   } finally {
     release(tabId)
@@ -209,4 +324,6 @@ export function resetForTests(): void {
   }
   sessions.clear()
   eventHandlers.clear()
+  frameTrackingInstalled = false
+  installFrameTracking()
 }
