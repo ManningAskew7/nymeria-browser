@@ -69,6 +69,15 @@ Load the unpacked extension from `dist/`:
 
 ## Connecting to a Nymeria backend
 
+**The backend must be `https://` or on `localhost`.** Chrome only lets an
+extension request permission for origins its manifest declares, and this one
+declares `https://*/*` plus loopback. A backend at `http://<public-ip>:8000`
+matches neither, so Connect fails before it reaches Nymeria. That is
+intentional: the extension holds an account token AND acts in your logged-in
+browser, so it is not a place to accept a clear-text bearer token. Tailscale
+MagicDNS, a Cloudflare Tunnel, and any domain behind the stack's Caddy all
+give you HTTPS for free; see the backend's remote-access guide.
+
 1. Make sure your Nymeria API is reachable (default `http://localhost:8000`).
 2. Add the extension's origin to `CORS_ORIGINS` in `Nymeria/.env.docker`:
    ```
