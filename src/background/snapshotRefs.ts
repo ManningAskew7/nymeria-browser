@@ -1,10 +1,19 @@
 /**
  * Per-tab cache mapping snapshot refs (`@e5`) to CDP `backendNodeId`s.
  *
- * Refs are assigned by `chrome_snapshot`'s AX-tree formatter and stay
- * valid until the page mutates significantly. We invalidate on
- * navigation via the chrome.webNavigation / chrome.tabs.onUpdated hooks
- * registered in background/index.ts.
+ * Refs are minted by the snapshot formatter and are only meaningful for the
+ * exact document they were read from. Three things invalidate them:
+ *
+ *  - navigation (committed navigation hooks in background/index.ts),
+ *  - tab close,
+ *  - the recorded URL no longer matching the tab's current URL, which is the
+ *    backstop for the cases the hooks miss (a service-worker recycle between
+ *    snapshot and act drops this map entirely, and a same-document history
+ *    change may not commit).
+ *
+ * Callers never get a bare `null` back: `resolve` returns a typed reason so
+ * the agent is told to re-read the page instead of being left to guess why a
+ * ref stopped working. Acting on a stale ref must never silently mis-click.
  */
 
 type Ref = string // "e1", "e2", ...
@@ -13,20 +22,58 @@ type BackendNodeId = number
 interface TabRefs {
   byRef: Map<Ref, BackendNodeId>
   urlAtSnapshot: string | null
+  /** Bumped on every snapshot so callers can detect a re-read mid-sequence. */
+  generation: number
 }
+
+export type StaleReason = 'no-snapshot' | 'unknown-ref' | 'navigated'
+
+export type RefResolution =
+  | { ok: true; backendNodeId: number; generation: number }
+  | { ok: false; reason: StaleReason; detail: string }
 
 const cache = new Map<number, TabRefs>()
+let generationCounter = 0
 
-export function set(tabId: number, refs: Map<Ref, BackendNodeId>, url: string | null = null): void {
-  cache.set(tabId, { byRef: new Map(refs), urlAtSnapshot: url })
+export function set(tabId: number, refs: Map<Ref, BackendNodeId>, url: string | null = null): number {
+  generationCounter += 1
+  cache.set(tabId, { byRef: new Map(refs), urlAtSnapshot: url, generation: generationCounter })
+  return generationCounter
 }
 
-export function resolve(tabId: number, target: string): BackendNodeId | null {
-  // target may be "@e5", "e5", or unrelated.
+/**
+ * Resolve a `@eN` ref for a tab.
+ *
+ * `currentUrl` is compared against the URL the snapshot was taken from when
+ * both are known; a mismatch is reported as `navigated` rather than resolving
+ * a backendNodeId that now points into a different document.
+ */
+export function resolve(tabId: number, target: string, currentUrl?: string | null): RefResolution {
   const ref = target.startsWith('@') ? target.slice(1) : target
   const entry = cache.get(tabId)
-  if (!entry) return null
-  return entry.byRef.get(ref) ?? null
+  if (!entry) {
+    return {
+      ok: false,
+      reason: 'no-snapshot',
+      detail: `no snapshot cached for tab ${tabId} (read the page first)`,
+    }
+  }
+  if (currentUrl && entry.urlAtSnapshot && currentUrl !== entry.urlAtSnapshot) {
+    return {
+      ok: false,
+      reason: 'navigated',
+      detail: `page moved from ${entry.urlAtSnapshot} to ${currentUrl} since the snapshot (re-read the page)`,
+    }
+  }
+  const backendNodeId = entry.byRef.get(ref)
+  if (backendNodeId == null) {
+    return {
+      ok: false,
+      reason: 'unknown-ref',
+      detail: `unknown ref @${ref} (re-read the page to refresh refs)`,
+    }
+  }
+  return { ok: true, backendNodeId, generation: entry.generation }
 }
 
 export function clear(tabId: number): void {
@@ -39,4 +86,17 @@ export function clearAll(): void {
 
 export function size(tabId: number): number {
   return cache.get(tabId)?.byRef.size ?? 0
+}
+
+export function snapshotUrl(tabId: number): string | null {
+  return cache.get(tabId)?.urlAtSnapshot ?? null
+}
+
+export function generation(tabId: number): number | null {
+  return cache.get(tabId)?.generation ?? null
+}
+
+export function resetForTests(): void {
+  cache.clear()
+  generationCounter = 0
 }

@@ -81,7 +81,12 @@ describe('execSnapshot', () => {
     const result = await execSnapshot({ tab_id: 1, detail: 'interactive' })
     expect(result.ok).toBe(true)
     expect(snapshotRefs.size(1)).toBe(1)
-    expect(snapshotRefs.resolve(1, '@e1')).toBe(42)
+    const resolution = snapshotRefs.resolve(1, '@e1')
+    expect(resolution.ok).toBe(true)
+    if (resolution.ok) expect(resolution.backendNodeId).toBe(42)
+    // The URL the refs were minted on is recorded, so a later navigation can
+    // be detected rather than silently resolving into a different document.
+    expect(snapshotRefs.snapshotUrl(1)).toBe('https://example.com')
   })
 
   it('returns ok:false with a clear error when tab_id is missing', async () => {

@@ -3,7 +3,7 @@
   "name": "Nymeria Browser",
   "version": "0.1.0",
   "description": "Bridges the local browser to the Nymeria personal assistant API.",
-  "permissions": ["storage", "alarms", "tabs", "activeTab", "scripting", "debugger", "notifications"],
+  "permissions": ["storage", "alarms", "tabs", "activeTab", "scripting", "debugger", "webNavigation"],
   "optional_permissions": [],
   "host_permissions": [],
   "optional_host_permissions": [

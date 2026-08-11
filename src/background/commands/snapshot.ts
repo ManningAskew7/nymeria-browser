@@ -203,7 +203,11 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   const rootIds = nodes.filter((n) => !n.parentId || !ids.has(n.parentId)).map((n) => n.nodeId)
 
   const { text, refs } = formatTree(nodes, rootIds, detail)
-  setRefs(a.tab_id, refs)
+  // Record the URL the refs were minted on: it is the backstop that stops a
+  // ref surviving a navigation the invalidation hooks missed.
+  const tab = await chrome.tabs.get(a.tab_id).catch(() => null)
+  const url = tab?.url ?? null
+  setRefs(a.tab_id, refs, url)
 
   return {
     ok: true,
@@ -212,6 +216,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
       tree: text,
       ref_count: refs.size,
       detail,
+      url,
     },
   }
 }

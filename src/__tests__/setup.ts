@@ -71,6 +71,7 @@ interface MockChrome {
     detach: ReturnType<typeof vi.fn>
     sendCommand: ReturnType<typeof vi.fn>
     onEvent: { addListener: ReturnType<typeof vi.fn> }
+    onDetach: { addListener: ReturnType<typeof vi.fn> }
   }
   windows: { update: ReturnType<typeof vi.fn> }
   webNavigation?: { onCommitted: { addListener: ReturnType<typeof vi.fn> } }
@@ -138,6 +139,7 @@ function makeMockChrome(): MockChrome {
       detach: vi.fn(async () => undefined),
       sendCommand: vi.fn(async () => ({})),
       onEvent: { addListener: vi.fn() },
+      onDetach: { addListener: vi.fn() },
     },
     windows: { update: vi.fn(async () => undefined) },
     webNavigation: { onCommitted: { addListener: vi.fn() } },

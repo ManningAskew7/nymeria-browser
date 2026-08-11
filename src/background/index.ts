@@ -6,7 +6,7 @@ import { ingestConsoleEntry } from './commands/console'
 import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs } from './debuggerSession'
 import { clear as clearRefs } from './snapshotRefs'
-import { forgetHook as forgetConsoleHook } from './consoleBuffer'
+import { forgetHook as forgetConsoleHook, installCdpConsoleCapture } from './consoleBuffer'
 import {
   getSnapshot,
   loadFromStorage,
@@ -26,6 +26,12 @@ setDispatchHooks({
   },
 })
 
+// Console + uncaught exceptions stream in over CDP, which needs no host
+// permission and so works on every origin the agent can reach. Installed at
+// the top level: the buffer must already be filling before the first action,
+// or the post-action verification has nothing to report.
+installCdpConsoleCapture()
+
 // When a tab navigates we invalidate per-tab caches: ref IDs are stale and
 // the console-capture hook must be re-injected.
 chrome.webNavigation?.onCommitted.addListener?.((details) => {
@@ -42,7 +48,9 @@ async function bootstrap(): Promise<void> {
   logger.log('bootstrap')
   await loadFromStorage()
   await ensureClientId()
-  chrome.alarms.create(HEARTBEAT_NAME, { periodInMinutes: 0.5 })
+  // 1 minute is Chrome's floor for a packed extension; asking for less does
+  // not go faster, it just makes the real interval a surprise.
+  chrome.alarms.create(HEARTBEAT_NAME, { periodInMinutes: 1 })
   await ensureConnected()
 }
 
