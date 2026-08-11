@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { execAct, __test } from './act'
 import { resetForTests as resetDebugger } from '../debuggerSession'
 import { push as pushConsole, resetForTests as resetConsole } from '../consoleBuffer'
+import { resetForTests as resetDelivery } from '../delivery'
 import { resetForTests as resetRefs, set as setRefs } from '../snapshotRefs'
 
 const TAB = 1
@@ -16,6 +17,16 @@ interface MockOptions {
   settleValue?: string
   bodyText?: string
   selectMatches?: boolean
+  /** false models a tab where the probe's isolated world cannot be created. */
+  deliveryWorld?: boolean
+  /** How many events the page saw. 0 is the suppressed-tab case. */
+  deliveryCount?: number
+  /** Thrown by the probe read, to model a context that died mid-action. */
+  deliveryReadThrows?: string
+  /** true models a document containing iframes, where the probe sees one only. */
+  pageHasFrames?: boolean
+  /** false models a target inside an iframe the probe never watched. */
+  targetInTopDocument?: boolean
 }
 
 /**
@@ -32,7 +43,13 @@ function installCdpMock(opts: MockOptions = {}) {
     settleValue = 'quiet',
     bodyText = '',
     selectMatches = true,
+    deliveryWorld = true,
+    deliveryCount = 1,
+    deliveryReadThrows,
+    pageHasFrames = false,
+    targetInTopDocument = true,
   } = opts
+  const PROBE_CONTEXT = 77
 
   const sendCommand = vi.fn(async (_target: unknown, method: string, params: Record<string, unknown> = {}) => {
     if (method === 'DOM.resolveNode') {
@@ -45,13 +62,32 @@ function installCdpMock(opts: MockOptions = {}) {
       }
       if (fn.includes('elementFromPoint')) return { result: { value: hit } }
       if (fn.includes('isConnected')) return { result: { value: true } }
+      if (fn.includes('ownerDocument')) return { result: { value: targetInTopDocument } }
       if (fn.includes('this.options')) return { result: { value: selectMatches } }
       if (fn.includes('this.checked') && fn.includes('return')) return { result: { value: value } }
       if (fn.includes('this.value !== undefined')) return { result: { value } }
       return { result: { value: undefined } }
     }
+    if (method === 'Page.getFrameTree') {
+      return deliveryWorld ? { frameTree: { frame: { id: 'frame-1' } } } : {}
+    }
+    if (method === 'Page.createIsolatedWorld') {
+      return { executionContextId: PROBE_CONTEXT }
+    }
     if (method === 'Runtime.evaluate') {
       const expression = String(params.expression ?? '')
+      // The delivery probe, addressed to its own isolated world. Answered by
+      // count rather than by running the page-side code: that logic has its own
+      // executed-for-real tests in delivery.test.ts, and here we only care what
+      // an action DOES with each outcome.
+      if (params.contextId === PROBE_CONTEXT) {
+        if (expression.includes('addEventListener')) return { result: { value: true } }
+        if (expression.includes('querySelectorAll')) {
+          return { result: { value: !pageHasFrames } }
+        }
+        if (deliveryReadThrows) throw new Error(deliveryReadThrows)
+        return { result: { value: deliveryCount } }
+      }
       if (expression.includes('MutationObserver')) return { result: { value: settleValue } }
       if (expression.includes('activeElement')) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
@@ -86,6 +122,7 @@ beforeEach(() => {
   resetRefs()
   resetDebugger()
   resetConsole()
+  resetDelivery()
 })
 
 describe('trusted input', () => {
@@ -403,5 +440,259 @@ describe('execAct target resolution', () => {
         ),
     )
     expect(forced, 'must not fall back to forcing the property').toBe(false)
+  })
+})
+
+describe('input delivery', () => {
+  /**
+   * The failure these cover: Chrome disables page input while a tab-modal
+   * dialog is showing, so `Input.dispatch*` is accepted by CDP, acked without
+   * error, and discarded before the renderer. Nothing mutates, so settle
+   * reports `quiet`, and the action reported a clean success having done
+   * nothing at all.
+   */
+
+  it('fails the command when the page provably received no event', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.status).toBe('error')
+    expect(result.error).toMatch(/received no event/)
+  })
+
+  it('names the fresh-tab recovery and rules out reloading', async () => {
+    // The agent cannot see browser UI: not in the tree, not in the console, not
+    // in a screenshot. Told only that the click failed it will retry the same
+    // dead tab forever, which is exactly what happened live.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.error).toMatch(/fresh tab/i)
+    expect(result.error).toMatch(/reloading does not clear it/i)
+  })
+
+  it('keeps the whole verification payload on the failure', async () => {
+    // A failure that drops the diagnostics is a worse trade than the silent
+    // success it replaced.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as Record<string, unknown>
+    expect(data).toBeDefined()
+    expect(data.action).toBe('click')
+    expect(data.url).toBe(TAB_URL)
+    expect(data.settled).toBeDefined()
+  })
+
+  it('reports the channel and the outcome as two separate answers', async () => {
+    // `input: "trusted"` says which pipe was used. It must keep saying that on
+    // a dropped event, because collapsing the two is how the original bug read
+    // as success.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as { input: string; input_delivered: string }
+    expect(data.input).toBe('trusted')
+    expect(data.input_delivered).toBe('no')
+  })
+
+  it('succeeds and records delivery when the event arrived', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 1 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input_delivered: string }).input_delivered).toBe('yes')
+  })
+
+  it('does not fail the command when delivery could not be proven either way', async () => {
+    // Unprovable is not the same as failed. Turning "we could not check" into
+    // an error would make the tool unusable wherever the probe cannot run.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryWorld: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input_delivered: string }).input_delivered).toBe('unknown')
+  })
+
+  it('treats an action that navigated the page as delivered', async () => {
+    // The probe died with its document, so the count is unreadable, but a
+    // navigation is proof the input landed.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryReadThrows: 'Cannot find context with specified id' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input_delivered: string }).input_delivered).toBe('yes')
+  })
+
+  it('checks delivery for every verb that goes in through browser-level input', async () => {
+    for (const action of ['click', 'double_click', 'right_click', 'key', 'type']) {
+      resetRefs()
+      resetDelivery()
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ deliveryCount: 0 })
+
+      const result = await execAct({ tab_id: TAB, action, ref: '@e1', value: 'a' })
+
+      expect(result.ok, `${action} must report an undelivered event as a failure`).toBe(false)
+      expect(result.error, `${action} error text`).toMatch(/received no event/)
+    }
+  })
+
+  it('does not probe the verbs that never touch the browser input gate', async () => {
+    // `fill` is Input.insertText, an IME commit on a path the gate does not
+    // consult: it kept working live while every other verb was suppressed.
+    // `select` and `check` run in-page, and `check` already verifies itself.
+    for (const [action, extra] of [
+      ['fill', { value: 'x' }],
+      ['select', { value: 'Option 2' }],
+      ['check', {}],
+    ] as const) {
+      resetRefs()
+      resetDelivery()
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      const cdp = installCdpMock({ deliveryCount: 0, value: 'false' })
+
+      const result = await execAct({ tab_id: TAB, action, ref: '@e1', ...extra })
+
+      expect(result.ok, `${action} must not be failed by the delivery probe`).toBe(true)
+      expect((result.data as Record<string, unknown>).input_delivered).toBeUndefined()
+      expect(
+        methodsOf(cdp),
+        `${action} must not pay for a probe it does not need`,
+      ).not.toContain('Page.createIsolatedWorld')
+    }
+  })
+
+  it('arms the probe after target resolution so setup cannot be counted as delivery', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const methods = methodsOf(cdp)
+    const armed = cdp.mock.calls.findIndex(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression ?? '').includes('addEventListener'),
+    )
+    const dispatched = methods.indexOf('Input.dispatchMouseEvent')
+    expect(armed).toBeGreaterThan(-1)
+    // After resolution, so the resolve traffic cannot be counted as delivery,
+    // and before dispatch, so the dispatch can be.
+    expect(armed).toBeGreaterThan(methods.indexOf('DOM.resolveNode'))
+    expect(dispatched).toBeGreaterThan(armed)
+  })
+})
+
+describe('delivery in framed pages', () => {
+  /**
+   * The probe watches one document, the top one, but this tool deliberately
+   * acts inside iframes: cross-origin frames are where payment fields and
+   * consent dialogs live, and the whole `elementSession` / `frameOffset`
+   * machinery exists for them. Events dispatched inside a frame never reach the
+   * top window, so a zero count there means "not seen here", not "not
+   * delivered". Failing on it would tell the agent to abandon a working tab and
+   * retry in a fresh one, where the identical failure repeats.
+   */
+
+  it('does not fail a click whose target lives inside an iframe', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0, pageHasFrames: true, targetInTopDocument: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok, 'an unwatched frame is not evidence of suppression').toBe(true)
+    expect((result.data as { input_delivered: string }).input_delivered).toBe('unknown')
+  })
+
+  it('still fails when the target is in the top document the probe watched', async () => {
+    // Frames exist, but this target is not in one, so a zero count is real.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0, pageHasFrames: true, targetInTopDocument: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/received no event/)
+  })
+
+  it('trusts a zero count outright when the document has no frames at all', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0, pageHasFrames: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+  })
+
+  it('does not fail an untargeted action on a framed page', async () => {
+    // A keystroke with no ref goes to whatever holds focus, which on a framed
+    // page may be inside a frame. With no target there is nothing to check the
+    // absence against, so it cannot be confirmed.
+    installCdpMock({ deliveryCount: 0, pageHasFrames: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'key', value: 'a' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input_delivered: string }).input_delivered).toBe('unknown')
+  })
+
+  it('still fails an untargeted action on a page with no frames', async () => {
+    installCdpMock({ deliveryCount: 0, pageHasFrames: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'key', value: 'a' })
+
+    expect(result.ok).toBe(false)
+  })
+})
+
+describe('delivery is only asked about input we actually dispatched', () => {
+  it('does not fail a click that deliberately fell back to synthetic dispatch', async () => {
+    // A hidden file input has no layout box, so the click goes in as
+    // `this.click()`. That produces no TRUSTED event by definition, so probing
+    // it would fail the one path chrome_find's own docstring recommends for
+    // upload buttons, on a page with nothing wrong with it.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ geometry: null, deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input: string }).input).toBe('synthetic')
+    expect((result.data as Record<string, unknown>).input_delivered).toBeUndefined()
+  })
+
+  it('does not fail a type of the empty string, which dispatches nothing', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: '' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as Record<string, unknown>).input_delivered).toBeUndefined()
+  })
+
+  it('still checks a click that did go in as trusted input', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
   })
 })

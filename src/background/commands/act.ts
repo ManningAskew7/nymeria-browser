@@ -1,6 +1,7 @@
 import type { CommandResult } from '../../shared/types'
 import { readSince as consoleSince } from '../consoleBuffer'
 import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
+import { absenceIsConclusive, armDelivery, type DeliveryOutcome } from '../delivery'
 import {
   callOn,
   dispatchKey,
@@ -98,6 +99,62 @@ const NEEDS_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
 
 /** Actions that focus a target first when given one, but work without. */
 const OPTIONAL_TARGET: ReadonlySet<ActionName> = new Set<ActionName>(['type', 'key'])
+
+/**
+ * The events each verb must produce in the page, for the delivery probe.
+ *
+ * Only the verbs that go in through `Input.dispatch*` appear here, because only
+ * those traverse the browser-process input gate that a tab-modal dialog closes.
+ * `fill` uses `Input.insertText`, an IME commit on a path that does not consult
+ * that gate (it demonstrably kept working while every other verb was
+ * suppressed), and `select` / `upload` / `scroll_to` run in-page through
+ * `Runtime.callFunctionOn` and never touch it. `check` and `uncheck` do dispatch
+ * a real click first, but they already verify their own outcome by re-reading
+ * the control, which is the precedent this whole mechanism generalises.
+ *
+ * `mousedown` rather than `click` for the click family: it is the one event
+ * every button variant produces, including `right_click`, which yields
+ * `contextmenu` instead of `click`.
+ *
+ * `hover` and `scroll` are deliberately ABSENT. Their events (`mousemove`,
+ * `wheel`) are coalesced and frame-aligned rather than discrete, so Blink can
+ * dispatch them to the DOM after we have already read the counter, especially
+ * in a background or occluded tab, which an agent's tab usually is. A false
+ * "no" now fails the command, so a verb that cannot be timed reliably is worse
+ * off checked than unchecked.
+ */
+const PROBE_EVENTS: Partial<Record<ActionName, readonly string[]>> = {
+  click: ['mousedown'],
+  double_click: ['mousedown'],
+  right_click: ['mousedown'],
+  drag: ['mousedown'],
+  key: ['keydown'],
+  type: ['keydown'],
+}
+
+/**
+ * What to tell an agent whose input vanished.
+ *
+ * It cannot see browser UI: a native dialog is invisible to the accessibility
+ * tree, to `chrome_console`, to `chrome_network`, and to `chrome_screenshot`
+ * (which captures the page compositor surface, not the browser frame). Without
+ * being told the recovery it retries the same dead tab indefinitely.
+ *
+ * The wording hedges on the cause deliberately. Suppression is the likeliest
+ * explanation but a disabled control produces the same reading, and asserting a
+ * dialog that is not there would send the agent hunting for nothing.
+ */
+function undeliveredError(action: ActionName): string {
+  return (
+    `the ${action} was dispatched but the page received no event, so it did nothing. ` +
+    'Input to this tab may be suppressed by a browser dialog (a password warning, ' +
+    'an HTTP auth prompt, a "Leave site?" confirmation), which is invisible to ' +
+    'page-level tools and to screenshots. Reloading does NOT clear it: open a fresh ' +
+    'tab and redo the work there, and do not dismiss browser security UI yourself. ' +
+    'If no dialog is present, the target may be disabled or the page may be ' +
+    'swallowing the event.'
+  )
+}
 
 type TargetResolution =
   /** `session` is the CDP addressee that OWNS the node: a cross-origin frame
@@ -415,6 +472,12 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   let previousValue: string | null | undefined
   const extra: Record<string, unknown> = {}
 
+  // Armed AFTER target resolution so the probe cannot count our own setup: the
+  // geometry and hit-test reads run in-page, and neither produces any of the
+  // event types above.
+  const probeTypes = PROBE_EVENTS[a.action]
+  const probe = probeTypes ? await armDelivery(tabId, probeTypes) : null
+
   try {
     switch (a.action) {
       case 'click':
@@ -496,8 +559,10 @@ export async function execAct(args: unknown): Promise<CommandResult> {
           await focusElement(elementSession, objectId)
           previousValue = await readValue(elementSession, objectId)
         }
-        await typeText(tabId, a.value)
-        inputMode = 'trusted'
+        if (a.value) {
+          await typeText(tabId, a.value)
+          inputMode = 'trusted'
+        }
         break
       }
       case 'key': {
@@ -688,6 +753,30 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     return { ok: false, status: 'error', error: `${a.action} failed: ${String(e)}` }
   }
 
+  // Read before settling: a settle that waits for quiet gives a suppressed page
+  // 250ms of nothing to happen in, and the probe should reflect the action, not
+  // the wait.
+  // Read only when this action really did dispatch browser-level input. The
+  // synthetic fallbacks (a click on an element with no layout box goes in as
+  // `this.click()`) produce no trusted event by definition, and `type ""`
+  // dispatches nothing at all; probing either would manufacture a failure for a
+  // page with nothing wrong with it.
+  let delivered: DeliveryOutcome | null = null
+  if (probe && inputMode === 'trusted') {
+    delivered = await probe.read()
+    // The probe watches the top document only, and this tool deliberately acts
+    // inside iframes. A zero count there means "not seen here", not "not
+    // delivered", so it is downgraded unless the absence can be confirmed.
+    if (delivered === 'no') {
+      const conclusive = await absenceIsConclusive(
+        tabId,
+        objectId ? { session: elementSession, objectId } : null,
+      )
+      if (!conclusive) delivered = 'unknown'
+    }
+    extra.input_delivered = delivered
+  }
+
   const settleResult = await settle(tabId)
   const data = await buildVerification({
     action: a.action,
@@ -702,6 +791,14 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     previousValue,
     extra,
   })
+  // An action that provably did nothing is a FAILED command, not a successful
+  // one carrying a flag. A flag beside a green status reproduces the original
+  // bug one level down: the agent that skimmed past `settled: "quiet"` would
+  // skim past a new field just as readily. The full verification payload rides
+  // along on the failure, so nothing diagnostic is lost.
+  if (delivered === 'no') {
+    return { ok: false, status: 'error', error: undeliveredError(a.action), data }
+  }
   return { ok: true, status: 'success', data }
 }
 

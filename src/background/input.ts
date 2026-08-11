@@ -80,6 +80,31 @@ export const KEY_TABLE: Record<
 /** CDP modifier bits. Shift still produces a character; the others do not. */
 const SHIFT_BIT = 8
 
+/**
+ * `code` and `windowsVirtualKeyCode` for a single printable character.
+ *
+ * `KeyboardEvent.keyCode` and `.which` are derived from
+ * `windowsVirtualKeyCode`, and omitting it lands them both at 0. A page that
+ * gates on either then ignores an event that is trusted, delivered, and to
+ * every other appearance correct: the same class of dishonesty as reporting
+ * success for input that never arrived.
+ *
+ * Punctuation is deliberately left bare. Its virtual-key code depends on the
+ * keyboard layout, and a wrong one names a different physical key, which is
+ * worse than none. The previous fabrication (`Key@`, `Key1`) was never a real
+ * `code` value in any layout.
+ */
+function charKeyInfo(ch: string): { code?: string; windowsVirtualKeyCode?: number } {
+  if (/^[a-zA-Z]$/.test(ch)) {
+    const upper = ch.toUpperCase()
+    return { code: `Key${upper}`, windowsVirtualKeyCode: upper.charCodeAt(0) }
+  }
+  if (/^[0-9]$/.test(ch)) {
+    return { code: `Digit${ch}`, windowsVirtualKeyCode: ch.charCodeAt(0) }
+  }
+  return {}
+}
+
 export async function callOn<T = unknown>(
   target: Cdp,
   objectId: string,
@@ -296,8 +321,13 @@ export async function dispatchKey(target: Cdp, key: string, modifiers = 0): Prom
   const common = {
     modifiers,
     key: entry ? entry.key : key,
-    code: entry ? entry.code : isChar ? `Key${key.toUpperCase()}` : key,
-    ...(entry ? { windowsVirtualKeyCode: entry.windowsVirtualKeyCode } : {}),
+    ...(entry
+      ? { code: entry.code, windowsVirtualKeyCode: entry.windowsVirtualKeyCode }
+      : isChar
+        ? charKeyInfo(key)
+        : // A named key we do not carry (F1, Insert): its `code` IS its name,
+          // so pass it through rather than inventing one.
+          { code: key }),
   }
   await sendCommand(target, 'Input.dispatchKeyEvent', {
     type: text ? 'keyDown' : 'rawKeyDown',

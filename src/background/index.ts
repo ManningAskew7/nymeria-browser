@@ -4,6 +4,7 @@ import { HttpError, ping, whoami } from './api'
 import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs } from './debuggerSession'
+import { clearWorld as clearDeliveryWorld } from './delivery'
 import { clear as clearRefs } from './snapshotRefs'
 import { installCdpConsoleCapture } from './consoleBuffer'
 import { clear as clearNetwork, installCdpNetworkCapture } from './networkBuffer'
@@ -33,16 +34,20 @@ setDispatchHooks({
 installCdpConsoleCapture()
 installCdpNetworkCapture()
 
-// A committed navigation invalidates the tab's refs. Network history is kept
-// deliberately: the requests a navigation itself fired are often the answer
-// to "why did that go wrong".
+// A committed navigation invalidates the tab's refs, and destroys the isolated
+// world the delivery probe caches (it dies with its document, so a cached
+// context id would resolve to nothing). Network history is kept deliberately:
+// the requests a navigation itself fired are often the answer to "why did that
+// go wrong".
 chrome.webNavigation?.onCommitted.addListener?.((details) => {
   if (details.frameId !== 0) return
   clearRefs(details.tabId)
+  clearDeliveryWorld(details.tabId)
 })
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearRefs(tabId)
   clearNetwork(tabId)
+  clearDeliveryWorld(tabId)
 })
 
 async function bootstrap(): Promise<void> {

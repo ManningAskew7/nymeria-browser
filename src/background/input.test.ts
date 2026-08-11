@@ -91,3 +91,90 @@ describe('dispatchKey', () => {
     expect(keyEvents(shifted)[0].text).toBe('A')
   })
 })
+
+describe('key identity for single characters', () => {
+  /**
+   * `KeyboardEvent.keyCode` and `.which` are derived from
+   * `windowsVirtualKeyCode`. Omitting it lands both at 0, so a page that gates
+   * on either ignores an event that is trusted, delivered, and in every other
+   * respect correct. Found live: `/key_presses` echoed nothing for a keystroke
+   * whose probe confirmed it had reached the page.
+   */
+
+  it('gives a letter its virtual key code and its physical code', async () => {
+    const mock = installCdpMock()
+
+    await dispatchKey(TAB, 'b')
+
+    const down = keyEvents(mock)[0]
+    expect(down.windowsVirtualKeyCode, 'keyCode 0 is invisible to keyCode-gated pages').toBe(66)
+    expect(down.code).toBe('KeyB')
+    expect(down.key).toBe('b')
+    expect(down.text).toBe('b')
+  })
+
+  it('uses the uppercase virtual key code for an uppercase letter', async () => {
+    // The virtual key names the PHYSICAL key, which is the same one either way.
+    const mock = installCdpMock()
+
+    await dispatchKey(TAB, 'B')
+
+    expect(keyEvents(mock)[0].windowsVirtualKeyCode).toBe(66)
+    expect(keyEvents(mock)[0].code).toBe('KeyB')
+  })
+
+  it('gives a digit a Digit code, not a Key code', async () => {
+    const mock = installCdpMock()
+
+    await dispatchKey(TAB, '1')
+
+    const down = keyEvents(mock)[0]
+    expect(down.windowsVirtualKeyCode).toBe(49)
+    expect(down.code, '"Key1" is not a code any layout produces').toBe('Digit1')
+  })
+
+  it('sends no fabricated code for punctuation rather than a wrong one', async () => {
+    // A wrong `code` names a different physical key, which is worse than none:
+    // the previous behaviour emitted "Key@".
+    const mock = installCdpMock()
+
+    await dispatchKey(TAB, '@')
+
+    const down = keyEvents(mock)[0]
+    expect(down.code).toBeUndefined()
+    expect(down.windowsVirtualKeyCode).toBeUndefined()
+    // It still types the character.
+    expect(down.text).toBe('@')
+  })
+
+  it('leaves named keys exactly as they were', async () => {
+    const mock = installCdpMock()
+
+    await dispatchKey(TAB, 'Enter')
+
+    const down = keyEvents(mock)[0]
+    expect(down.windowsVirtualKeyCode).toBe(13)
+    expect(down.code).toBe('Enter')
+    expect(down.text).toBe('\r')
+  })
+
+  it('passes an unlisted named key through as its own code', async () => {
+    const mock = installCdpMock()
+
+    await dispatchKey(TAB, 'F5')
+
+    expect(keyEvents(mock)[0].code).toBe('F5')
+  })
+
+  it('carries the virtual key code through every character of a typed string', async () => {
+    // `type` routes through the same helper, so a per-character regression here
+    // would silently break every keystroke-driven widget.
+    const mock = installCdpMock()
+
+    await typeText(TAB, 'a1')
+
+    const downs = keyEvents(mock).filter((e) => e.type === 'keyDown')
+    expect(downs.map((e) => e.windowsVirtualKeyCode)).toEqual([65, 49])
+    expect(downs.map((e) => e.code)).toEqual(['KeyA', 'Digit1'])
+  })
+})

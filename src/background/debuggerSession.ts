@@ -23,7 +23,15 @@ import { backgroundLogger as logger } from '../utils/logger'
 const DEBUGGER_VERSION = '1.3'
 const DETACH_LINGER_MS = 10_000
 
-/** Domains enabled on every attach so their event streams are never late. */
+/**
+ * Domains enabled on every attach so their event streams are never late.
+ *
+ * `Page` is deliberately NOT here. Enabling it takes ownership of JS dialogs:
+ * the client must then answer every `javascriptDialogOpening` with
+ * `handleJavaScriptDialog` or the renderer stalls. This extension drives the
+ * user's own logged-in browser, so an unanswered dialog wedges a real tab.
+ * Backlog #162 carries the design for doing it safely.
+ */
 const CAPTURE_DOMAINS = ['Runtime', 'Network'] as const
 
 /**
