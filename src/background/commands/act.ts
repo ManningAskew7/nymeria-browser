@@ -104,6 +104,19 @@ const NEEDS_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
 const OPTIONAL_TARGET: ReadonlySet<ActionName> = new Set<ActionName>(['type', 'key'])
 
 /**
+ * Verbs that can act on a bare coordinate. The rest of `NEEDS_TARGET` reject
+ * a coordinate-only call further down, so describing the point for them would
+ * spend a round trip on a call that is about to be refused.
+ */
+const ACCEPTS_COORDINATE: ReadonlySet<ActionName> = new Set<ActionName>([
+  'click',
+  'double_click',
+  'right_click',
+  'hover',
+  'drag',
+])
+
+/**
  * Actions that ACTIVATE their target, which is what makes a file input
  * dangerous rather than merely awkward.
  *
@@ -282,27 +295,94 @@ const OPENS_FILE_CHOOSER = `
 `
 
 /**
- * The same question for a bare coordinate, where there is no resolved node to
- * interrogate.
+ * Name an element the way a human would point at it: `button "Sign in"`,
+ * `input#email`, `div.cookie-banner`, or bare `body`.
  *
- * Reads the main world, so a hostile page could in principle hide a file input
- * from this check (the standing `elementFromPoint` caveat, backlog #160). That
- * only returns this path to how it behaved before the guard existed, and the
- * page it protects in practice is an ordinary one with a visible "Choose File"
- * button, so the check is worth having while the isolated-world move is not
- * yet made. Failing to answer counts as NOT a file input: a probe that cannot
- * run must not block an otherwise valid click.
+ * Text is the trap here, and the first version fell into it. `innerText` is
+ * SUBTREE text, so a click on empty background produced
+ * `body "Acme Home About Contact Sign in ..."`: the words of everything the
+ * click did NOT hit, which reads as a confident hit on real content and
+ * inverts the field's whole purpose. Hence three rules: never take text from
+ * `body`/`html`, prefer explicit labelling attributes, and accept text only
+ * when it is short enough to BE a label (a container's text runs long, a
+ * button's does not). `textContent` rather than `innerText` also avoids
+ * forcing a synchronous layout in the user's page.
+ *
+ * Structure carries the rest, following `hitTest`'s precedent of identifying
+ * a blocker by tag/id/class rather than by prose.
  */
-async function pointIsFileInput(tabId: number, point: Point | null): Promise<boolean> {
-  if (!point) return false
+const DESCRIBE_ELEMENT = `
   try {
-    const resp = await sendCommand<{ result?: { value?: boolean } }>(tabId, 'Runtime.evaluate', {
-      expression: `(() => { const el = document.elementFromPoint(${Math.round(point.x)}, ${Math.round(point.y)}); if (!el) return false; return (function(){ ${OPENS_FILE_CHOOSER} }).call(el); })()`,
-      returnByValue: true,
-    })
-    return resp.result?.value === true
+    const tag = this.tagName.toLowerCase();
+    let raw = this.getAttribute('aria-label') || this.getAttribute('name')
+      || this.getAttribute('placeholder') || this.getAttribute('alt')
+      || this.getAttribute('title') || '';
+    if (!raw && tag !== 'body' && tag !== 'html') {
+      const text = String(this.textContent || '').trim().replace(/\\s+/g, ' ');
+      if (text && text.length <= 60) raw = text;
+    }
+    const label = String(raw || '').trim().replace(/\\s+/g, ' ').slice(0, 60).replace(/"/g, "'");
+    const id = this.id ? '#' + String(this.id).slice(0, 40) : '';
+    const cls = (!id && this.classList && this.classList.length)
+      ? '.' + String(this.classList[0]).slice(0, 40) : '';
+    return label ? tag + id + cls + ' "' + label + '"' : tag + id + cls;
+  } catch (e) {
+    return 'unknown';
+  }
+`
+
+interface PointTarget {
+  /** Human-readable: `button "Sign in"`, or just `body`. */
+  description: string
+  opensFileChooser: boolean
+}
+
+/**
+ * What is actually under a coordinate, and whether activating it opens the
+ * file chooser. One evaluate answers both, so the description is free.
+ *
+ * The description exists because `input_delivered` cannot answer the question
+ * an agent asks after a coordinate click. The delivery counter listens at
+ * `window` in the capture phase, so a click on empty page background produces
+ * a trusted `click` event that reaches it and COUNTS: the report is
+ * `input_delivered: "yes"`, true by its own definition and useless. Measured
+ * on the official Claude in Chrome extension 2026-08-12 (comparison doc,
+ * experiment 2): its viewport resized itself between turns, a click at a
+ * now-stale coordinate landed on blank margin, and the payload said only
+ * "Clicked at (65, 146)". Naming what was under the point makes that
+ * self-evident (`hit: "body"`) instead of a confident nothing.
+ *
+ * Reads the main world, so a hostile page could in principle lie about both
+ * answers (the standing `elementFromPoint` caveat, backlog #160). For the
+ * guard that only returns this path to how it behaved before the guard
+ * existed; for the description it is one more page-derived string, which the
+ * whole payload already is. Failing to answer counts as NOT a file input: a
+ * probe that cannot run must not block an otherwise valid click.
+ */
+async function describePoint(tabId: number, point: Point | null): Promise<PointTarget | null> {
+  if (!point) return null
+  try {
+    const resp = await sendCommand<{ result?: { value?: PointTarget | null } }>(
+      tabId,
+      'Runtime.evaluate',
+      {
+        // The verdict is computed FIRST and the description is separately
+        // guarded, so a page whose getters throw loses the label and keeps the
+        // safety answer. The other order let a hostile `textContent` getter
+        // delete the file-input refusal.
+        expression: `(() => {
+          const el = document.elementFromPoint(${Math.round(point.x)}, ${Math.round(point.y)});
+          if (!el) return null;
+          const opens = (function(){ ${OPENS_FILE_CHOOSER} }).call(el) === true;
+          const description = (function(){ ${DESCRIBE_ELEMENT} }).call(el);
+          return { description: String(description || 'unknown'), opensFileChooser: opens };
+        })()`,
+        returnByValue: true,
+      },
+    )
+    return resp.result?.value ?? null
   } catch {
-    return false
+    return null
   }
 }
 
@@ -321,6 +401,29 @@ function fileInputRefusal(target: string | null): string {
     'themselves. Use chrome_act(action="upload", ref=..., path="...") instead, which ' +
     'puts the file straight into the input and works even when it is hidden behind a ' +
     'styled button.'
+  )
+}
+
+/**
+ * A ref that resolves to a node no longer in the document.
+ *
+ * Blink's `DOMNodeId` map holds a `WeakRef` keyed on GC LIVENESS, not on
+ * attachment, so `DOM.resolveNode` succeeds for a node the page removed but
+ * still holds a reference to (React caching a component's element is the
+ * everyday case). Acting on it runs the page's own handler against a detached
+ * node: the handler fires, CDP reports success, and nothing changes on
+ * screen. That is the silent-success shape this whole arc exists to remove,
+ * so the check moved BEFORE the action; `target_exists` still reports the
+ * same fact afterwards for the cases that detach mid-action.
+ */
+function detachedRefError(target: string | null, action: ActionName): string {
+  return (
+    `${target ?? 'that element'} still resolves, but the element is no longer in the ` +
+    'page: it was removed after the page was read (a re-render, a closed modal, a list ' +
+    `that reloaded). The ${action} was NOT sent, because acting on a detached node ` +
+    'does not do what you meant: the page handler runs against nothing, and for a ' +
+    'typing action the text goes to whatever else holds focus. Re-read the page and ' +
+    'use a fresh ref.'
   )
 }
 
@@ -458,6 +561,26 @@ async function stillConnected(session: Cdp, objectId: string | null): Promise<bo
     return await callOn<boolean>(session, objectId, 'function(){ return this.isConnected === true; }')
   } catch {
     // The context went away (navigation). Not an error, just unknowable.
+    return null
+  }
+}
+
+/**
+ * The same question, asked BEFORE acting, where a session-layer failure must
+ * not be swallowed.
+ *
+ * `stillConnected` is deliberately tolerant because it also runs after the
+ * action, where an unanswerable probe is just a missing field. Here it gates
+ * a dispatch: if the tab went unusable or the call rode its full 15s deadline
+ * between resolution and now, "unknown, carry on" would send input into a tab
+ * we already know is not answering, and burn most of the command's budget
+ * first. Same rule `resolveTarget` follows for the same two classes.
+ */
+async function connectedBeforeActing(session: Cdp, objectId: string): Promise<boolean | null> {
+  try {
+    return await callOn<boolean>(session, objectId, 'function(){ return this.isConnected === true; }')
+  } catch (e) {
+    if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
     return null
   }
 }
@@ -634,6 +757,8 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // frame swaps this for that frame's session.
   let elementSession: Cdp = tabId
   let elementFrameId: string | undefined
+  /** What a bare coordinate landed on, for the verification payload. */
+  let pointTarget: PointTarget | null = null
   if (NEEDS_TARGET.has(a.action) || (OPTIONAL_TARGET.has(a.action) && target)) {
     const explicitPoint = pointFrom(a.coordinate)
     if (NEEDS_TARGET.has(a.action) && !target && !explicitPoint) {
@@ -647,6 +772,24 @@ export async function execAct(args: unknown): Promise<CommandResult> {
           status: 'error',
           error: resolution.error,
           data: resolution.stale ? { stale_refs: true, reason: resolution.stale } : undefined,
+        }
+      }
+      // BEFORE anything is sent: a resolvable ref is not a live one. See
+      // `detachedRefError`. `null` (the context went away) is unknowable, not
+      // a refusal, and falls through to the action's own honest failure.
+      // Only for `@` refs: `css=`/`xpath=` go through `querySelector`, which
+      // returns connected nodes by construction, so the check would spend a
+      // round trip to say what the resolution already proved, and its
+      // "use a fresh ref" advice names something the caller never used.
+      if (
+        target.startsWith('@') &&
+        (await connectedBeforeActing(resolution.session, resolution.objectId)) === false
+      ) {
+        return {
+          ok: false,
+          status: 'error',
+          error: detachedRefError(target, a.action),
+          data: { action: a.action, target, stale_refs: true, reason: 'detached' },
         }
       }
       objectId = resolution.objectId
@@ -664,16 +807,31 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     // visible "Choose File" button reaches the same chooser, and is the shape
     // most likely to hit one, since a coordinate is used precisely when the
     // agent could not resolve a ref to look at.
+    // One evaluate for a coordinate target, answering both the guard below and
+    // `hit` in the payload. Run for the coordinate-capable verbs whether or
+    // not they activate: knowing a hover landed on `body` is the same
+    // information, and it is the same call either way.
+    if (!objectId && ACCEPTS_COORDINATE.has(a.action)) {
+      pointTarget = await describePoint(tabId, explicitPoint)
+    }
+
     if (ACTIVATES_TARGET.has(a.action)) {
       const onFileInput = objectId
         ? await isFileInput(elementSession, objectId)
-        : await pointIsFileInput(tabId, pointFrom(a.coordinate))
+        : pointTarget?.opensFileChooser === true
       if (onFileInput) {
         return {
           ok: false,
           status: 'error',
-          error: fileInputRefusal(target),
-          data: { action: a.action, target, refused: 'file_input' },
+          // A coordinate refusal has no ref to quote, but it does know what
+          // it found there, which is the whole point of having looked.
+          error: fileInputRefusal(target ?? pointTarget?.description ?? null),
+          data: {
+            action: a.action,
+            target,
+            refused: 'file_input',
+            ...(pointTarget ? { hit: pointTarget.description } : {}),
+          },
         }
       }
     }
@@ -696,6 +854,11 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   let inputMode: 'trusted' | 'synthetic' | 'none' = 'none'
   let previousValue: string | null | undefined
   const extra: Record<string, unknown> = {}
+  // Only ever set for a coordinate act: a ref act already names its target,
+  // and `target_exists` answers the same question for it more directly. On a
+  // drag the point is the SOURCE, so it is named as such rather than left to
+  // read as "what the drag hit".
+  if (pointTarget) extra[a.action === 'drag' ? 'hit_from' : 'hit'] = pointTarget.description
 
   // Armed AFTER target resolution so the probe cannot count our own setup: the
   // geometry and hit-test reads run in-page, and neither produces any of the
@@ -952,6 +1115,23 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         if (a.to_ref) {
           const dest = await resolveTarget(tabId, a.to_ref, urlBefore)
           if (!dest.ok) return { ok: false, status: 'error', error: `drag destination: ${dest.error}` }
+          // The destination gets the same liveness gate as the source. Without
+          // it a detached to_ref fell through to the generic "needs a
+          // resolvable destination" below (a detached node has a zero rect, so
+          // geometry returns null), which is false: it resolved fine, it is
+          // just gone, and only one of those two messages tells the agent to
+          // re-read the page.
+          if (
+            a.to_ref.startsWith('@') &&
+            (await connectedBeforeActing(dest.session, dest.objectId)) === false
+          ) {
+            return {
+              ok: false,
+              status: 'error',
+              error: `drag destination: ${detachedRefError(a.to_ref, 'drag')}`,
+              data: { action: 'drag', target, stale_refs: true, reason: 'detached' },
+            }
+          }
           const destLocal = (await elementGeometry(dest.session, dest.objectId))?.point ?? null
           if (destLocal && dest.sessionId) {
             const destFrame = frameSessions(tabId).find((f) => f.sessionId === dest.sessionId)
@@ -1085,4 +1265,11 @@ async function viewportCentre(tabId: number): Promise<Point> {
   return { x: 400, y: 300 }
 }
 
-export const __test = { resolveTarget, performWait, buildVerification, NEEDS_TARGET, OPENS_FILE_CHOOSER }
+export const __test = {
+  resolveTarget,
+  performWait,
+  buildVerification,
+  NEEDS_TARGET,
+  OPENS_FILE_CHOOSER,
+  DESCRIBE_ELEMENT,
+}

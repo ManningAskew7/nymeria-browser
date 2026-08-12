@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { execAct, __test } from './act'
-import { resetForTests as resetDebugger } from '../debuggerSession'
+import { CdpCallTimeout, resetForTests as resetDebugger } from '../debuggerSession'
 import { push as pushConsole, resetForTests as resetConsole } from '../consoleBuffer'
 import { resetForTests as resetDelivery } from '../delivery'
 import { resetForTests as resetRefs, set as setRefs } from '../snapshotRefs'
@@ -46,6 +46,12 @@ interface MockOptions {
   inputAckHangsFrom?: number
   /** true models input[type=file], whose activation opens the OS chooser. */
   isFileInput?: boolean
+  /** false models a ref that still resolves but is detached from the document. */
+  targetConnected?: boolean
+  /** 'timeout' models the session layer failing the connectedness probe. */
+  connectedThrows?: 'timeout'
+  /** What `elementFromPoint` finds under a bare coordinate. */
+  pointDescription?: string
   /** true models a document containing iframes, where the probe sees one only. */
   pageHasFrames?: boolean
   /** false models a target inside an iframe the probe never watched. */
@@ -73,6 +79,9 @@ function installCdpMock(opts: MockOptions = {}) {
     rendererHangsAfterDispatch,
     inputAckHangsFrom,
     isFileInput = false,
+    targetConnected = true,
+    connectedThrows,
+    pointDescription = 'body',
     pageHasFrames = false,
     targetInTopDocument = true,
   } = opts
@@ -112,7 +121,10 @@ function installCdpMock(opts: MockOptions = {}) {
       }
       if (fn.includes('const isFile =')) return { result: { value: isFileInput } }
       if (fn.includes('elementFromPoint')) return { result: { value: hit } }
-      if (fn.includes('isConnected')) return { result: { value: true } }
+      if (fn.includes('isConnected')) {
+        if (connectedThrows === 'timeout') throw new CdpCallTimeout('Runtime.callFunctionOn', 15_000)
+        return { result: { value: targetConnected } }
+      }
       if (fn.includes('ownerDocument')) return { result: { value: targetInTopDocument } }
       if (fn.includes('this.options')) return { result: { value: selectMatches } }
       if (fn.includes('this.checked') && fn.includes('return')) return { result: { value: value } }
@@ -139,8 +151,11 @@ function installCdpMock(opts: MockOptions = {}) {
         if (deliveryReadThrows) throw new Error(deliveryReadThrows)
         return { result: { value: deliveryCount } }
       }
-      // The coordinate-target file-input probe, which has no objectId to ask.
-      if (expression.includes('elementFromPoint')) return { result: { value: isFileInput } }
+      // The coordinate-target probe, which has no objectId to ask: one call
+      // answers both the file-input guard and what the point landed on.
+      if (expression.includes('elementFromPoint')) {
+        return { result: { value: { description: pointDescription, opensFileChooser: isFileInput } } }
+      }
       if (expression.includes('MutationObserver')) return { result: { value: settleValue } }
       if (expression.includes('activeElement')) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
@@ -1107,5 +1122,221 @@ describe('the file-chooser predicate', () => {
     build('<input id="t" type="text" value="file"><div id="d" type="file">x</div>')
     expect(opensChooser(document.getElementById('t')!)).toBe(false)
     expect(opensChooser(document.getElementById('d')!)).toBe(false)
+  })
+})
+
+/**
+ * Two failures that both report success while nothing happens, which is the
+ * shape #162 exists to remove. One is ours by construction (a ref that
+ * resolves to a node the page already removed); the other was MEASURED on the
+ * official Claude in Chrome extension 2026-08-12 and has a twin here.
+ */
+describe('targeting honesty', () => {
+  it('refuses a ref that resolves but is detached, before sending anything', async () => {
+    // Blink's DOMNodeId map is keyed on GC liveness, not attachment, so a node
+    // React removed but still caches RESOLVES. Acting fires the page handler
+    // against a detached node: success reported, nothing on screen.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ targetConnected: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(inputEventTypes(cdp), 'nothing may be dispatched at a detached node').toHaveLength(0)
+    const error = String(result.error)
+    expect(error).toMatch(/no longer in the page/i)
+    expect(error).toMatch(/re-read the page/i)
+    // It must NOT read as "the ref was never valid": it was, and the
+    // difference tells the agent the page changed under it.
+    expect(error).toMatch(/still resolves/i)
+    expect((result.data as { reason: string }).reason).toBe('detached')
+  })
+
+  it('still acts on a ref whose connectedness cannot be determined', async () => {
+    // A dead execution context answers nothing. Unknowable is not detached,
+    // and refusing here would fail an action that was about to work.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ targetConnected: null as unknown as boolean })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+  })
+
+  it('names what a coordinate click landed on, so a mis-aim is not a silent success', async () => {
+    // The delivery counter sits at window capture, so a click on empty page
+    // background produces a trusted click event that COUNTS: input_delivered
+    // says yes and the agent learns nothing. Measured on the competing
+    // harness: a stale coordinate hit blank margin and the payload said only
+    // "Clicked at (65, 146)".
+    const cdp = installCdpMock({ pointDescription: 'body' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [65, 146] })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toContain('mousePressed')
+    const data = result.data as { hit?: string; input_delivered?: string }
+    expect(data.hit, 'the payload must say what was under the point').toBe('body')
+    // The honest pairing: input DID reach the page, and it reached nothing
+    // useful. Both facts, neither hidden.
+    expect(data.input_delivered).toBe('yes')
+  })
+
+  it('names the drag source as such rather than as what the drag hit', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ pointDescription: 'div.card' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'drag',
+      coordinate: [10, 10],
+      to_ref: '@e1',
+    })
+
+    const data = result.data as { hit?: string; hit_from?: string }
+    expect(data.hit_from).toBe('div.card')
+    expect(data.hit, 'a drag has two points; an unqualified "hit" would lie').toBeUndefined()
+  })
+
+  it('propagates a session-layer failure from the pre-check instead of acting anyway', async () => {
+    // stillConnected swallows everything by design (it also runs AFTER the
+    // action, where an unanswerable probe is just a missing field). The
+    // pre-dispatch twin must not: if the tab went unusable between resolution
+    // and now, "unknown, carry on" sends input into a tab already known to be
+    // dead, after burning most of the command's budget on the deadline.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ connectedThrows: 'timeout' })
+
+    await expect(execAct({ tab_id: TAB, action: 'click', ref: '@e1' })).rejects.toThrow(
+      /did not answer/i,
+    )
+  })
+
+  it('gives a detached drag DESTINATION the same honest error as a detached source', async () => {
+    // A detached node has a zero rect, so geometry returns null and the drag
+    // used to fail with "needs a resolvable to_ref destination", which is
+    // false (it resolved fine) and never tells the agent to re-read.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ targetConnected: false })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'drag',
+      coordinate: [10, 10],
+      to_ref: '@e1',
+    })
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toMatch(/drag destination/i)
+    expect(error).toMatch(/no longer in the page/i)
+    expect(error).not.toMatch(/needs a resolvable/i)
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('refuses a coordinate click onto a file input naming what it found there', async () => {
+    // The refusal has no ref to quote, but it looked at the point already.
+    const cdp = installCdpMock({ isFileInput: true, pointDescription: 'input#file-upload' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [65, 146] })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toContain('input#file-upload')
+    expect(String(result.error)).toMatch(/path=/)
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('does not claim a hit for a ref act, which already names its target', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { hit?: string }).hit).toBeUndefined()
+    expect((result.data as { target?: string }).target).toBe('@e1')
+  })
+})
+
+/**
+ * Executed against real DOM, not mocked, because the mock fabricates the
+ * value this logic produces and would have carried a syntax error or the
+ * subtree-text bug straight into production with every test green.
+ *
+ * The bug this exists to prevent, caught in review: the first version used
+ * `innerText`, which is SUBTREE text, so a click on empty background reported
+ * `body "Acme Home About Contact Sign in ..."` (the words of everything the
+ * click did NOT hit) instead of `body`. The field's entire purpose is to make
+ * a mis-aim obvious, and that inverted it.
+ */
+describe('the coordinate description', () => {
+  const describeEl = (el: Element): string =>
+    new Function(__test.DESCRIBE_ELEMENT).call(el) as string
+
+  const build = (html: string): void => {
+    document.body.innerHTML = html
+  }
+
+  it('names a container WITHOUT the text of everything inside it', () => {
+    build('<div><h1>Acme</h1><p>Home About Contact</p><button>Sign in</button></div>')
+    expect(describeEl(document.body)).toBe('body')
+  })
+
+  it('labels a leaf control by its own text', () => {
+    build('<button id="t">Sign in</button>')
+    expect(describeEl(document.getElementById('t')!)).toBe('button#t "Sign in"')
+  })
+
+  it('reads a label through a nested span, the usual button shape', () => {
+    build('<button id="t"><span>Add to cart</span></button>')
+    expect(describeEl(document.getElementById('t')!)).toBe('button#t "Add to cart"')
+  })
+
+  it('prefers explicit labelling over text', () => {
+    build('<button id="t" aria-label="Close dialog">x</button>')
+    expect(describeEl(document.getElementById('t')!)).toBe('button#t "Close dialog"')
+  })
+
+  it('falls back to the first class when there is no id and nothing to label with', () => {
+    build('<div id="w"><div class="cookie-banner overlay"></div></div>')
+    expect(describeEl(document.querySelector('.cookie-banner')!)).toBe('div.cookie-banner')
+  })
+
+  it('drops text that is too long to be a label', () => {
+    build(`<section class="content"><p>${'word '.repeat(40)}</p></section>`)
+    expect(describeEl(document.querySelector('.content')!)).toBe('section.content')
+  })
+
+  it('never takes text from html, whatever the page contains', () => {
+    build('<p>short</p>')
+    expect(describeEl(document.documentElement)).toBe('html')
+  })
+
+  it('does not let a quote in a label unbalance the description', () => {
+    build('<button id="t" aria-label=\'say "hi" now\'>x</button>')
+    expect(describeEl(document.getElementById('t')!)).toBe('button#t "say \'hi\' now"')
+  })
+
+  it('collapses whitespace and truncates, so one field cannot flood the payload', () => {
+    build(`<button id="t" aria-label="${'x'.repeat(200)}">y</button>`)
+    const out = describeEl(document.getElementById('t')!)
+    expect(out.length).toBeLessThan(80)
+    build('<button id="u" aria-label="a\n\n   b">y</button>')
+    expect(describeEl(document.getElementById('u')!)).toBe('button#u "a b"')
+  })
+
+  it('survives an element whose getters throw, rather than losing the answer', () => {
+    // A hostile page can define these. The verdict half of the probe is
+    // computed first and separately guarded, so a throwing description costs
+    // the label and not the file-input refusal.
+    build('<div id="t">x</div>')
+    const el = document.getElementById('t')!
+    Object.defineProperty(el, 'textContent', {
+      get() {
+        throw new Error('nope')
+      },
+    })
+    expect(describeEl(el)).toBe('unknown')
   })
 })
