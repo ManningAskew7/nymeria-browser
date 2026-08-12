@@ -31,6 +31,19 @@ interface MockOptions {
   rendererHangs?: boolean
   /** true models an action that RAISES a dialog: healthy until input lands. */
   rendererHangsAfterDispatch?: boolean
+  /**
+   * Models the SYNCHRONOUS dialog: Chrome acks `Input.dispatch*` only after
+   * the renderer has processed the event, so a handler that calls `alert()`
+   * blocks the ack itself and the dispatch await never returns. Measured live
+   * 2026-08-12; `rendererHangsAfterDispatch` cannot model it, because there
+   * the Input call resolves and only the NEXT call hangs.
+   *
+   * The VALUE is the 1-indexed Input event to stall from, and it matters: a
+   * click emits a preparatory mouseMoved before its press, so 1 models a
+   * blocking hover handler (nothing landed) and 2 models the real alert case
+   * (the press landed). A boolean could only ever have expressed the first.
+   */
+  inputAckHangsFrom?: number
   /** true models a document containing iframes, where the probe sees one only. */
   pageHasFrames?: boolean
   /** false models a target inside an iframe the probe never watched. */
@@ -56,11 +69,13 @@ function installCdpMock(opts: MockOptions = {}) {
     deliveryReadThrows,
     rendererHangs,
     rendererHangsAfterDispatch,
+    inputAckHangsFrom,
     pageHasFrames = false,
     targetInTopDocument = true,
   } = opts
   const PROBE_CONTEXT = 77
   let dispatched = false
+  let inputEvents = 0
 
   // Every method that needs the renderer's main thread. A page suspended by its
   // own dialog answers NONE of them, which is what makes a single-method hang
@@ -74,7 +89,13 @@ function installCdpMock(opts: MockOptions = {}) {
 
   const sendCommand = vi.fn(async (_target: unknown, method: string, params: Record<string, unknown> = {}) => {
     if (rendererHangs && RENDERER_BOUND.has(method)) return new Promise<never>(() => {})
-    if (method.startsWith('Input.')) dispatched = true
+    // Recorded BEFORE the ack-hang return, so combining this with
+    // `rendererHangsAfterDispatch` models what it reads as.
+    if (method.startsWith('Input.')) {
+      dispatched = true
+      inputEvents += 1
+      if (inputAckHangsFrom && inputEvents >= inputAckHangsFrom) return new Promise<never>(() => {})
+    }
     if (rendererHangsAfterDispatch && dispatched && RENDERER_BOUND.has(method)) {
       return new Promise<never>(() => {})
     }
@@ -545,6 +566,78 @@ describe('input delivery', () => {
       expect(error).toMatch(/was sent/i)
       expect(error).toMatch(/not simply retry/i)
       expect(error).not.toMatch(/was NOT sent/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('fails fast when the dispatch ack itself never returns, and says the input LANDED', async () => {
+    // The synchronous twin of the case above, and the commonest shape of it:
+    // Chrome acks `Input.dispatch*` only after the renderer has PROCESSED the
+    // event, so a click handler that calls alert() blocks the ack itself.
+    // Execution never returns from the dispatch await, the post-dispatch
+    // liveness check is unreachable, and without a deadline on the ack the
+    // command rides the full 30s transport timeout. Measured live 2026-08-12.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      // From the PRESS, not the opening pointer move: an alert() raised by
+      // the click handler is reached only once the button goes down.
+      installCdpMock({ inputAckHangsFrom: 2 })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      const error = String(result.error)
+      expect(error).toMatch(/was sent/i)
+      expect(error).toMatch(/not simply retry/i)
+      expect(error).not.toMatch(/was NOT sent/i)
+      expect((result.data as Record<string, unknown>).input).toBe('trusted')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('deadlines check/uncheck\'s read-back, which runs after its own click', async () => {
+    // check/uncheck is the one verb whose renderer-bound verification lives
+    // INSIDE the action rather than after the switch, so the post-dispatch
+    // liveness check cannot cover it. A click that raises a dialog
+    // asynchronously acks fine and suspends the renderer during this read.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ rendererHangsAfterDispatch: true })
+
+      const pending = execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/was sent/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not claim the input landed when the stall was on the opening pointer move', async () => {
+    // A click opens with a mouseMoved. If a blocking hover handler stalls that
+    // ack, no button was ever pressed, so the do-not-retry warning would be a
+    // lie in the expensive direction: it discourages an action that never
+    // happened.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ inputAckHangsFrom: 1 })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/NOT sent/i)
+      expect((result.data as Record<string, unknown>).input).toBeUndefined()
     } finally {
       vi.useRealTimers()
     }

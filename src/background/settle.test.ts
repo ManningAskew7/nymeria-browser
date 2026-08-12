@@ -1,6 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { rendererResponsive } from './settle'
-import { resetForTests as resetDebugger } from './debuggerSession'
+import { isAttached, resetForTests as resetDebugger } from './debuggerSession'
 
 const TAB = 1
 
@@ -78,6 +78,26 @@ describe('rendererResponsive', () => {
 
       expect(settled, 'must decide well inside the 30s transport timeout').toBe(true)
       expect(await pending).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does not leave the tab attached forever', async () => {
+    // The probe acquires a session so the attach is paid outside its deadline.
+    // Acquiring without releasing pins the refcount above zero, and the detach
+    // linger is only ever scheduled when it reaches zero, so the tab would keep
+    // Chrome's "being debugged" banner up for the life of the service worker.
+    // This runs on EVERY action, twice, so it is not a leak that needs an
+    // unusual page to show up.
+    vi.useFakeTimers()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn(async () => ({ result: { value: 1 } }))
+
+      await rendererResponsive(TAB)
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect(isAttached(TAB), 'the session must be released when the probe is done').toBe(false)
     } finally {
       vi.useRealTimers()
     }

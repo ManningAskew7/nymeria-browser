@@ -27,6 +27,86 @@ export interface Point {
   y: number
 }
 
+/**
+ * Chrome acks an `Input.dispatch*` command only after the renderer has
+ * PROCESSED the event, not when the browser accepts it. A handler that raises
+ * a tab-modal dialog synchronously (`alert()` in a click handler is the
+ * textbook case, measured live 2026-08-12) therefore blocks the ack itself,
+ * and an unguarded await rides the backend's whole 30s transport timeout. No
+ * post-dispatch liveness check can help: execution never returns from the
+ * dispatch await to reach one.
+ *
+ * So every dispatch ack gets a wall-clock deadline. Expiry REJECTS with this
+ * distinct type rather than resolving null (which is why settle.ts's
+ * `withDeadline` is not reused): the event provably reached the page, since
+ * its handler running is what suspended the renderer, and that is a different
+ * fact with a different recovery than "never sent". A real protocol error
+ * must stay distinguishable from it, so rejections pass through unchanged.
+ *
+ * Single attempt, no retry, for the same reason as RESPONSIVE_DEADLINE_MS: a
+ * retried dispatch queues behind the same suspended renderer. The abandoned
+ * ack promise keeps its handlers attached, so a late ack (the user dismissing
+ * the dialog minutes later) settles silently instead of surfacing as an
+ * unhandled rejection.
+ */
+export class InputDispatchStalled extends Error {
+  /**
+   * Did the event this stalled on carry the ACTION, or only set up for it?
+   *
+   * `trustedClick` and `trustedDrag` open with a pointer move, so the first
+   * ack that can stall belongs to an event that is not the click. Reporting
+   * "the click was sent, do not retry" for a gesture whose press never went
+   * out would warn the agent off an action that never happened, which is the
+   * same dishonesty in the other direction.
+   */
+  readonly landed: boolean
+
+  constructor(landed: boolean) {
+    super('the renderer did not finish processing the dispatched event')
+    this.name = 'InputDispatchStalled'
+    this.landed = landed
+  }
+}
+
+/**
+ * Deliberately LONGER than settle.ts's RESPONSIVE_DEADLINE_MS, which is the
+ * mistake to avoid rather than the pattern to copy.
+ *
+ * The two look alike and time different quantities. `rendererResponsive` races
+ * a trivial `Runtime.evaluate('1')`, which a healthy page answers in
+ * single-digit milliseconds whatever it is doing. A dispatch ack does not
+ * return until the renderer has run the PAGE'S OWN HANDLERS for that event, so
+ * a heavy click handler on an ordinary SPA legitimately spends a second or
+ * more here. Giving this the liveness deadline would fail actions that were
+ * about to succeed, and inside a batch a false failure aborts every remaining
+ * action, which #162 measured as the expensive direction.
+ *
+ * Still far enough inside the tool layer's 30s that the failure arrives as a
+ * useful answer rather than a timeout.
+ */
+export const DISPATCH_ACK_DEADLINE_MS = 8_000
+
+export function ackWithinDeadline<T>(
+  work: Promise<T>,
+  opts: { ms?: number; landed?: boolean } = {},
+): Promise<T> {
+  const ms = opts.ms ?? DISPATCH_ACK_DEADLINE_MS
+  const landed = opts.landed ?? true
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new InputDispatchStalled(landed)), ms)
+    work.then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (err) => {
+        clearTimeout(timer)
+        reject(err)
+      },
+    )
+  })
+}
+
 export type MouseButton = 'left' | 'right'
 
 const MODIFIER_BITS: Record<string, number> = {
@@ -235,21 +315,31 @@ async function mouseEvent(
   target: Cdp,
   type: 'mouseMoved' | 'mousePressed' | 'mouseReleased',
   point: Point,
-  opts: { button?: MouseButton; clickCount?: number; modifiers?: number; held?: MouseButton } = {},
+  opts: {
+    button?: MouseButton
+    clickCount?: number
+    modifiers?: number
+    held?: MouseButton
+    /** This event only positions the pointer for the real one that follows. */
+    preparatory?: boolean
+  } = {},
 ): Promise<void> {
   const button = opts.button ?? (type === 'mouseMoved' ? 'none' : 'left')
   // Held during a press, and during a drag's intermediate moves; released by
   // definition on mouseReleased.
   const held = opts.held ?? (type === 'mousePressed' ? button : 'none')
-  await sendCommand(target, 'Input.dispatchMouseEvent', {
-    type,
-    x: Math.round(point.x),
-    y: Math.round(point.y),
-    button,
-    buttons: BUTTON_BIT[held] ?? 0,
-    clickCount: opts.clickCount ?? (type === 'mouseMoved' ? 0 : 1),
-    modifiers: opts.modifiers ?? 0,
-  })
+  await ackWithinDeadline(
+    sendCommand(target, 'Input.dispatchMouseEvent', {
+      type,
+      x: Math.round(point.x),
+      y: Math.round(point.y),
+      button,
+      buttons: BUTTON_BIT[held] ?? 0,
+      clickCount: opts.clickCount ?? (type === 'mouseMoved' ? 0 : 1),
+      modifiers: opts.modifiers ?? 0,
+    }),
+    { landed: !opts.preparatory },
+  )
 }
 
 /** Move the pointer first so hover handlers fire before the press. */
@@ -265,7 +355,9 @@ export async function trustedClick(
   const button = opts.button ?? 'left'
   const modifiers = opts.modifiers ?? 0
   const clickCount = opts.clickCount ?? 1
-  await mouseEvent(target, 'mouseMoved', point, { modifiers })
+  // Preparatory: if a hover handler blocks the main thread here, no button has
+  // been pressed yet, so this is a click that did NOT go out.
+  await mouseEvent(target, 'mouseMoved', point, { modifiers, preparatory: true })
   for (let n = 1; n <= clickCount; n += 1) {
     await mouseEvent(target, 'mousePressed', point, { button, clickCount: n, modifiers })
     await mouseEvent(target, 'mouseReleased', point, { button, clickCount: n, modifiers })
@@ -273,7 +365,7 @@ export async function trustedClick(
 }
 
 export async function trustedDrag(target: Cdp, from: Point, to: Point, modifiers = 0): Promise<void> {
-  await mouseEvent(target, 'mouseMoved', from, { modifiers })
+  await mouseEvent(target, 'mouseMoved', from, { modifiers, preparatory: true })
   await mouseEvent(target, 'mousePressed', from, { button: 'left', clickCount: 1, modifiers })
   // A couple of intermediate moves: drag implementations that listen for
   // movement deltas ignore a single teleporting move.
@@ -289,6 +381,30 @@ export async function trustedDrag(target: Cdp, from: Point, to: Point, modifiers
   await mouseEvent(target, 'mouseReleased', to, { button: 'left', clickCount: 1, modifiers })
 }
 
+/**
+ * Wheel scroll. Lives here rather than at the call site so that every
+ * `Input.*` dispatch in the extension goes through this module, and therefore
+ * through the ack deadline: a call site that builds its own dispatch is the
+ * one that gets forgotten.
+ */
+export async function trustedWheel(
+  target: Cdp,
+  point: Point,
+  delta: { x: number; y: number },
+  modifiers = 0,
+): Promise<void> {
+  await ackWithinDeadline(
+    sendCommand(target, 'Input.dispatchMouseEvent', {
+      type: 'mouseWheel',
+      x: Math.round(point.x),
+      y: Math.round(point.y),
+      deltaX: delta.x,
+      deltaY: delta.y,
+      modifiers,
+    }),
+  )
+}
+
 export async function focusElement(target: Cdp, objectId: string): Promise<void> {
   await sendCommand(target, 'DOM.focus', { objectId })
 }
@@ -299,7 +415,7 @@ export async function focusElement(target: Cdp, objectId: string): Promise<void>
  * `typeText` for widgets that listen for keydown.
  */
 export async function insertText(target: Cdp, text: string): Promise<void> {
-  await sendCommand(target, 'Input.insertText', { text })
+  await ackWithinDeadline(sendCommand(target, 'Input.insertText', { text }))
 }
 
 /**
@@ -329,12 +445,14 @@ export async function dispatchKey(target: Cdp, key: string, modifiers = 0): Prom
           // so pass it through rather than inventing one.
           { code: key }),
   }
-  await sendCommand(target, 'Input.dispatchKeyEvent', {
-    type: text ? 'keyDown' : 'rawKeyDown',
-    ...common,
-    ...(text ? { text } : {}),
-  })
-  await sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common })
+  await ackWithinDeadline(
+    sendCommand(target, 'Input.dispatchKeyEvent', {
+      type: text ? 'keyDown' : 'rawKeyDown',
+      ...common,
+      ...(text ? { text } : {}),
+    }),
+  )
+  await ackWithinDeadline(sendCommand(target, 'Input.dispatchKeyEvent', { type: 'keyUp', ...common }))
 }
 
 /** Per-character key events, for widgets that need keydown/keyup per key. */

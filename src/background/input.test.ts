@@ -1,5 +1,14 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { dispatchKey, modifierMask, typeText } from './input'
+import {
+  dispatchKey,
+  InputDispatchStalled,
+  insertText,
+  modifierMask,
+  trustedClick,
+  trustedHover,
+  trustedWheel,
+  typeText,
+} from './input'
 import { resetForTests as resetDebugger } from './debuggerSession'
 
 const TAB = 1
@@ -176,5 +185,210 @@ describe('key identity for single characters', () => {
     const downs = keyEvents(mock).filter((e) => e.type === 'keyDown')
     expect(downs.map((e) => e.windowsVirtualKeyCode)).toEqual([65, 49])
     expect(downs.map((e) => e.code)).toEqual(['KeyA', 'Digit1'])
+  })
+})
+
+describe('dispatch ack deadline', () => {
+  // Chrome acks Input.dispatch* only after the renderer has processed the
+  // event, so a handler that raises a dialog synchronously blocks the ack
+  // forever. Measured live 2026-08-12; the full story is on the class.
+
+  it('gives up on an unacked dispatch well before the transport does', async () => {
+    // The upper bound is what decides whether this does anything: the tool
+    // layer kills a browser command at 30s, so a deadline near that costs a
+    // round trip and buys nothing. Without this assertion a 29s deadline
+    // passes every other test in the file.
+    vi.useFakeTimers()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn(() => new Promise<never>(() => {}))
+
+      let outcome: unknown = null
+      const pending = dispatchKey(TAB, 'Enter').catch((e: unknown) => {
+        outcome = e
+        return e
+      })
+      await vi.advanceTimersByTimeAsync(12_000)
+
+      expect(outcome, 'must decide well inside the 30s transport timeout').toBeInstanceOf(
+        InputDispatchStalled,
+      )
+      await pending
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('deadlines every Input.* dispatch, not just the ones with a test each', async () => {
+    // A per-method sweep, because the failure mode here is a call site that
+    // forgets the wrapper rather than one that gets it wrong: unwrapping
+    // insertText, the keyUp half of a keystroke, or the wheel dispatch each
+    // survived the whole suite before this existed.
+    // `hangFrom` is the 1-indexed Input event to stall on, chosen as the LAST
+    // one each gesture emits: stalling the first would leave a later wrapper
+    // (a keystroke's keyUp) unproven, which is exactly the gap being closed.
+    const dispatches: Array<{ label: string; hangFrom: number; run: () => Promise<unknown> }> = [
+      { label: 'Input.insertText', hangFrom: 1, run: () => insertText(TAB, 'hello') },
+      { label: 'Input.dispatchKeyEvent (keyUp half)', hangFrom: 2, run: () => dispatchKey(TAB, 'a') },
+      {
+        label: 'Input.dispatchMouseEvent (wheel)',
+        hangFrom: 1,
+        run: () => trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 }),
+      },
+      {
+        label: 'Input.dispatchMouseEvent (hover)',
+        hangFrom: 1,
+        run: () => trustedHover(TAB, { x: 5, y: 5 }),
+      },
+      {
+        label: 'Input.dispatchMouseEvent (click release)',
+        hangFrom: 3,
+        run: () => trustedClick(TAB, { x: 5, y: 5 }),
+      },
+    ]
+
+    for (const { label, hangFrom, run } of dispatches) {
+      vi.useFakeTimers()
+      try {
+        let sent = 0
+        ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) => {
+          if (!method.startsWith('Input.')) return Promise.resolve({})
+          sent += 1
+          return sent >= hangFrom ? new Promise<never>(() => {}) : Promise.resolve({})
+        })
+
+        let outcome: unknown = null
+        const pending = run().catch((e: unknown) => {
+          outcome = e
+          return e
+        })
+        await vi.advanceTimersByTimeAsync(60_000)
+
+        expect(outcome, `${label} must be deadlined`).toBeInstanceOf(InputDispatchStalled)
+        await pending
+      } finally {
+        vi.useRealTimers()
+      }
+    }
+  })
+
+  it('marks a click stalled on its opening pointer move as NOT landed', async () => {
+    // trustedClick opens with a mouseMoved to position the pointer, so the
+    // first ack that can stall belongs to an event that is not the click. A
+    // blocking hover handler must not produce "the click was sent, do not
+    // retry" for a press that never went out.
+    vi.useFakeTimers()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) =>
+        method.startsWith('Input.') ? new Promise<never>(() => {}) : Promise.resolve({}),
+      )
+
+      let outcome: InputDispatchStalled | null = null
+      const pending = trustedClick(TAB, { x: 5, y: 5 }).catch((e: InputDispatchStalled) => {
+        outcome = e
+        return e
+      })
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect(outcome).toBeInstanceOf(InputDispatchStalled)
+      expect(outcome!.landed, 'no button was pressed, so nothing landed').toBe(false)
+      await pending
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('marks a stall on the press itself as landed', async () => {
+    // The other half of the pair: once the button is down the page has the
+    // event, so the do-not-retry warning is earned.
+    vi.useFakeTimers()
+    try {
+      let sent = 0
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) => {
+        if (!method.startsWith('Input.')) return Promise.resolve({})
+        sent += 1
+        return sent >= 2 ? new Promise<never>(() => {}) : Promise.resolve({})
+      })
+
+      let outcome: InputDispatchStalled | null = null
+      const pending = trustedClick(TAB, { x: 5, y: 5 }).catch((e: InputDispatchStalled) => {
+        outcome = e
+        return e
+      })
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect(outcome).toBeInstanceOf(InputDispatchStalled)
+      expect(outcome!.landed).toBe(true)
+      await pending
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('gives the page longer than the liveness probe does', async () => {
+    // The lower bound, and the reason these two deadlines must not be unified:
+    // a liveness probe times a trivial evaluate, while a dispatch ack waits on
+    // the page's OWN handler for that event. A handler that takes a couple of
+    // seconds is ordinary, and failing it would abort the rest of a batch.
+    vi.useFakeTimers()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn(
+        (_t: unknown, method: string) =>
+          new Promise((resolve) => {
+            setTimeout(() => resolve({}), method.startsWith('Input.') ? 5_000 : 0)
+          }),
+      )
+
+      const pending = dispatchKey(TAB, 'Enter').then(
+        () => 'ok',
+        (e: unknown) => e,
+      )
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect(await pending, 'a 5s handler must not read as a suspended page').toBe('ok')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports a real protocol error as itself, never as a stall', async () => {
+    // A detached session or a closed target is a different failure with its
+    // own honest message downstream. Converting it into the "input landed"
+    // story would warn the agent off retrying an action that never happened.
+    ;(chrome.debugger.sendCommand as unknown) = vi.fn(async () => {
+      throw new Error('Detached while handling command')
+    })
+
+    await expect(dispatchKey(TAB, 'Enter')).rejects.toThrow('Detached while handling command')
+  })
+
+  it('stalls out of a multi-character type mid-string, not only on the first key', async () => {
+    // Each character is its own dispatch, and any one of them can be the one
+    // whose handler raises the dialog. The loop must not outlive the stall.
+    vi.useFakeTimers()
+    try {
+      // Count only the key events: the session also enables its capture
+      // domains through the same chrome.debugger.sendCommand on first use.
+      let keyEvents = 0
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) => {
+        if (method !== 'Input.dispatchKeyEvent') return Promise.resolve({})
+        keyEvents += 1
+        // Third key event: the keyDown of the second character.
+        if (keyEvents >= 3) return new Promise<never>(() => {})
+        return Promise.resolve({})
+      })
+
+      let outcome: unknown = null
+      const pending = typeText(TAB, 'hi').catch((e: unknown) => {
+        outcome = e
+        return e
+      })
+      await vi.advanceTimersByTimeAsync(60_000)
+
+      expect(outcome).toBeInstanceOf(InputDispatchStalled)
+      expect(keyEvents, 'no further keys may be dispatched after the stall').toBe(3)
+      await pending
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

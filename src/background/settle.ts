@@ -1,4 +1,4 @@
-import { acquire, sendCommand } from './debuggerSession'
+import { acquire, release, sendCommand } from './debuggerSession'
 
 /**
  * Wait for a page to stop changing after an action.
@@ -162,6 +162,14 @@ export async function rendererResponsive(
   // the condition being measured.
   try {
     await acquire(tabId)
+    // Released immediately, which does NOT undo the point of acquiring here:
+    // the attach and its capture-domain enables have already been paid, and
+    // the 10s detach linger keeps the session warm for the probe below and
+    // for the action after it. Holding the ref instead would leak it, since
+    // there is no path back here to release it, and a refcount that never
+    // returns to zero never schedules the detach: the tab would keep its
+    // "being debugged" banner for the life of the service worker.
+    release(tabId)
   } catch {
     // Nothing to measure without a session. Downstream calls will fail with
     // their own honest error rather than being blamed on a dialog.

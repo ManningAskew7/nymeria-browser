@@ -3,11 +3,13 @@ import { readSince as consoleSince } from '../consoleBuffer'
 import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
 import { absenceIsConclusive, armDelivery, type DeliveryOutcome } from '../delivery'
 import {
+  ackWithinDeadline,
   callOn,
   dispatchKey,
   elementGeometry,
   focusElement,
   hitTest,
+  InputDispatchStalled,
   insertText,
   modifierMask,
   frameOffset,
@@ -16,6 +18,7 @@ import {
   trustedClick,
   trustedDrag,
   trustedHover,
+  trustedWheel,
   typeText,
   type Point,
 } from '../input'
@@ -203,11 +206,13 @@ function localDiagnostics(tabId: number, startedAt: number): Record<string, unkn
 function dispatchedThenStalledError(action: ActionName): string {
   return (
     `the ${action} was sent, and the page then stopped running scripts, so what it ` +
-    'did could not be verified. The usual cause is that the action itself raised a ' +
-    'dialog (a "Leave site?" on a form with unsaved changes, or a confirm() in the ' +
-    'page\'s own handler). DO NOT simply retry: the action may already have taken ' +
-    'effect, and repeating it could submit twice. Read the tab in a fresh one, or ' +
-    'ask the user what is on their screen.'
+    'did could not be verified. Two things do that, and this does not say which: the ' +
+    'action raised a dialog (a "Leave site?" on a form with unsaved changes, or a ' +
+    "confirm() in the page's own handler), or its own handler is still running and " +
+    'has blocked the page for several seconds. DO NOT simply retry either way: the ' +
+    'action may already have taken effect, and repeating it could submit twice. Read ' +
+    'the tab to see what happened, in a fresh one if this one stays stuck, or ask the ' +
+    'user what is on their screen.'
   )
 }
 
@@ -717,7 +722,15 @@ export async function execAct(args: unknown): Promise<CommandResult> {
             await trustedClick(tabId, await dispatchPoint(geo.point), { modifiers })
             inputMode = 'trusted'
           }
-          const now = await readValue(elementSession, objectId)
+          // Deadlined for the same reason the dispatch itself is, and this is
+          // the only verb that needs it said separately: its verification runs
+          // HERE, inside the action, rather than after the switch where the
+          // post-dispatch liveness check sits. A click that raises a dialog
+          // asynchronously (a setTimeout'ed alert, a queued beforeunload) acks
+          // fine and then suspends the renderer, and this read would queue
+          // behind it for the whole transport timeout. A stall here means the
+          // click landed, which is exactly what the caught error reports.
+          const now = await ackWithinDeadline(readValue(elementSession, objectId))
           if (now !== String(want)) {
             await callOn(
               tabId,
@@ -790,14 +803,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         const deltaX = direction === 'left' ? -amount : direction === 'right' ? amount : 0
         const deltaY = direction === 'up' ? -amount : direction === 'down' ? amount : 0
         const at = pointFrom(a.coordinate) ?? (await viewportCentre(tabId))
-        await sendCommand(tabId, 'Input.dispatchMouseEvent', {
-          type: 'mouseWheel',
-          x: Math.round(at.x),
-          y: Math.round(at.y),
-          deltaX,
-          deltaY,
-          modifiers,
-        })
+        await trustedWheel(tabId, at, { x: deltaX, y: deltaY }, modifiers)
         inputMode = 'trusted'
         extra.scrolled = { direction, amount_px: amount }
         break
@@ -835,6 +841,30 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         return { ok: false, status: 'error', error: `unknown action: ${String(a.action)}` }
     }
   } catch (e) {
+    if (e instanceof InputDispatchStalled) {
+      // The synchronous twin of the post-dispatch check below: an event
+      // reached the page and its handler suspended the renderer BEFORE Chrome
+      // could ack the dispatch, so execution never gets as far as that check.
+      //
+      // `landed` decides WHICH failure this is, and the distinction is not
+      // cosmetic. A click opens with a pointer move, so a stall on that first
+      // ack means no button was ever pressed: telling the agent the click
+      // landed would warn it off retrying something that never happened. Only
+      // a stall on the event carrying the action earns the do-not-retry
+      // message, and only that case is `trusted`, since nothing else went out.
+      const landed = e.landed
+      return {
+        ok: false,
+        status: 'error',
+        error: landed ? dispatchedThenStalledError(a.action) : stalledError(a.action),
+        data: {
+          action: a.action,
+          url: urlBefore,
+          ...(landed ? { input: 'trusted' } : {}),
+          ...localDiagnostics(tabId, startedAt),
+        },
+      }
+    }
     return { ok: false, status: 'error', error: `${a.action} failed: ${String(e)}` }
   }
 
