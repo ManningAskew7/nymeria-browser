@@ -1,6 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { clear as clearRefs } from '../snapshotRefs'
-import { waitForTabComplete } from '../settle'
+import { TAB_LOAD_WAIT_MS, waitForTabComplete } from '../settle'
 
 /**
  * Move a tab through its session history.
@@ -38,7 +38,7 @@ export async function execHistory(args: unknown): Promise<CommandResult> {
     }
   }
   clearRefs(a.tab_id)
-  const complete = await waitForTabComplete(a.tab_id, 15_000)
+  const complete = await waitForTabComplete(a.tab_id, TAB_LOAD_WAIT_MS)
   const after = await chrome.tabs.get(a.tab_id).catch(() => null)
 
   return {

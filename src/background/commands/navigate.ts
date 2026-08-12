@@ -1,6 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { clear as clearRefs } from '../snapshotRefs'
-import { waitForTabComplete } from '../settle'
+import { TAB_LOAD_WAIT_MS, waitForTabComplete } from '../settle'
 
 interface NavigateArgs {
   tab_id: number
@@ -30,7 +30,7 @@ export async function execNavigate(args: unknown): Promise<CommandResult> {
   clearRefs(a.tab_id)
 
   // Shared with history.ts so the two cannot drift on what "loaded" means.
-  const complete = await waitForTabComplete(a.tab_id, 25_000)
+  const complete = await waitForTabComplete(a.tab_id, TAB_LOAD_WAIT_MS)
   const finalTab = await chrome.tabs.get(a.tab_id).catch(() => null)
 
   return {

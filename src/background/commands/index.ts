@@ -13,6 +13,7 @@ import { execNetwork } from './network'
 import { execScreenshot } from './screenshot'
 import { execSnapshot } from './snapshot'
 import { execTabs } from './tabs'
+import { READ_LIVENESS_DEADLINE_MS, rendererResponsive, suspendedPageReadError } from '../settle'
 
 type Executor = (args: unknown) => Promise<CommandResult>
 
@@ -26,10 +27,65 @@ type Executor = (args: unknown) => Promise<CommandResult>
  */
 const MAX_RESULT_BYTES = 8_000_000
 
+/**
+ * Which commands cannot produce anything on a suspended renderer.
+ *
+ * A `Record<CommandType, boolean>` rather than a set of names, so adding a
+ * command type is a COMPILE ERROR until someone answers this question for it.
+ * A set would let a thirteenth command be silently unclassified, and the whole
+ * point of this table is that it must not quietly go stale.
+ *
+ * Measured 2026-08-12: a `chrome_find` against a tab held by an alert() rode
+ * its full 20s transport budget and came back with a bare timeout, and the
+ * agent worked around it by guessing a css= selector rather than learning the
+ * tab was wedged.
+ *
+ * The falses are as deliberate as the trues. `act` does its own liveness
+ * checking, twice, and must: its answer turns on whether the stall happened
+ * before or after input went out, which a check out here cannot know.
+ * `navigate` and `tabs` are driven from the browser process and keep working
+ * on a suspended tab, which is exactly why navigating away is a recovery, and
+ * gating them would break it. `history` is the same. `console` and `network`
+ * read local buffers fed by CDP events and need nothing from the page, which
+ * makes them the diagnostics an agent reaches for once a tab goes quiet.
+ * `dialog` is aimed at a suspended tab by definition. `batch` is not itself a
+ * page read; its sub-commands come back through here individually. `cdp` is
+ * the raw escape hatch and must not be second-guessed.
+ *
+ * `screenshot` is a false on purpose, and it is the interesting one. Its
+ * image comes from the compositor, not the renderer, so a picture of a page
+ * frozen by a script is exactly what an agent most wants and a pre-flight
+ * would throw it away. Only its viewport-metrics `Runtime.evaluate` is
+ * renderer-bound, and that call carries its own deadline. (The probe would
+ * not have helped with the OTHER screenshot hang either: on a backgrounded
+ * tab `Page.captureScreenshot` waits for a compositor frame while evaluate
+ * answers instantly. Backlog #165, C-03.)
+ */
+const READS_THE_PAGE: Record<CommandType, boolean> = {
+  snapshot: true,
+  extract_text: true,
+  act: false,
+  screenshot: false,
+  navigate: false,
+  tabs: false,
+  history: false,
+  console: false,
+  network: false,
+  dialog: false,
+  batch: false,
+  cdp: false,
+}
+
 async function runSingle(type: string, args: unknown): Promise<CommandResult> {
   const executor = EXECUTORS[type as CommandType]
   if (!executor) {
     return { ok: false, status: 'error', error: `unknown command_type: ${String(type)}` }
+  }
+  const tabId = (args as { tab_id?: unknown } | null)?.tab_id
+  if (READS_THE_PAGE[type as CommandType] && typeof tabId === 'number') {
+    if (!(await rendererResponsive(tabId, READ_LIVENESS_DEADLINE_MS))) {
+      return { ok: false, status: 'error', error: suspendedPageReadError() }
+    }
   }
   return executor(args)
 }
@@ -94,17 +150,15 @@ export function setDispatchHooks(h: DispatchHooks): void {
 
 export async function dispatchBrowserCommand(event: BrowserCommandEvent): Promise<void> {
   const { command_id, command_type, args } = event
-  const executor = EXECUTORS[command_type]
   hooks.onStart?.(event)
   let payload: CommandResult
-  if (!executor) {
-    payload = { ok: false, status: 'error', error: `unknown command_type: ${String(command_type)}` }
-  } else {
-    try {
-      payload = await executor(args)
-    } catch (e) {
-      payload = { ok: false, status: 'error', error: errorToString(e) }
-    }
+  // Through `runSingle`, the same entry a batch's sub-commands use. These were
+  // two parallel paths that each looked up the executor themselves, so
+  // anything added to one silently missed the other. Keep it one path.
+  try {
+    payload = await runSingle(String(command_type), args)
+  } catch (e) {
+    payload = { ok: false, status: 'error', error: errorToString(e) }
   }
   payload = capResult(payload, String(command_type))
   hooks.onResult?.(event, payload)

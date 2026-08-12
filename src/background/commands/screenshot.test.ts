@@ -60,4 +60,39 @@ describe('execScreenshot', () => {
     expect(beyond(captures[0])).toBe(true)
     expect(beyond(captures[1])).toBe(false)
   })
+
+  it('still returns the image when the page is too suspended to answer for metrics', async () => {
+    // The image comes from the COMPOSITOR, so a picture of a page frozen by a
+    // dialog or a long script is exactly what an agent most wants. Only the
+    // viewport metrics are renderer-bound, and an undeadlined evaluate there
+    // would hold the whole command to its transport timeout and throw the
+    // picture away. Losing the coordinates costs the vision fallback its
+    // aim; losing the picture costs the agent the page.
+    vi.useFakeTimers()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn(async (...call: unknown[]) => {
+        const method = call[1] as string
+        if (method === 'Page.captureScreenshot') return { data: 'PNGDATA' }
+        if (method === 'Runtime.evaluate') return new Promise<never>(() => {})
+        return {}
+      })
+
+      let settled = false
+      const pending = execScreenshot({ tab_id: TAB }).then((r) => {
+        settled = true
+        return r
+      })
+      await vi.advanceTimersByTimeAsync(10_000)
+
+      expect(settled, 'must not wait on the suspended renderer').toBe(true)
+      const result = await pending
+      expect(result.ok).toBe(true)
+      const data = result.data as { base64: string; viewport: unknown; scale: unknown }
+      expect(data.base64).toBe('PNGDATA')
+      expect(data.viewport).toBeNull()
+      expect(data.scale).toBeNull()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
 })

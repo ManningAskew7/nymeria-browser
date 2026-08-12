@@ -44,6 +44,8 @@ interface MockOptions {
    * (the press landed). A boolean could only ever have expressed the first.
    */
   inputAckHangsFrom?: number
+  /** true models input[type=file], whose activation opens the OS chooser. */
+  isFileInput?: boolean
   /** true models a document containing iframes, where the probe sees one only. */
   pageHasFrames?: boolean
   /** false models a target inside an iframe the probe never watched. */
@@ -70,6 +72,7 @@ function installCdpMock(opts: MockOptions = {}) {
     rendererHangs,
     rendererHangsAfterDispatch,
     inputAckHangsFrom,
+    isFileInput = false,
     pageHasFrames = false,
     targetInTopDocument = true,
   } = opts
@@ -107,6 +110,7 @@ function installCdpMock(opts: MockOptions = {}) {
       if (fn.includes('getBoundingClientRect')) {
         return { result: { value: geometry } }
       }
+      if (fn.includes('const isFile =')) return { result: { value: isFileInput } }
       if (fn.includes('elementFromPoint')) return { result: { value: hit } }
       if (fn.includes('isConnected')) return { result: { value: true } }
       if (fn.includes('ownerDocument')) return { result: { value: targetInTopDocument } }
@@ -135,6 +139,8 @@ function installCdpMock(opts: MockOptions = {}) {
         if (deliveryReadThrows) throw new Error(deliveryReadThrows)
         return { result: { value: deliveryCount } }
       }
+      // The coordinate-target file-input probe, which has no objectId to ask.
+      if (expression.includes('elementFromPoint')) return { result: { value: isFileInput } }
       if (expression.includes('MutationObserver')) return { result: { value: settleValue } }
       if (expression.includes('activeElement')) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
@@ -600,6 +606,99 @@ describe('input delivery', () => {
     }
   })
 
+  it('refuses to click a file input, because the OS chooser it opens cannot be closed', async () => {
+    // The most severe wedge in the failure-mode research: activating an
+    // input[type=file] opens the NATIVE file chooser, which is not browser UI.
+    // No CDP domain sees it, no extension API dismisses it, and it blocks the
+    // user's browser window until a human deals with it. We shipped no guard.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ isFileInput: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/file input/i)
+    // It must name the route that does work, or the agent just gives up. And
+    // it must name the AGENT-FACING parameter: `file_name`/`file_base64` are
+    // wire args the backend synthesizes from `path`, so pointing the agent at
+    // them sends it to a call that is rejected for an unknown parameter.
+    expect(String(result.error)).toMatch(/action="upload"/)
+    expect(String(result.error)).toMatch(/\bpath=/)
+    expect(String(result.error)).not.toMatch(/file_base64|file_name/)
+    // Nothing may reach the page: a synthetic this.click() opens the chooser
+    // exactly as a trusted one does, so refusing after the geometry check
+    // would not be refusing at all.
+    expect(methodsOf(cdp)).not.toContain('Input.dispatchMouseEvent')
+  })
+
+  it('refuses a hidden file input too, where the synthetic path would have fired', async () => {
+    // The hidden file input behind a styled upload button is the common shape,
+    // and it has no layout box, so click falls through to a synthetic
+    // this.click(). That opens the chooser just the same.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ isFileInput: true, geometry: null })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/file input/i)
+    const clicked = (cdp.mock.calls as unknown as [unknown, string, { functionDeclaration?: string }][])
+      .some((c) => c[1] === 'Runtime.callFunctionOn' && (c[2].functionDeclaration ?? '').includes('this.click()'))
+    expect(clicked, 'the synthetic fallback must not fire either').toBe(false)
+  })
+
+  it('still clicks ordinary inputs', async () => {
+    // The guard must not become "refuse anything that looks like an input".
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ isFileInput: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(methodsOf(cdp)).toContain('Input.dispatchMouseEvent')
+  })
+
+  it('refuses a coordinate click that lands on a file input', async () => {
+    // The vision-fallback shape, and the likeliest one to meet a visible
+    // "Choose File" button: a coordinate is used precisely when the agent
+    // could not resolve a ref to look at, so a guard that needs one would
+    // miss the case it most needs to cover.
+    const cdp = installCdpMock({ isFileInput: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [10, 20] })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/file input/i)
+    expect(methodsOf(cdp)).not.toContain('Input.dispatchMouseEvent')
+  })
+
+  it('refuses a key press on a focused file input, which opens the chooser too', async () => {
+    // Enter or Space on a focused input[type=file] opens the same OS chooser.
+    // Scoping the guard to clicks would leave the justification ("the only
+    // element whose activation is unrecoverable") only two-thirds honoured.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ isFileInput: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'key', ref: '@e1', value: 'Enter' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/file input/i)
+    expect(methodsOf(cdp)).not.toContain('Input.dispatchKeyEvent')
+  })
+
+  it('still right-clicks a file input, whose context menu is dismissable', async () => {
+    // The guard is about activation, not about the element being present. A
+    // context menu is ordinary browser UI the user can close, so refusing it
+    // would be the guard overreaching.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ isFileInput: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'right_click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(methodsOf(cdp)).toContain('Input.dispatchMouseEvent')
+  })
+
   it('deadlines check/uncheck\'s read-back, which runs after its own click', async () => {
     // check/uncheck is the one verb whose renderer-bound verification lives
     // INSIDE the action rather than after the switch, so the post-dispatch
@@ -954,5 +1053,53 @@ describe('delivery is only asked about input we actually dispatched', () => {
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect(result.ok).toBe(false)
+  })
+})
+
+/**
+ * The predicate itself, EXECUTED against real DOM rather than answered by a
+ * mock. The mock can only prove the guard consults something; these prove the
+ * something is right, which is where the interesting cases live: the direct
+ * input is the shape an agent is least likely to hold a ref for, because a
+ * display:none input is absent from the accessibility tree and what the agent
+ * gets is the visible affordance in front of it.
+ */
+describe('the file-chooser predicate', () => {
+  const opensChooser = (el: Element): boolean =>
+    new Function(__test.OPENS_FILE_CHOOSER).call(el) as boolean
+
+  const build = (html: string): Document => {
+    document.body.innerHTML = html
+    return document
+  }
+
+  it('catches a direct file input', () => {
+    build('<input id="t" type="file">')
+    expect(opensChooser(document.getElementById('t')!)).toBe(true)
+  })
+
+  it('catches a label pointing at a hidden file input, the common real shape', () => {
+    // <label for=x> + display:none input is how nearly every styled upload
+    // button is built, and the label is what the accessibility tree surfaces.
+    build('<label id="t" for="f">Upload</label><input id="f" type="file" style="display:none">')
+    expect(opensChooser(document.getElementById('t')!)).toBe(true)
+  })
+
+  it('catches an element inside a label that wraps the input', () => {
+    build('<label><span id="t">Choose a file</span><input type="file"></label>')
+    expect(opensChooser(document.getElementById('t')!)).toBe(true)
+  })
+
+  it('leaves ordinary controls alone', () => {
+    build('<button id="b">Send</button><input id="i" type="text"><label id="l" for="i">Name</label>')
+    for (const id of ['b', 'i', 'l']) {
+      expect(opensChooser(document.getElementById(id)!), `${id} must not be refused`).toBe(false)
+    }
+  })
+
+  it('is not fooled by a type attribute that only looks like one', () => {
+    build('<input id="t" type="text" value="file"><div id="d" type="file">x</div>')
+    expect(opensChooser(document.getElementById('t')!)).toBe(false)
+    expect(opensChooser(document.getElementById('d')!)).toBe(false)
   })
 })

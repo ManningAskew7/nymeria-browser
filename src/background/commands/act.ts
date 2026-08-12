@@ -104,6 +104,26 @@ const NEEDS_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
 const OPTIONAL_TARGET: ReadonlySet<ActionName> = new Set<ActionName>(['type', 'key'])
 
 /**
+ * Actions that ACTIVATE their target, which is what makes a file input
+ * dangerous rather than merely awkward.
+ *
+ * Membership is about activation, not about pointers: `key` earns a place
+ * because Enter or Space on a focused `input[type=file]` opens the chooser
+ * exactly as a click does, and `right_click` is absent because a context menu
+ * is ordinary browser UI the user can dismiss. `upload` is absent because it
+ * is the route this guard exists to send people to.
+ */
+const ACTIVATES_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
+  'click',
+  'double_click',
+  'key',
+  // These dispatch a real click of their own before falling back, so a file
+  // input reached through one opens the chooser just the same.
+  'check',
+  'uncheck',
+])
+
+/**
  * The events each verb must produce in the page, for the delivery probe.
  *
  * Only the verbs that go in through `Input.dispatch*` appear here, because only
@@ -213,6 +233,94 @@ function dispatchedThenStalledError(action: ActionName): string {
     'action may already have taken effect, and repeating it could submit twice. Read ' +
     'the tab to see what happened, in a fresh one if this one stays stuck, or ask the ' +
     'user what is on their screen.'
+  )
+}
+
+/**
+ * Is this element the one control that can wedge the user's whole browser?
+ *
+ * Activating an `input[type=file]` opens the NATIVE OS file chooser. That is
+ * not browser UI: no CDP domain sees it, no extension API dismisses it, and
+ * on Windows it blocks the owning browser window until a human clicks it. It
+ * is the only element on a page whose activation is unrecoverable from here,
+ * which is why it earns a check the rest do not.
+ *
+ * Checked on the ELEMENT rather than by intercepting the chooser, because
+ * `Page.setInterceptFileChooserDialog` is page-wide and sticky: leaving it
+ * armed means the user clicks their own "Choose File" and nothing happens.
+ */
+async function isFileInput(session: Cdp, objectId: string): Promise<boolean> {
+  return (
+    (await callOn<boolean>(session, objectId, `function(){ ${OPENS_FILE_CHOOSER} }`)) === true
+  )
+}
+
+/**
+ * Does activating this element open the file chooser?
+ *
+ * Three routes, and the direct one is the LEAST likely to be met. An agent
+ * reads the accessibility tree, and a `display:none` input is absent from it,
+ * so what the agent gets a ref for is the visible affordance in front of the
+ * input. A `<label for=...>` is therefore checked through `.control`, and an
+ * ancestor label through `.closest`, because activating either forwards to the
+ * input exactly as clicking it does.
+ *
+ * The route this CANNOT see is `<button onclick="input.click()">`: nothing
+ * static distinguishes it from any other button. Closing that one needs
+ * `Page.setInterceptFileChooserDialog` armed around the dispatch (it does not
+ * require `Page.enable`, so the dialog-ownership trap does not apply), which
+ * is filed rather than built: suppression is page-wide, so it must be armed
+ * and disarmed around each act, and it converts the wedge into a silent no-op
+ * that we then have to report honestly. Backlog #165.
+ */
+const OPENS_FILE_CHOOSER = `
+  const isFile = (el) => !!el && el.tagName === 'INPUT' && el.type === 'file';
+  if (isFile(this)) return true;
+  if (this.tagName === 'LABEL' && isFile(this.control)) return true;
+  const label = this.closest && this.closest('label');
+  return !!label && isFile(label.control);
+`
+
+/**
+ * The same question for a bare coordinate, where there is no resolved node to
+ * interrogate.
+ *
+ * Reads the main world, so a hostile page could in principle hide a file input
+ * from this check (the standing `elementFromPoint` caveat, backlog #160). That
+ * only returns this path to how it behaved before the guard existed, and the
+ * page it protects in practice is an ordinary one with a visible "Choose File"
+ * button, so the check is worth having while the isolated-world move is not
+ * yet made. Failing to answer counts as NOT a file input: a probe that cannot
+ * run must not block an otherwise valid click.
+ */
+async function pointIsFileInput(tabId: number, point: Point | null): Promise<boolean> {
+  if (!point) return false
+  try {
+    const resp = await sendCommand<{ result?: { value?: boolean } }>(tabId, 'Runtime.evaluate', {
+      expression: `(() => { const el = document.elementFromPoint(${Math.round(point.x)}, ${Math.round(point.y)}); if (!el) return false; return (function(){ ${OPENS_FILE_CHOOSER} }).call(el); })()`,
+      returnByValue: true,
+    })
+    return resp.result?.value === true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The signature here is the AGENT-FACING one (`path`), not the wire args this
+ * file receives. `file_name`/`file_base64` exist only after the backend has
+ * read the workspace file, so naming them would send the agent to a call that
+ * is rejected for an unknown parameter, in the one message whose entire job is
+ * to redirect it onto the route that works.
+ */
+function fileInputRefusal(target: string | null): string {
+  return (
+    `refusing to click ${target ?? 'that element'}: it is a file input, and clicking ` +
+    'one opens the operating system\'s file chooser. That window is not part of the ' +
+    'browser, nothing here can close it, and it blocks the user until they dismiss it ' +
+    'themselves. Use chrome_act(action="upload", ref=..., path="...") instead, which ' +
+    'puts the file straight into the input and works even when it is hidden behind a ' +
+    'styled button.'
   )
 }
 
@@ -540,6 +648,26 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         elementFrameId = frameSessions(tabId).find(
           (f) => f.sessionId === resolution.sessionId,
         )?.targetId
+      }
+    }
+
+    // Checked HERE rather than inside the click case, so it covers every verb
+    // that activates a target rather than the one that happens to be commonest.
+    // Coordinate targets are checked too: a vision-fallback click onto a
+    // visible "Choose File" button reaches the same chooser, and is the shape
+    // most likely to hit one, since a coordinate is used precisely when the
+    // agent could not resolve a ref to look at.
+    if (ACTIVATES_TARGET.has(a.action)) {
+      const onFileInput = objectId
+        ? await isFileInput(elementSession, objectId)
+        : await pointIsFileInput(tabId, pointFrom(a.coordinate))
+      if (onFileInput) {
+        return {
+          ok: false,
+          status: 'error',
+          error: fileInputRefusal(target),
+          data: { action: a.action, target, refused: 'file_input' },
+        }
       }
     }
   }
@@ -950,4 +1078,4 @@ async function viewportCentre(tabId: number): Promise<Point> {
   return { x: 400, y: 300 }
 }
 
-export const __test = { resolveTarget, performWait, buildVerification, NEEDS_TARGET }
+export const __test = { resolveTarget, performWait, buildVerification, NEEDS_TARGET, OPENS_FILE_CHOOSER }

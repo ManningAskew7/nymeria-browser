@@ -1,5 +1,12 @@
 import type { CommandResult } from '../../shared/types'
 import { sendCommand } from '../debuggerSession'
+import { withDeadline } from '../settle'
+
+/**
+ * The viewport metrics are a nice-to-have on a page that may be wedged, so
+ * they get a short leash rather than the renderer's full patience.
+ */
+const METRICS_DEADLINE_MS = 2_000
 
 interface ScreenshotArgs {
   tab_id: number
@@ -39,13 +46,23 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
   // The viewport box and device scale are what let the model turn a pixel it
   // can see into a `coordinate` it can act on. Without them the vision
   // fallback can look but not point.
-  const metrics = await sendCommand<{ result?: { value?: Metrics } }>(a.tab_id, 'Runtime.evaluate', {
-    expression:
-      '({width: window.innerWidth, height: window.innerHeight, scale: window.devicePixelRatio,' +
-      ' scrollX: Math.round(window.scrollX), scrollY: Math.round(window.scrollY)})',
-    returnByValue: true,
-  }).catch(() => ({ result: { value: undefined } }))
-  const m = metrics.result?.value
+  // Deadlined, not just caught. This is the one renderer-bound call in the
+  // command, so on a page suspended by a dialog or a long script it does not
+  // reject, it never returns, and it would hold the whole screenshot to its
+  // transport timeout. The image itself comes from the compositor and is
+  // already in hand by this point, so losing the metrics costs the vision
+  // fallback its coordinates and nothing else: far better than losing the
+  // picture of the very page the agent is trying to understand.
+  const metrics = await withDeadline(
+    sendCommand<{ result?: { value?: Metrics } }>(a.tab_id, 'Runtime.evaluate', {
+      expression:
+        '({width: window.innerWidth, height: window.innerHeight, scale: window.devicePixelRatio,' +
+        ' scrollX: Math.round(window.scrollX), scrollY: Math.round(window.scrollY)})',
+      returnByValue: true,
+    }).catch(() => ({ result: { value: undefined } })),
+    METRICS_DEADLINE_MS,
+  )
+  const m = metrics?.result?.value
 
   return {
     ok: true,

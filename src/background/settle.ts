@@ -73,10 +73,31 @@ function probeExpression(quietMs: number, maxMs: number): string {
   })`
 }
 
-/** Wait for the tab's own load to complete, bounded. Used after a navigation. */
-export async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<boolean> {
-  const existing = await chrome.tabs.get(tabId).catch(() => null)
-  if (existing?.status === 'complete') return true
+/**
+ * How long any command that triggers a page load waits for it.
+ *
+ * Shared so `navigate`, `tabs create` and `tabs reload` cannot drift, and
+ * because the BACKEND's transport budget for those commands must exceed this
+ * number across a repo boundary (`chrome_browser.py::_TIMEOUTS`). Raise it
+ * here and the backend starts returning bare transport timeouts instead of
+ * these commands' honest `complete: false`.
+ */
+export const TAB_LOAD_WAIT_MS = 25_000
+
+/**
+ * Watch for the NEXT completed load, without the already-complete early-out.
+ *
+ * `waitForTabComplete` short-circuits when the tab currently reads `complete`,
+ * which is right when you are waiting on a load already in flight and wrong
+ * when you are about to START one: at the instant `chrome.tabs.reload()`
+ * resolves, the OLD document still reads `complete`, so the early-out fires
+ * and the wait returns true having waited for nothing.
+ *
+ * The listener is attached synchronously here so the caller can arm it BEFORE
+ * triggering the load, which is what removes the race rather than narrowing
+ * it: no completion can land in the gap between trigger and listen.
+ */
+export function watchForTabComplete(tabId: number, timeoutMs: number): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let done = false
     const finish = (value: boolean) => {
@@ -92,6 +113,13 @@ export async function waitForTabComplete(tabId: number, timeoutMs: number): Prom
     chrome.tabs.onUpdated.addListener(listener)
     const timer = setTimeout(() => finish(false), timeoutMs)
   })
+}
+
+/** Wait for the tab's own load to complete, bounded. Used after a navigation. */
+export async function waitForTabComplete(tabId: number, timeoutMs: number): Promise<boolean> {
+  const existing = await chrome.tabs.get(tabId).catch(() => null)
+  if (existing?.status === 'complete') return true
+  return watchForTabComplete(tabId, timeoutMs)
 }
 
 /**
@@ -111,8 +139,21 @@ export async function waitForTabComplete(tabId: number, timeoutMs: number): Prom
  */
 const RESPONSIVE_DEADLINE_MS = 4_000
 
+/**
+ * The same probe, given longer, for a READ.
+ *
+ * `RESPONSIVE_DEADLINE_MS` is tuned for `act`, where refusing early is cheap
+ * because nothing has mutated. For a read the trade inverts: reads are
+ * idempotent and their transport budgets are 15-20s, so failing a page that is
+ * five seconds into synchronous hydration would turn a slow success into a
+ * hard failure that tells the agent to close the tab. Long enough to clear
+ * that, short enough to still save most of the budget on a genuinely wedged
+ * tab.
+ */
+export const READ_LIVENESS_DEADLINE_MS = 8_000
+
 /** Resolve `work`, or report a timeout, whichever comes first. */
-function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> {
+export function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> {
   return new Promise((resolve) => {
     const timer = setTimeout(() => resolve(null), ms)
     work.then(
@@ -126,6 +167,32 @@ function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> {
       },
     )
   })
+}
+
+/**
+ * What to tell an agent whose READ could not run because the page is suspended.
+ *
+ * Names no command, deliberately: the agent called `chrome_read_page`,
+ * `chrome_find`, `chrome_read_text` or `chrome_screenshot`, and the wire type
+ * behind them ("snapshot", "extract_text") is a name it has never seen. Two of
+ * those tools share one wire type, so there is nothing honest to interpolate.
+ *
+ * Deliberately shaped like `act`'s equivalent, and deliberately not identical:
+ * nothing was dispatched here, so there is no "your input landed" half and no
+ * double-submit risk, and the honest advice is different. Both name two causes
+ * and assert neither, because a suspended renderer looks the same whether a
+ * dialog is holding it or a script is still running.
+ */
+export function suspendedPageReadError(): string {
+  return (
+    'this read could not run: the tab did not run a script for several seconds, so ' +
+    'nothing could be read from it. Two things do that. A dialog the PAGE raised ' +
+    '(alert, confirm, prompt, or a "Leave site?" on navigation) suspends it until ' +
+    'answered, and chrome_dialog cannot clear it: navigate the tab away, or close it ' +
+    'and redo the work in a fresh one. A long-running script suspends it temporarily: ' +
+    'wait a few seconds and retry, and if the retry reports this again it is the ' +
+    'dialog. Nothing was changed on the page either way.'
+  )
 }
 
 /**
@@ -151,6 +218,7 @@ function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | null> {
  * session) is a different failure with its own honest message downstream, and
  * reporting it as a dialog would send the agent hunting for one.
  */
+
 export async function rendererResponsive(
   tabId: number,
   ms: number = RESPONSIVE_DEADLINE_MS,
