@@ -267,11 +267,21 @@ export async function settle(
     const resp = await sendCommand<{
       result?: { value?: unknown }
       exceptionDetails?: { text?: string }
-    }>(tabId, 'Runtime.evaluate', {
-      expression: probeExpression(quietMs, maxMs),
-      awaitPromise: true,
-      returnByValue: true,
-    })
+    }>(
+      tabId,
+      'Runtime.evaluate',
+      {
+        expression: probeExpression(quietMs, maxMs),
+        awaitPromise: true,
+        returnByValue: true,
+      },
+      // This evaluate legitimately runs for up to maxMs IN the page (the
+      // agent picks it, via wait's timeout_ms), so the transport deadline
+      // must sit above it or a healthy long wait gets cut off as a hang. The
+      // slack covers dispatch overhead; a truly suspended page still fails,
+      // just maxMs+2s late instead of at the default.
+      { deadlineMs: maxMs + 2_000 },
+    )
     if (resp.exceptionDetails) {
       return { settled: false, reason: 'unavailable', ms: elapsed() }
     }

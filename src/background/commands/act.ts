@@ -1,6 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { readSince as consoleSince } from '../consoleBuffer'
-import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
+import { CdpCallTimeout, frameSessions, sendCommand, TabUnusable, type Cdp } from '../debuggerSession'
 import { absenceIsConclusive, armDelivery, type DeliveryOutcome } from '../delivery'
 import {
   ackWithinDeadline,
@@ -389,6 +389,13 @@ async function resolveTarget(
       }
       return { ok: true, objectId, session, sessionId: resolution.sessionId }
     } catch (e) {
+      // A session-layer failure is about the TAB, not the ref: telling the
+      // agent to re-read the page would send it into the same wall with worse
+      // advice appended. Rethrow and let the dispatch layer surface the
+      // message these classes already carry (which names the actual remedy).
+      // The css=/xpath= branch below does not catch at all, so this keeps the
+      // two branches consistent for these errors.
+      if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
       return {
         ok: false,
         error: `ref ${target} no longer resolves (${String(e)}); re-read the page`,

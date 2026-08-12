@@ -316,10 +316,16 @@ describe('verification payload', () => {
 
   it('reports a URL change caused by the action', async () => {
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    installCdpMock()
+    const cdp = installCdpMock()
+    // Semantic, not positional: the URL flips once input has been dispatched,
+    // which is what "changed because of the action" means. A positional
+    // once-mock here breaks every time an unrelated `tabs.get` joins the flow
+    // (the attach pre-flight did exactly that).
     const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
-    get.mockImplementationOnce(async () => ({ id: TAB, url: TAB_URL }))
-      .mockImplementation(async () => ({ id: TAB, url: 'https://example.com/thanks' }))
+    get.mockImplementation(async () => ({
+      id: TAB,
+      url: inputEventTypes(cdp).length > 0 ? 'https://example.com/thanks' : TAB_URL,
+    }))
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 

@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { rendererResponsive } from './settle'
+import { rendererResponsive, settle } from './settle'
+import type { SettleResult } from './settle'
 import { isAttached, resetForTests as resetDebugger } from './debuggerSession'
 
 const TAB = 1
@@ -130,5 +131,34 @@ describe('rendererResponsive', () => {
     ) as unknown as [unknown, string, { expression: string }][]
     expect(evaluates).toHaveLength(1)
     expect(evaluates[0][2].expression.length).toBeLessThan(10)
+  })
+})
+
+/**
+ * The settle probe runs IN the page for up to maxMs, a budget the agent picks
+ * via wait's timeout_ms. The transport deadline under it must therefore sit
+ * above maxMs, or a healthy 20s wait is cut off at the 15s default and
+ * reported as a hang.
+ */
+describe('settle transport deadline', () => {
+  it('lets an agent-chosen wait outlive the default CDP deadline', async () => {
+    vi.useFakeTimers()
+    try {
+      resetDebugger()
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn((_target: unknown, method: string) =>
+        method === 'Runtime.evaluate' ? new Promise<never>(() => {}) : Promise.resolve({}),
+      )
+      let result: SettleResult | null = null
+      void settle(TAB, { maxMs: 20_000 }).then((r) => (result = r))
+
+      await vi.advanceTimersByTimeAsync(16_000)
+      expect(result, 'a 20s wait must survive the 15s default').toBeNull()
+
+      await vi.advanceTimersByTimeAsync(7_000) // past maxMs + slack
+      expect(result).not.toBeNull()
+      expect(result!.reason).toBe('unavailable')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })

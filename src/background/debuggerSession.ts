@@ -76,12 +76,136 @@ interface Session {
   refCount: number
   detachTimer: ReturnType<typeof setTimeout> | null
   attached: boolean
+  /** The one in-flight attach, shared by every concurrent cold acquire. */
+  attaching: Promise<void> | null
+  /** The in-flight detach a concurrent acquire must wait out, never join. */
+  detaching: Promise<void> | null
   domains: Set<string>
   /** Flattened out-of-process iframe sessions, keyed by sessionId. */
   frames: Map<string, FrameSession>
 }
 
 const sessions = new Map<number, Session>()
+
+/**
+ * Every CDP call gets a bounded lifetime.
+ *
+ * `chrome.debugger.sendCommand` has no timeout of its own, and a discarded or
+ * frozen tab simply never answers an enable (measured externally: 14 of 20
+ * tabs on one real profile), so an unbounded await here never settles. That is
+ * worse than slow: a pending extension API call holds the MV3 service worker
+ * alive to Chrome's 5-minute hard kill, which then drops the snapshot ref map
+ * and this file's attach bookkeeping, and the agent experiences the loss as
+ * unrelated intermittent failure a command later. Backlog #165 (C-02, L-01).
+ *
+ * The default is sized above the calls this extension makes in earnest
+ * (`Accessibility.getFullAXTree` on a heavy page and a full-page capture run
+ * seconds, not tens of seconds, though neither is pinned by measurement) and
+ * below the transport budgets of the commands that lean on the renderer:
+ * act 30s, snapshot and screenshot 20s, cdp 60s. It is NOT below every
+ * budget: tabs, console and network get 5s from the backend but barely touch
+ * CDP (an attach, a local buffer read), and `dialog`, whose 5s budget would
+ * always expire first, passes its own smaller deadline so its failure stays
+ * ours and named. Callers with a legitimately LONGER wait override upward:
+ * `settle()` runs an in-page probe whose budget the agent controls, and
+ * `cdp` forwards arbitrary methods.
+ */
+export const CDP_CALL_DEADLINE_MS = 15_000
+
+/** How long a detach gets before we stop waiting and drop the bookkeeping. */
+const DETACH_CALL_DEADLINE_MS = 5_000
+
+/**
+ * Both messages hedge on effect deliberately: a call that timed out or was
+ * detached mid-flight may already have mutated the page (the same ambiguity
+ * `InputDispatchStalled.landed` exists for), so neither may read as "nothing
+ * happened". And the remedies must match `assertUsableTab`'s: reload recovers
+ * a discarded or frozen tab; closing is for the rest.
+ */
+export class CdpCallTimeout extends Error {
+  constructor(method: string, ms: number) {
+    super(
+      `Chrome did not answer ${method} for this tab within ${Math.round(ms / 1000)}s: ` +
+        'it may be suspended by a page dialog, frozen or discarded mid-command, or ' +
+        'its renderer may be gone. Whether the call took effect is unknown, so do ' +
+        'not repeat an action that changes state without checking. Reload recovers ' +
+        'a discarded or frozen tab; otherwise close it and redo the work in a ' +
+        'fresh one.',
+    )
+    this.name = 'CdpCallTimeout'
+  }
+}
+
+/** A tab refused before attach because its renderer provably is not running. */
+export class TabUnusable extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'TabUnusable'
+  }
+}
+
+interface PendingCall {
+  reject: (e: Error) => void
+}
+
+/** In-flight CDP calls per tab, so an external detach can fail them NOW. */
+const pendingCalls = new Map<number, Set<PendingCall>>()
+
+/**
+ * The raw bounded call. No refcounting here: `doAttach`'s eager domain
+ * enables use this directly because they ride the attach that `acquire` is
+ * already paying for.
+ *
+ * The underlying promise keeps its handlers attached after the deadline
+ * fires, so a call that Chrome answers late (the user dismissing a dialog
+ * minutes on) settles silently instead of as an unhandled rejection.
+ */
+function boundedCdpCall<T>(
+  target: Cdp,
+  method: string,
+  params: Record<string, unknown>,
+  deadlineMs: number,
+): Promise<T> {
+  const tabId = tabOf(target)
+  return new Promise<T>((resolve, reject) => {
+    let done = false
+    const finish = (settle: () => void) => {
+      if (done) return
+      done = true
+      clearTimeout(timer)
+      const tabSet = pendingCalls.get(tabId)
+      if (tabSet) {
+        tabSet.delete(entry)
+        if (tabSet.size === 0) pendingCalls.delete(tabId)
+      }
+      settle()
+    }
+    const entry: PendingCall = { reject: (e) => finish(() => reject(e)) }
+    const timer = setTimeout(() => entry.reject(new CdpCallTimeout(method, deadlineMs)), deadlineMs)
+    let set = pendingCalls.get(tabId)
+    if (!set) {
+      set = new Set()
+      pendingCalls.set(tabId, set)
+    }
+    set.add(entry)
+    // The extension bindings THROW synchronously on a schema violation (a
+    // non-object params, say, via chrome_cdp's forwarded args). Without the
+    // catch that throw would reject the outer promise while leaving the timer
+    // armed for the full deadline, pinning the worker for exactly the reason
+    // this helper exists to remove.
+    let raw: Promise<unknown>
+    try {
+      raw = Promise.resolve(chrome.debugger.sendCommand(debuggee(target), method, params))
+    } catch (err) {
+      finish(() => reject(err instanceof Error ? err : new Error(String(err))))
+      return
+    }
+    raw.then(
+      (result) => finish(() => resolve(result as T)),
+      (err: unknown) => finish(() => reject(err instanceof Error ? err : new Error(String(err)))),
+    )
+  })
+}
 
 export type CdpEventHandler = (tabId: number, method: string, params: unknown) => void
 
@@ -120,19 +244,54 @@ export function installCdpEventRouter(): void {
 
 installCdpEventRouter()
 
+/** Chrome names why it detached us; hand the agent that name, not a guess. */
+function detachReasonProse(reason: string | undefined): string {
+  switch (reason) {
+    case 'target_closed':
+      return 'the tab or its page went away'
+    case 'canceled_by_user':
+      return 'the user cancelled the debug session via the banner'
+    case 'replaced_with_devtools':
+      return 'DevTools was opened on the tab'
+    case 'rendering_process_gone':
+      return 'the tab renderer process is gone (it crashed or was killed)'
+    default:
+      return 'DevTools was opened on it, the tab went away, or the user cancelled via the banner'
+  }
+}
+
 // Chrome detaches us unilaterally when DevTools opens on the tab, when the
 // tab navigates to a protected page, or when the target goes away. Without
 // this the session would stay marked attached and every later sendCommand
-// would fail with "Debugger is not attached".
-chrome.debugger.onDetach?.addListener?.((source) => {
-  const tabId = source.tabId
-  if (typeof tabId !== 'number') return
-  const s = sessions.get(tabId)
-  if (!s) return
-  if (s.detachTimer) clearTimeout(s.detachTimer)
-  logger.log(`debugger detached externally tab=${tabId}`)
-  sessions.delete(tabId)
-})
+// would fail with "Debugger is not attached". In-flight calls are failed NOW
+// rather than left to their deadline: whether Chrome rejects a pending
+// command on detach is undocumented, and a call that will never be answered
+// should say so the moment that becomes known. Exported like
+// `installCdpEventRouter` so tests can re-bind after swapping the chrome mock.
+export function installDetachHandler(): void {
+  chrome.debugger.onDetach?.addListener?.((source, reason) => {
+    const tabId = source.tabId
+    if (typeof tabId !== 'number') return
+    const pending = pendingCalls.get(tabId)
+    if (pending) {
+      pendingCalls.delete(tabId)
+      const err = new Error(
+        `Chrome detached the debugger from this tab mid-call: ${detachReasonProse(reason)}. ` +
+          'The command did not finish, and whether it took effect first is unknown, so ' +
+          'do not repeat an action that changes state without checking.',
+      )
+      err.name = 'CdpDetached'
+      for (const p of Array.from(pending)) p.reject(err)
+    }
+    const s = sessions.get(tabId)
+    if (!s) return
+    if (s.detachTimer) clearTimeout(s.detachTimer)
+    logger.log(`debugger detached externally tab=${tabId} reason=${reason ?? 'unknown'}`)
+    sessions.delete(tabId)
+  })
+}
+
+installDetachHandler()
 
 function getOrCreate(tabId: number): Session {
   let s = sessions.get(tabId)
@@ -141,6 +300,8 @@ function getOrCreate(tabId: number): Session {
       refCount: 0,
       detachTimer: null,
       attached: false,
+      attaching: null,
+      detaching: null,
       domains: new Set(),
       frames: new Map(),
     }
@@ -158,12 +319,12 @@ function getOrCreate(tabId: number): Session {
  */
 async function armAutoAttach(target: Cdp): Promise<void> {
   try {
-    await chrome.debugger.sendCommand(debuggee(target), 'Target.setAutoAttach', {
+    await boundedCdpCall(target, 'Target.setAutoAttach', {
       autoAttach: true,
       waitForDebuggerOnStart: false,
       flatten: true,
       filter: [{ type: 'iframe', exclude: false }],
-    })
+    }, CDP_CALL_DEADLINE_MS)
   } catch (e) {
     // Older Chrome, or a frame type that refuses: frame reach degrades to the
     // main document rather than the whole command failing.
@@ -213,15 +374,60 @@ export function frameSessions(tabId: number): FrameSession[] {
   return Array.from(sessions.get(tabId)?.frames.values() ?? [])
 }
 
-export async function acquire(tabId: number): Promise<void> {
-  const s = getOrCreate(tabId)
-  if (s.detachTimer) {
-    clearTimeout(s.detachTimer)
-    s.detachTimer = null
+/**
+ * Refuse to attach to a tab whose renderer provably is not running.
+ *
+ * A discarded tab (Chrome unloaded it to save memory) has no renderer at all,
+ * so it never answers the enables an attach fires, and every command against
+ * it used to spend its whole deadline learning nothing. `chrome.tabs.get`
+ * answers from the browser process in under a millisecond and names the state
+ * outright, an extension-only advantage no external CDP client has; and
+ * reload provably recovers it, costing nothing a discard had not already
+ * destroyed. Only a POSITIVE signal refuses: a tab the browser cannot find
+ * falls through so `chrome.debugger.attach` can produce its own honest error.
+ *
+ * A FROZEN tab is deliberately NOT refused. Chromium's freezing policy opts
+ * out tabs "currently being inspected by DevTools", which makes it plausible
+ * that attaching unfreezes the tab, and a refusal would then fail a path
+ * that was about to work; the false refusal is the expensive direction, and
+ * unlike a discard, reload on a frozen tab DESTROYS state (its page is still
+ * in memory and unfreezes losslessly on activation). If the optimism is
+ * wrong, `CdpCallTimeout` names frozen among its causes.
+ */
+async function assertUsableTab(tabId: number): Promise<void> {
+  const tab = await chrome.tabs.get(tabId).catch(() => null)
+  if (tab?.discarded) {
+    throw new TabUnusable(
+      `tab ${tabId} is discarded: Chrome unloaded it to save memory, so nothing can ` +
+        `run in it. Reload it with chrome_tabs(action="reload", tab_id=${tabId}) to ` +
+        'bring it back, then retry.',
+    )
   }
-  s.refCount += 1
-  if (!s.attached) {
-    await chrome.debugger.attach({ tabId }, DEBUGGER_VERSION)
+}
+
+/** The one cold attach for a session, whatever the number of waiters. */
+async function doAttach(tabId: number, s: Session): Promise<void> {
+  try {
+    await assertUsableTab(tabId)
+    // Bounded like everything else. Attach is a browser-process call that
+    // should not hang, but "should not hang" was sendCommand's story too, and
+    // `console`/`network` reach CDP only through this attach.
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(
+        () => reject(new CdpCallTimeout('debugger attach', CDP_CALL_DEADLINE_MS)),
+        CDP_CALL_DEADLINE_MS,
+      )
+      Promise.resolve(chrome.debugger.attach({ tabId }, DEBUGGER_VERSION)).then(
+        () => {
+          clearTimeout(timer)
+          resolve()
+        },
+        (e: unknown) => {
+          clearTimeout(timer)
+          reject(e instanceof Error ? e : new Error(String(e)))
+        },
+      )
+    })
     s.attached = true
     s.domains.clear()
     logger.log(`debugger attached tab=${tabId}`)
@@ -229,9 +435,13 @@ export async function acquire(tabId: number): Promise<void> {
     // carries request failures. Both feed the post-action verification
     // payload, so both are enabled eagerly: capture that starts when you
     // first ASK is capture that is always empty the first time you ask.
-    // Sent raw rather than through sendCommand to avoid re-entering refcount.
+    // Through boundedCdpCall, NOT sendCommand: these ride the attach that
+    // acquire is already paying for, and re-entering acquire from here would
+    // churn the refcount and the detach linger for no benefit. Bounded so a
+    // wedged tab's never-settling enables cannot hold the service worker
+    // toward its 5-minute kill.
     for (const domain of CAPTURE_DOMAINS) {
-      void Promise.resolve(chrome.debugger.sendCommand({ tabId }, `${domain}.enable`, {}))
+      void boundedCdpCall(tabId, `${domain}.enable`, {}, CDP_CALL_DEADLINE_MS)
         .then(() => {
           sessions.get(tabId)?.domains.add(domain)
         })
@@ -241,6 +451,44 @@ export async function acquire(tabId: number): Promise<void> {
     // asynchronously, so arming at attach time means they are usually known
     // by the time the first page read happens.
     void armAutoAttach(tabId)
+  } finally {
+    s.attaching = null
+  }
+}
+
+export async function acquire(tabId: number): Promise<void> {
+  // A detach in flight must FINISH before a new session starts. Joining the
+  // old entry mid-detach left a caller holding a ref to a session that was
+  // deleted underneath it the moment the detach resolved (verified by review
+  // probe): its release then no-opped against nothing and its command got
+  // "Debugger is not attached". Wait it out, drop the dead entry, start cold.
+  const stale = sessions.get(tabId)
+  if (stale?.detaching) {
+    await stale.detaching
+    if (sessions.get(tabId) === stale) sessions.delete(tabId)
+  }
+  const s = getOrCreate(tabId)
+  if (s.detachTimer) {
+    clearTimeout(s.detachTimer)
+    s.detachTimer = null
+  }
+  s.refCount += 1
+  if (!s.attached) {
+    // One shared in-flight attach: two concurrent cold acquires used to BOTH
+    // call chrome.debugger.attach, and the loser's "already attached" error
+    // failed a command that should have ridden the winner's session (verified
+    // by review probe; the tabs.get pre-flight had widened that window).
+    if (!s.attaching) s.attaching = doAttach(tabId, s)
+    try {
+      await s.attaching
+    } catch (e) {
+      // Roll back only OUR increment; every waiter does the same for its own.
+      // Callers that never got a session never release it, so keeping the
+      // count would strand the entry above zero and no detach would ever be
+      // scheduled once a later attach succeeded.
+      s.refCount = Math.max(0, s.refCount - 1)
+      throw e
+    }
   }
 }
 
@@ -264,26 +512,60 @@ async function detachNow(tabId: number): Promise<void> {
     s.detachTimer = null
     return
   }
-  try {
-    await chrome.debugger.detach({ tabId })
-    logger.log(`debugger detached tab=${tabId}`)
-  } catch (e) {
-    logger.warn(`debugger detach failed tab=${tabId}:`, e)
-  }
-  sessions.delete(tabId)
+  s.detachTimer = null
+  // Bounded like every other debugger call: a detach against a wedged tab
+  // that never answers must not strand the bookkeeping (or the worker).
+  // Whatever happens, the session entry is dropped: Chrome reconciles its own
+  // side on the next attach. Published on `detaching` so a concurrent
+  // `acquire` waits this out and starts a fresh session, instead of joining
+  // an entry that is about to be deleted underneath it.
+  s.detaching = new Promise<void>((resolve) => {
+    const timer = setTimeout(() => {
+      logger.warn(`debugger detach did not answer tab=${tabId}`)
+      resolve()
+    }, DETACH_CALL_DEADLINE_MS)
+    Promise.resolve(chrome.debugger.detach({ tabId })).then(
+      () => {
+        clearTimeout(timer)
+        logger.log(`debugger detached tab=${tabId}`)
+        resolve()
+      },
+      (e: unknown) => {
+        clearTimeout(timer)
+        logger.warn(`debugger detach failed tab=${tabId}:`, e)
+        resolve()
+      },
+    )
+  })
+  await s.detaching
+  // Guarded: an acquire that waited the detach out may already have dropped
+  // this entry and started a fresh one, which must not be deleted here.
+  if (sessions.get(tabId) === s) sessions.delete(tabId)
+}
+
+export interface SendCommandOpts {
+  /**
+   * Wall-clock bound for this one call, replacing `CDP_CALL_DEADLINE_MS`.
+   * For a call whose legitimate duration the caller knows better, in either
+   * direction: `settle()` and `cdp` override upward, `dialog` downward.
+   */
+  deadlineMs?: number
 }
 
 export async function sendCommand<T = unknown>(
   target: Cdp,
   method: string,
   params: Record<string, unknown> = {},
+  opts: SendCommandOpts = {},
 ): Promise<T> {
   const tabId = tabOf(target)
   await acquire(tabId)
   try {
-    const result = await chrome.debugger.sendCommand(debuggee(target), method, params)
-    return result as T
+    return await boundedCdpCall<T>(target, method, params, opts.deadlineMs ?? CDP_CALL_DEADLINE_MS)
   } finally {
+    // Runs at the deadline too, not only on an answer: an abandoned call must
+    // not pin the refcount, or a wedged tab keeps its debugger banner for the
+    // life of the worker instead of losing it a linger after the deadline.
     release(tabId)
   }
 }
@@ -312,6 +594,7 @@ export function resetForTests(): void {
     if (s.detachTimer) clearTimeout(s.detachTimer)
   }
   sessions.clear()
+  pendingCalls.clear()
   eventHandlers.clear()
   frameTrackingInstalled = false
   installFrameTracking()
