@@ -174,7 +174,7 @@ describe('suspended-page pre-flight', () => {
     return results[0] as { ok: boolean; error?: string }
   }
 
-  it.each(['snapshot', 'extract_text'])(
+  it.each(['snapshot', 'extract_text', 'screenshot'])(
     'fails %s fast and honestly instead of riding its transport budget',
     async (type) => {
       vi.useFakeTimers()
@@ -196,14 +196,15 @@ describe('suspended-page pre-flight', () => {
     },
   )
 
-  it.each(['navigate', 'tabs', 'console', 'network', 'screenshot'])(
+  it.each(['navigate', 'tabs', 'console', 'network'])(
     'does not pre-flight %s, which still works on a suspended tab',
     async (type) => {
       // Gating these would break the recovery: navigating away is how a
       // browser dialog is cleared, and the buffer readers are the diagnostics
-      // an agent reaches for once a tab goes quiet. `screenshot` is here
-      // because its image comes from the compositor, so a picture of a frozen
-      // page is exactly what an agent wants and a pre-flight would discard it.
+      // an agent reaches for once a tab goes quiet. `screenshot` used to be
+      // here on the compositor theory; measured live 2026-08-12, capture
+      // hangs on a dialog-suspended tab like every other renderer-bound
+      // call, so it is gated with the readers now.
       vi.useFakeTimers()
       try {
         suspendRenderer()

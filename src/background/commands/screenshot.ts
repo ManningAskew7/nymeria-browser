@@ -46,13 +46,14 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
   // The viewport box and device scale are what let the model turn a pixel it
   // can see into a `coordinate` it can act on. Without them the vision
   // fallback can look but not point.
-  // Deadlined, not just caught. This is the one renderer-bound call in the
-  // command, so on a page suspended by a dialog or a long script it does not
-  // reject, it never returns, and it would hold the whole screenshot to its
-  // transport timeout. The image itself comes from the compositor and is
-  // already in hand by this point, so losing the metrics costs the vision
-  // fallback its coordinates and nothing else: far better than losing the
-  // picture of the very page the agent is trying to understand.
+  // Deadlined, not just caught: on a suspended page this call does not
+  // reject, it never returns. The reader pre-flight in `commands/index.ts`
+  // normally refuses a suspended page before capture even runs (measured
+  // 2026-08-12: `Page.captureScreenshot` itself hangs on a dialog-suspended
+  // tab, compositor or not), so this deadline covers the race where the page
+  // suspends between that check and this call. Losing the metrics then costs
+  // the vision fallback its coordinates and nothing else: far better than
+  // losing the picture that is already in hand.
   const metrics = await withDeadline(
     sendCommand<{ result?: { value?: Metrics } }>(a.tab_id, 'Runtime.evaluate', {
       expression:

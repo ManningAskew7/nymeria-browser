@@ -52,20 +52,22 @@ const MAX_RESULT_BYTES = 8_000_000
  * page read; its sub-commands come back through here individually. `cdp` is
  * the raw escape hatch and must not be second-guessed.
  *
- * `screenshot` is a false on purpose, and it is the interesting one. Its
- * image comes from the compositor, not the renderer, so a picture of a page
- * frozen by a script is exactly what an agent most wants and a pre-flight
- * would throw it away. Only its viewport-metrics `Runtime.evaluate` is
- * renderer-bound, and that call carries its own deadline. (The probe would
- * not have helped with the OTHER screenshot hang either: on a backgrounded
- * tab `Page.captureScreenshot` waits for a compositor frame while evaluate
- * answers instantly. Backlog #165, C-03.)
+ * `screenshot` was a false at first, on the theory that its image comes from
+ * the compositor, not the renderer, so a picture of a frozen page is exactly
+ * what an agent most wants and a pre-flight would throw it away. Measured
+ * live 2026-08-12: the theory is wrong on real Chrome. Against an ACTIVE tab
+ * held by an alert(), `Page.captureScreenshot` itself never returned and the
+ * command rode its full 20s transport budget into a three-way-ambiguous
+ * timeout. The pre-flight converts that into the same fast, named failure
+ * the other readers give. (The probe still cannot see the OTHER screenshot
+ * hang: on a backgrounded tab capture waits for a compositor frame while
+ * evaluate answers instantly. Backlog #165, C-03.)
  */
 const READS_THE_PAGE: Record<CommandType, boolean> = {
   snapshot: true,
   extract_text: true,
   act: false,
-  screenshot: false,
+  screenshot: true,
   navigate: false,
   tabs: false,
   history: false,
