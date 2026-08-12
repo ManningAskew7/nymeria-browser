@@ -63,9 +63,43 @@ import { callOn } from './input'
 /** `unknown` means we could not prove either way, and is NOT a failure. */
 export type DeliveryOutcome = 'yes' | 'no' | 'unknown'
 
+export interface DeliveryReading {
+  outcome: DeliveryOutcome
+  /**
+   * A `click` reached an `input[type=file]` during the action, so the page
+   * asked for the OS file chooser.
+   *
+   * Watched here because this is already the one listener that sees every
+   * event in the document, and because NOTHING else can see it: the chooser
+   * is an OS window, so it blocks the user while the page, the renderer and
+   * every check in this extension carry on reading healthy (measured on
+   * another harness 2026-08-12, comparison doc experiment 2).
+   *
+   * Deliberately NOT filtered on `isTrusted`: the whole point is to catch a
+   * page's own `input.click()`, which is untrusted by definition.
+   *
+   * Weak evidence in BOTH directions, and the caller has to know it. A false
+   * misses a click inside an iframe (this listener is on the root frame
+   * only), one on an input never added to the document, one inside a CLOSED
+   * shadow root (`composedPath()` stops at the host for a listener outside
+   * it, so only OPEN roots are covered), a picker opened through
+   * `showPicker()`/`showOpenFilePicker()` (no click event at all), and any
+   * click the page defers past the read, which happens immediately after the
+   * dispatch ack. A true does not PROVE a chooser opened either: this runs at
+   * capture, ahead of any handler that might cancel the activation, and it is
+   * not correlated with the element acted on, so a concurrent act or the
+   * user's own upload click during the arm window trips it too.
+   *
+   * Nothing here prevents the wedge, it only reports the click most likely to
+   * have caused it. `act.ts` narrows it once more, to trusted input, because
+   * the synthetic path cannot open a chooser at all.
+   */
+  fileInputClicked: boolean
+}
+
 export interface DeliveryProbe {
   /** Read the count and disarm. Safe to call once; further calls report unknown. */
-  read(): Promise<DeliveryOutcome>
+  read(): Promise<DeliveryReading>
 }
 
 const WORLD_NAME = 'nymeria_delivery_probe'
@@ -145,8 +179,8 @@ async function worldFor(tabId: number): Promise<number | null> {
  * boolean so a failure to install surfaces as `false` rather than as an
  * exception we would have to guess the meaning of.
  */
-function armExpression(types: readonly string[], id: string): string {
-  return `(function(types, id){
+function armExpression(types: readonly string[], id: string, watchFileChooser: boolean): string {
+  return `(function(types, id, watchFile){
     try {
       var g = globalThis;
       var reg = g.__nymDelivery || (g.__nymDelivery = {});
@@ -158,6 +192,7 @@ function armExpression(types: readonly string[], id: string): string {
         }
       }
       var n = 0;
+      var f = false;
       var offs = [];
       for (var i = 0; i < types.length; i++) {
         (function(type){
@@ -166,16 +201,34 @@ function armExpression(types: readonly string[], id: string): string {
           offs.push(function(){ window.removeEventListener(type, h, true); });
         })(types[i]);
       }
+      if (watchFile) {
+        // Separate listener, and deliberately not isTrusted-filtered: the
+        // event we are hunting is the page's own input.click(). composedPath
+        // is used so an input inside a shadow root still registers, with the
+        // target as the fallback where composedPath is unavailable.
+        var fh = function(e){
+          try {
+            var path = (e && e.composedPath) ? e.composedPath() : [e && e.target];
+            for (var p = 0; p < path.length; p++) {
+              var el = path[p];
+              if (el && el.tagName === 'INPUT' && el.type === 'file') { f = true; return; }
+            }
+          } catch (err) {}
+        };
+        window.addEventListener('click', fh, true);
+        offs.push(function(){ window.removeEventListener('click', fh, true); });
+      }
       reg[id] = {
         t: now,
         count: function(){ return n; },
+        fileClicked: function(){ return f; },
         off: function(){ for (var j = 0; j < offs.length; j++) { try { offs[j](); } catch (e) {} } }
       };
       return true;
     } catch (e) {
       return false;
     }
-  })(${JSON.stringify(types)}, ${JSON.stringify(id)})`
+  })(${JSON.stringify(types)}, ${JSON.stringify(id)}, ${watchFileChooser ? 'true' : 'false'})`
 }
 
 function readExpression(id: string): string {
@@ -185,10 +238,10 @@ function readExpression(id: string): string {
     if (!reg) return null;
     var p = reg[id];
     if (!p) return null;
-    var n = p.count();
+    var out = { n: p.count(), f: p.fileClicked ? p.fileClicked() === true : false };
     try { p.off(); } catch (e) {}
     delete reg[id];
-    return n;
+    return out;
   })(${JSON.stringify(id)})`
 }
 
@@ -217,7 +270,9 @@ async function evaluateInWorld<T>(
 }
 
 /** A probe that never armed. Reports `unknown`, never `yes`. */
-const UNARMED: DeliveryProbe = { read: async () => 'unknown' }
+const UNARMED: DeliveryProbe = {
+  read: async () => ({ outcome: 'unknown', fileInputClicked: false }),
+}
 
 /**
  * Install the counter and return a handle that reads it.
@@ -229,41 +284,51 @@ const UNARMED: DeliveryProbe = { read: async () => 'unknown' }
 export async function armDelivery(
   tabId: number,
   types: readonly string[],
+  opts: { watchFileChooser?: boolean } = {},
 ): Promise<DeliveryProbe> {
+  const watchFileChooser = opts.watchFileChooser === true
   let contextId = await worldFor(tabId)
   if (contextId === null) return UNARMED
 
   nextProbeId += 1
   const id = `p${nextProbeId}`
-  let armed = await evaluateInWorld<boolean>(tabId, contextId, armExpression(types, id))
+  const arm = () => armExpression(types, id, watchFileChooser)
+  let armed = await evaluateInWorld<boolean>(tabId, contextId, arm())
   if (!armed.ok && armed.contextGone) {
     // The cached world died with its document. Rebuild once and retry.
     clearWorld(tabId)
     contextId = await createWorld(tabId)
     if (contextId === null) return UNARMED
-    armed = await evaluateInWorld<boolean>(tabId, contextId, armExpression(types, id))
+    armed = await evaluateInWorld<boolean>(tabId, contextId, arm())
   }
   if (!armed.ok || armed.value !== true) return UNARMED
 
   const world = contextId
   let spent = false
   return {
-    async read(): Promise<DeliveryOutcome> {
-      if (spent) return 'unknown'
+    async read(): Promise<DeliveryReading> {
+      if (spent) return { outcome: 'unknown', fileInputClicked: false }
       spent = true
-      const result = await evaluateInWorld<number | null>(tabId, world, readExpression(id))
+      const result = await evaluateInWorld<{ n: number; f: boolean } | null>(
+        tabId,
+        world,
+        readExpression(id),
+      )
       if (!result.ok) {
         // The context was destroyed between arming and reading, which means the
         // document went away: the action navigated the page. A navigation is
         // proof the input landed, so this is delivery, not ignorance.
         if (result.contextGone) {
           clearWorld(tabId)
-          return 'yes'
+          return { outcome: 'yes', fileInputClicked: false }
         }
-        return 'unknown'
+        return { outcome: 'unknown', fileInputClicked: false }
       }
-      if (typeof result.value !== 'number') return 'unknown'
-      return result.value > 0 ? 'yes' : 'no'
+      const value = result.value
+      if (!value || typeof value.n !== 'number') {
+        return { outcome: 'unknown', fileInputClicked: false }
+      }
+      return { outcome: value.n > 0 ? 'yes' : 'no', fileInputClicked: value.f === true }
     },
   }
 }

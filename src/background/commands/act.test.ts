@@ -50,6 +50,8 @@ interface MockOptions {
   targetConnected?: boolean
   /** 'timeout' models the session layer failing the connectedness probe. */
   connectedThrows?: 'timeout'
+  /** true models the page asking for the OS file chooser during the action. */
+  fileChooserOpened?: boolean
   /** What `elementFromPoint` finds under a bare coordinate. */
   pointDescription?: string
   /** true models a document containing iframes, where the probe sees one only. */
@@ -81,6 +83,7 @@ function installCdpMock(opts: MockOptions = {}) {
     isFileInput = false,
     targetConnected = true,
     connectedThrows,
+    fileChooserOpened = false,
     pointDescription = 'body',
     pageHasFrames = false,
     targetInTopDocument = true,
@@ -149,7 +152,7 @@ function installCdpMock(opts: MockOptions = {}) {
           return { result: { value: !pageHasFrames } }
         }
         if (deliveryReadThrows) throw new Error(deliveryReadThrows)
-        return { result: { value: deliveryCount } }
+        return { result: { value: { n: deliveryCount, f: fileChooserOpened } } }
       }
       // The coordinate-target probe, which has no objectId to ask: one call
       // answers both the file-input guard and what the point landed on.
@@ -1338,5 +1341,183 @@ describe('the coordinate description', () => {
       },
     })
     expect(describeEl(el)).toBe('unknown')
+  })
+})
+
+/**
+ * The one wedge nothing can detect after the fact and nothing can undo.
+ *
+ * A JS-driven upload button (`<button onclick="input.click()">`) is invisible
+ * to the static guard, and the OS chooser it opens blocks the USER's window
+ * while the page keeps reading perfectly healthy: measured on another agent's
+ * harness 2026-08-12, which opened three of them and could not close any.
+ *
+ * Detection is all that is on offer here, and the wording has to be honest
+ * about that. CDP can suppress the chooser, but only for a client that has
+ * also sent `Page.enable`, which makes us the owner of every JS dialog in the
+ * user's own tab: miss one `alert` and the renderer stalls. So the watcher
+ * reports what the click did and tells the agent to stop clicking, and no
+ * message claims the picker was stopped.
+ */
+describe('file-chooser detection', () => {
+  it('does not pretend to suppress the chooser', async () => {
+    // The suppress call is a silent no-op without Page.enable, so shipping it
+    // would buy nothing and license a message that lies about the outcome.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const methods = cdp.mock.calls.map((c) => c[1])
+    expect(methods).not.toContain('Page.setInterceptFileChooserDialog')
+    expect(methods, 'Page.enable would hand us ownership of the tab dialogs').not.toContain(
+      'Page.enable',
+    )
+  })
+
+  it('watches for the chooser on the verbs that activate their target', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'key', ref: '@e1', value: 'Enter' })
+
+    expect(result.ok, 'a key act that failed validation would arm and prove nothing').toBe(true)
+
+    // The watcher rides the delivery probe, whose arm expression takes it as
+    // its trailing argument. Enter on a focused control is one of the two
+    // shapes that actually opens a picker.
+    const arm = cdp.mock.calls.find(
+      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('__nymDelivery'),
+    )
+    expect(arm, 'no probe was armed at all').toBeDefined()
+    expect(String((arm![2] as { expression: string }).expression)).toMatch(/,\s*true\)$/)
+  })
+
+  it('does not watch on a verb that cannot reach a file input', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    // right_click probes delivery like a click but opens a context menu, so
+    // it pays for the counter and not for the extra listener.
+    await execAct({ tab_id: TAB, action: 'right_click', ref: '@e1' })
+
+    const arm = cdp.mock.calls.find(
+      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('__nymDelivery'),
+    )
+    expect(arm).toBeDefined()
+    expect(String((arm![2] as { expression: string }).expression)).toMatch(/,\s*false\)$/)
+  })
+
+  it('fails the click when the page opened a chooser, and says what to do', async () => {
+    // Reported as a failure, not a success with a note: something is now on
+    // the user's screen that only they can clear, and a flag beside a green
+    // status is the silent no-op this kit exists to remove.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ fileChooserOpened: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toMatch(/file chooser/i)
+    // The two instructions that keep it from getting worse.
+    expect(error, 'only the user can clear it').toMatch(/ask the user/i)
+    expect(error, 'each retry stacks another picker').toMatch(/do not repeat the click/i)
+    // And it must never claim the picker was stopped, which is what the
+    // suppression that silently no-ops would have had it say. Matched on the
+    // claim, not on the words: "blocking their browser window" is true and
+    // must stay sayable.
+    expect(error).not.toMatch(/suppress|was blocked|prevented|stopped/i)
+    // It must name the route that works, with the AGENT-facing signature.
+    expect(error).toMatch(/action="upload"/)
+    expect(error).toMatch(/path=/)
+    expect(error).not.toMatch(/file_base64|file_name/)
+    expect((result.data as { opened_file_chooser?: boolean }).opened_file_chooser).toBe(true)
+  })
+
+  it('reports the chooser rather than the undelivered input when both fire', async () => {
+    // The undelivered advice ends in "close the tab", which does not close an
+    // OS dialog: following it would destroy the tab and leave the picker up on
+    // the user's screen. The chooser is also the stronger signal of the two,
+    // being direct evidence that a click event ran in the page.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ fileChooserOpened: true, deliveryCount: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toMatch(/file chooser/i)
+    expect(error, 'the recovery advice for a dead tab must not win here').not.toMatch(
+      /close the tab/i,
+    )
+    const data = result.data as { input_delivered?: string; opened_file_chooser?: boolean }
+    expect(data.opened_file_chooser).toBe(true)
+    expect(data.input_delivered, 'both facts still ride along on the failure').toBe('no')
+  })
+
+  it('names the verb that actually reached the input, not always "click"', async () => {
+    // key is one of the two watched shapes. Telling the agent not to click
+    // again, after a key it never clicked with, is advice it cannot follow.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ fileChooserOpened: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'key', ref: '@e1', value: 'Enter' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/a key on @e1 reached a file input/)
+  })
+
+  it('names what a coordinate hit, since there is no ref to quote', async () => {
+    // The coordinate path is the likeliest to meet a JS upload button, a
+    // coordinate being what the agent falls back to when no ref resolved.
+    installCdpMock({ fileChooserOpened: true, pointDescription: 'button "Attach"' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [100, 200] })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/button "Attach" reached a file input/)
+  })
+
+  it('does not report a chooser on the synthetic path, which cannot open one', async () => {
+    // No layout box, so the click goes through Runtime.callFunctionOn without
+    // userGesture. Blink refuses to open a chooser without transient user
+    // activation, so the page's own input.click() still fires the event this
+    // watcher sees while no dialog can appear. Reporting one would send the
+    // agent to tell the user about a dialog that does not exist, and abort
+    // the rest of the batch behind it.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ geometry: null, fileChooserOpened: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as { input?: string; opened_file_chooser?: boolean }
+    expect(data.input, 'the premise of this test is the synthetic fallback').toBe('synthetic')
+    expect(data.opened_file_chooser).toBeUndefined()
+    expect(result.ok).toBe(true)
+  })
+
+  it('keeps the full verification payload on that failure', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ fileChooserOpened: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as { input_delivered?: string; settled?: unknown; url?: string }
+    expect(data.input_delivered, 'the click DID reach the page; both facts are true').toBe('yes')
+    expect(data.settled).toBeDefined()
+    expect(data.url).toBe(TAB_URL)
+  })
+
+  it('does not report a chooser for an ordinary click', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(
+      (result.data as { opened_file_chooser?: boolean }).opened_file_chooser,
+    ).toBeUndefined()
   })
 })

@@ -279,12 +279,9 @@ async function isFileInput(session: Cdp, objectId: string): Promise<boolean> {
  * input exactly as clicking it does.
  *
  * The route this CANNOT see is `<button onclick="input.click()">`: nothing
- * static distinguishes it from any other button. Closing that one needs
- * `Page.setInterceptFileChooserDialog` armed around the dispatch (it does not
- * require `Page.enable`, so the dialog-ownership trap does not apply), which
- * is filed rather than built: suppression is page-wide, so it must be armed
- * and disarmed around each act, and it converts the wedge into a silent no-op
- * that we then have to report honestly. Backlog #165.
+ * static distinguishes it from any other button. That one is DETECTED after
+ * the fact instead, by the file-input watcher on the delivery probe; it
+ * cannot be prevented from here (see `fileChooserOpenedError`). Backlog #166.
  */
 const OPENS_FILE_CHOOSER = `
   const isFile = (el) => !!el && el.tagName === 'INPUT' && el.type === 'file';
@@ -401,6 +398,37 @@ function fileInputRefusal(target: string | null): string {
     'themselves. Use chrome_act(action="upload", ref=..., path="...") instead, which ' +
     'puts the file straight into the input and works even when it is hidden behind a ' +
     'styled button.'
+  )
+}
+
+/**
+ * What to tell an agent whose click reached a file input we could not stop.
+ *
+ * We cannot PREVENT this. `Page.setInterceptFileChooserDialog` looks like the
+ * answer and is not: Blink applies the suppression through a probe that only
+ * visits agents registered by `InspectorPageAgent::enable()`, so with the Page
+ * domain disabled the call succeeds, changes nothing, and the OS dialog opens
+ * anyway. Enabling Page is not a free fix either: it makes every JS dialog in
+ * the user's own tab ours to answer, or the renderer stalls. (`chrome_dialog`
+ * does send `Page.enable`, but only reactively, against a tab already holding
+ * a dialog.) So detection is all that is available on this path. Backlog #166
+ * carries the decision.
+ *
+ * Hence the wording. It does not claim the dialog was blocked, it says the
+ * click landed so a retry would repeat it, and it sends the agent to the human
+ * because the human is the only one who can clear the dialog.
+ */
+function fileChooserOpenedError(action: ActionName, target: string | null): string {
+  return (
+    `a ${action} on ${target ?? 'that element'} reached a file input, which is what ` +
+    "opens the operating system's file chooser. If it opened, it is on the user's " +
+    'screen now, sitting over their browser window, and nothing here can close it: ' +
+    'that window is not part of the browser, and keys sent to the tab do not reach ' +
+    `it. ASK THE USER to dismiss it, and do not repeat the ${action}, because each ` +
+    'one stacks another chooser they have to clear by hand. The action itself DID ' +
+    'take effect, so do not retry it for that reason either. To attach a file, find ' +
+    'the file input behind this control (usually hidden, so pass a css= ref) and use ' +
+    'chrome_act(action="upload", ref=..., path="...").'
   )
 }
 
@@ -864,7 +892,15 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // geometry and hit-test reads run in-page, and neither produces any of the
   // event types above.
   const probeTypes = PROBE_EVENTS[a.action]
-  const probe = probeTypes ? await armDelivery(tabId, probeTypes) : null
+  // The chooser watcher rides the probe that is armed anyway, so it covers
+  // click, double_click and key: a button whose JavaScript opens the picker,
+  // and Enter on a focused control, which are the two shapes that actually
+  // occur. `check`/`uncheck` are ACTIVATES_TARGET but arm no probe, and they
+  // stay that way: a checkbox handler that opens a file chooser is not a real
+  // shape, and arming one would cost an arm and a read on every checkbox to
+  // watch for it.
+  const watchFileChooser = probeTypes !== undefined && ACTIVATES_TARGET.has(a.action)
+  const probe = probeTypes ? await armDelivery(tabId, probeTypes, { watchFileChooser }) : null
 
   try {
     switch (a.action) {
@@ -1207,20 +1243,36 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   }
 
   let delivered: DeliveryOutcome | null = null
-  if (probe && inputMode === 'trusted') {
-    delivered = await probe.read()
-    // The probe watches the top document only, and this tool deliberately acts
-    // inside iframes. A zero count there means "not seen here", not "not
-    // delivered", so it is downgraded unless the absence can be confirmed.
-    if (delivered === 'no') {
-      const conclusive = await absenceIsConclusive(
-        tabId,
-        objectId ? { session: elementSession, objectId } : null,
-      )
-      if (!conclusive) delivered = 'unknown'
+  let askedForFileChooser = false
+  if (probe) {
+    // Read on every armed path, so the probe is always disarmed; only ACTED
+    // on for trusted input. The synthetic fallback reaches the element through
+    // `Runtime.callFunctionOn` without `userGesture`, so there is no transient
+    // user activation, and Blink refuses to open a file chooser without one
+    // (it warns on the console and carries on). The click event still fires
+    // and would still trip this watcher, so treating it as a chooser would
+    // send the agent to tell the user about a dialog that cannot exist.
+    const reading = await probe.read()
+    if (inputMode === 'trusted') {
+      askedForFileChooser = reading.fileInputClicked
+      delivered = reading.outcome
+      // The probe watches the top document only, and this tool deliberately
+      // acts inside iframes. A zero count there means "not seen here", not
+      // "not delivered", so it is downgraded unless the absence can be
+      // confirmed.
+      if (delivered === 'no') {
+        const conclusive = await absenceIsConclusive(
+          tabId,
+          objectId ? { session: elementSession, objectId } : null,
+        )
+        if (!conclusive) delivered = 'unknown'
+      }
+      extra.input_delivered = delivered
     }
-    extra.input_delivered = delivered
   }
+  // NOT `refused`: nothing was refused and nothing was blocked. The action
+  // happened and so, in all likelihood, did the dialog.
+  if (askedForFileChooser) extra.opened_file_chooser = true
 
   const settleResult = await settle(tabId)
   const data = await buildVerification({
@@ -1241,6 +1293,21 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // bug one level down: the agent that skimmed past `settled: "quiet"` would
   // skim past a new field just as readily. The full verification payload rides
   // along on the failure, so nothing diagnostic is lost.
+  // Checked BEFORE `delivered`, which is the rarer and weaker signal when both
+  // fire: the chooser flag is direct evidence that a click event ran in the
+  // page. It also outranks it on remedy. The undelivered advice ends in "close
+  // the tab", which does not close an OS dialog, so following it would destroy
+  // the tab and leave the picker standing on the user's screen.
+  if (askedForFileChooser) {
+    // Same fallback as the static refusal 400 lines up: a coordinate act has
+    // no ref to quote, but `describePoint` already named what it found there.
+    return {
+      ok: false,
+      status: 'error',
+      error: fileChooserOpenedError(a.action, target ?? pointTarget?.description ?? null),
+      data,
+    }
+  }
   if (delivered === 'no') {
     return { ok: false, status: 'error', error: undeliveredError(a.action), data }
   }
