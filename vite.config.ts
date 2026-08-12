@@ -45,6 +45,11 @@ export default defineConfig({
         format: 'es',
       },
     },
+    // Chrome refuses a modulepreload link from an extension page as a
+    // "cross-world extension resource mismatch" and logs it on every popup
+    // open. The module still loads through its import, so the preload buys
+    // nothing here and only produces noise the user has to learn to ignore.
+    modulePreload: false,
     target: 'chrome91',
     minify: false,
   },

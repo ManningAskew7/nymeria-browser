@@ -30,6 +30,26 @@ function clearRetry(): void {
   }
 }
 
+/**
+ * Why the connection attempt failed, in the user's terms.
+ *
+ * This string is rendered verbatim in the popup's status card, so it is a
+ * diagnosis and has to be one we actually made. The previous wording called
+ * EVERY failure here "auth", including a bare `TypeError: Failed to fetch`,
+ * which is the shape a closed SSH tunnel, a stopped backend or a
+ * mid-restart container all take: the request never reached anything, so
+ * authentication was never attempted, let alone refused. Sending someone to
+ * re-mint a token because their tunnel dropped is the same mistake this
+ * codebase keeps finding in the browser tools, one layer out.
+ */
+export function describeConnectFailure(error: unknown): string {
+  if (error instanceof HttpError) {
+    if (error.status === 401 || error.status === 403) return `token rejected (${error.status})`
+    return `backend error (${error.status})`
+  }
+  return 'cannot reach the backend'
+}
+
 function scheduleRetry(reason: string): void {
   if (!running) return
   const delay = computeBackoff()
@@ -64,9 +84,8 @@ async function connectOnce(): Promise<void> {
   try {
     identity = await whoami({ baseUrl, token, clientId })
   } catch (error) {
-    const reason = error instanceof HttpError ? `auth (${error.status})` : 'auth (network)'
     logger.error('whoami failed:', error)
-    scheduleRetry(reason)
+    scheduleRetry(describeConnectFailure(error))
     return
   }
 
@@ -92,7 +111,9 @@ async function connectOnce(): Promise<void> {
       return
     }
     logger.error('stream fetch error:', error)
-    scheduleRetry('network')
+    // Same distinction as the whoami path: the stream never opened, so this is
+    // reachability, not credentials.
+    scheduleRetry(describeConnectFailure(error))
     return
   }
 
