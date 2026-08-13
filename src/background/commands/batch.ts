@@ -37,11 +37,15 @@ export const MAX_BATCH_ACTIONS = 20
 /**
  * What a batch may run, as an ALLOWLIST.
  *
- * A denylist here was a privilege-escalation hole: `chrome_cdp` is classified
- * SENSITIVE and deliberately left out of the browser-control kit, but a batch
- * step of `{type: "cdp"}` reached the same executor from the MODERATE
- * `chrome_batch`, skipping every safeguard the typed tools add. Batching is
- * for ordinary page work; diagnostics and escape hatches are single calls.
+ * A denylist here was a privilege-escalation hole: a batch step of
+ * `{type: "cdp"}` reached the escape-hatch executor from the MODERATE
+ * `chrome_batch`, skipping every safeguard the typed tools add. The
+ * browser-control kit now BINDS `chrome_cdp` (#167), so keeping it out of
+ * batches is a decision rather than a leftover: the escape hatch is
+ * last-resort and method-denylisted (cdp.ts), and each raw call stays a
+ * single, individually visible, individually justified round trip. Batching
+ * is for ordinary page work; diagnostics and escape hatches are single
+ * calls.
  */
 const ALLOWED_IN_BATCH = new Set([
   'act',

@@ -153,9 +153,10 @@ describe('execBatch', () => {
   it('refuses the privileged command types outright, not just nested batches', async () => {
     const run = vi.fn(async () => okResult())
 
-    // chrome_cdp is classified SENSITIVE and deliberately left out of the
-    // browser-control kit. If a batch step can name it, the kit's exclusion is
-    // decorative: the MODERATE chrome_batch becomes a route to raw CDP.
+    // chrome_cdp is classified SENSITIVE and taught as a last resort whose
+    // every use is stated and justified. If a batch step can name it, that
+    // framing is decorative: the MODERATE chrome_batch becomes a route to
+    // raw CDP, buried mid-sequence.
     for (const type of ['cdp', 'dialog', 'console', 'network']) {
       const result = await execBatch({ tab_id: TAB, actions: [{ type }] }, run)
       expect(result.ok, `${type} should be refused`).toBe(false)
