@@ -1509,6 +1509,59 @@ describe('owned dialogs during an act', () => {
     deadlineAt: Date.now() + 60_000,
   }
 
+  it('names the dialog when a synchronous confirm() stalls the dispatch ack itself', async () => {
+    // The live-QA branch (2026-08-14): a click handler that calls confirm()
+    // suspends the renderer before Chrome acks the press, so execution lands
+    // in the InputDispatchStalled catch, never reaching the post-dispatch
+    // dialog checks. The opening event has already arrived by then, and the
+    // agent must get the same delivered-plus-answer-route success as the
+    // async case, not the two-guesses stall copy.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ inputAckHangsFrom: 2 }) // the press lands, its ack never returns
+      vi.mocked(standingDialog)
+        .mockReturnValueOnce(null) // pre-dispatch: nothing standing yet
+        .mockReturnValue(CONFIRM) // by the stall deadline the confirm is recorded
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok, 'the input was delivered; failing it invites a double-submit').toBe(true)
+      const data = result.data as { input?: string; dialog?: { message?: string; note?: string } }
+      expect(data.input).toBe('trusted')
+      expect(data.dialog?.message).toBe('Delete this item?')
+      expect(data.dialog?.note).toMatch(/Do not repeat the click/)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('teaches answer-then-retry when the stall hit before the action went out', async () => {
+    // Stalling on the opening pointer move means no button was ever pressed:
+    // with a dialog standing the honest story is the blocked-act one (answer
+    // it, then retry), not "the click was sent".
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ inputAckHangsFrom: 1 })
+      vi.mocked(standingDialog).mockReturnValueOnce(null).mockReturnValue(CONFIRM)
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      const error = String(result.error)
+      expect(error).toMatch(/NOT sent/)
+      expect(error).toMatch(/Delete this item\?/)
+      expect(error).toMatch(/then retry/)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('refuses by name when a dialog is standing before the act', async () => {
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock()

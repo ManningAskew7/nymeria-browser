@@ -1288,6 +1288,41 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       // reached the page and its handler suspended the renderer BEFORE Chrome
       // could ack the dispatch, so execution never gets as far as that check.
       //
+      // The stall's cause may already be known BY NAME: a handler that calls
+      // `confirm()` synchronously suspends the renderer mid-dispatch, and the
+      // dialog's opening event has long arrived by the time the ack deadline
+      // fires. Measured live in the #169 QA run: this, not the post-dispatch
+      // checks, is the branch a confirm-in-click-handler actually takes, and
+      // without this check it returned the two-guesses copy with the answer
+      // standing right there.
+      const stallDialog = standingDialog(tabId)
+      if (stallDialog) {
+        if (e.landed) {
+          return pendingDialogResult(
+            a.action,
+            target,
+            tabId,
+            stallDialog,
+            'trusted',
+            startedAt,
+            extra,
+          )
+        }
+        // The action itself never went out (the stall hit the opening
+        // pointer move), so unlike the landed case a retry after answering
+        // is the right move, which is exactly what this copy teaches.
+        return {
+          ok: false,
+          status: 'error',
+          error: dialogBlockedActError(a.action, tabId, stallDialog),
+          data: {
+            action: a.action,
+            url: urlBefore,
+            dialog: standingDialogPayload(tabId, stallDialog),
+          },
+        }
+      }
+      //
       // `landed` decides WHICH failure this is, and the distinction is not
       // cosmetic. A click opens with a pointer move, so a stall on that first
       // ack means no button was ever pressed: telling the agent the click
