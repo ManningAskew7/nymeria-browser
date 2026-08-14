@@ -1538,10 +1538,12 @@ describe('owned dialogs during an act', () => {
     }
   })
 
-  it('teaches answer-then-retry when the stall hit before the action went out', async () => {
-    // Stalling on the opening pointer move means no button was ever pressed:
-    // with a dialog standing the honest story is the blocked-act one (answer
-    // it, then retry), not "the click was sent".
+  it('reports unknown delivery when the stall hit before the action was confirmed', async () => {
+    // Ack order is not a delivery oracle (measured live: a click whose
+    // confirm() opened mid-dispatch stalled the MOVE ack while the press had
+    // plainly been processed). So this branch must not claim NOT-sent (a
+    // double-submit invitation) nor delivered (skips a needed redo): it says
+    // delivery is unknown and teaches answer, re-read, then decide.
     vi.useFakeTimers()
     try {
       setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
@@ -1554,9 +1556,14 @@ describe('owned dialogs during an act', () => {
 
       expect(result.ok).toBe(false)
       const error = String(result.error)
-      expect(error).toMatch(/NOT sent/)
       expect(error).toMatch(/Delete this item\?/)
-      expect(error).toMatch(/then retry/)
+      expect(error).toMatch(/whether the click was processed first is unknown/)
+      expect(error).toMatch(/RE-READ/)
+      expect(error, 'must not claim the input never went out').not.toMatch(/NOT sent/)
+      expect(
+        (result.data as { dialog?: { answer_with?: string } }).dialog?.answer_with,
+        'the payload still carries the answer route',
+      ).toMatch(/chrome_dialog/)
     } finally {
       vi.useRealTimers()
     }

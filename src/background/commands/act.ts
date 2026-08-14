@@ -454,6 +454,25 @@ function dialogBlockedActError(action: ActionName, tabId: number, d: StandingDia
 }
 
 /**
+ * A dialog opened DURING the dispatch and the ack stalled before the event
+ * carrying the action was confirmed. Delivery is genuinely UNKNOWN here: ack
+ * order is not a delivery oracle (measured live in the #169 QA run, where a
+ * click whose confirm() opened mid-dispatch stalled the MOVE ack while the
+ * press had plainly been processed). Claiming NOT-sent invites a
+ * double-submit; claiming delivered invites skipping a needed redo. So this
+ * copy says the truth: answer, re-read, then decide.
+ */
+function dialogInterruptedActError(action: ActionName, tabId: number, d: StandingDialog): string {
+  return (
+    `the ${action} was dispatched exactly as a ${d.type} dialog opened: ` +
+    `"${d.message}". The page paused before Chrome confirmed the input, so ` +
+    `whether the ${action} was processed first is unknown. ` +
+    `${dialogAnswerSentence(tabId, d)}. Then RE-READ the page to see whether ` +
+    `the ${action} took effect, and only repeat it if it did not.`
+  )
+}
+
+/**
  * The act itself raised a dialog we now own, and the dialog is standing.
  *
  * A SUCCESS, deliberately: the input was delivered and did what inputs do,
@@ -1308,13 +1327,13 @@ export async function execAct(args: unknown): Promise<CommandResult> {
             extra,
           )
         }
-        // The action itself never went out (the stall hit the opening
-        // pointer move), so unlike the landed case a retry after answering
-        // is the right move, which is exactly what this copy teaches.
+        // The stall hit before the action-carrying event was confirmed, so
+        // delivery is unknown, and the copy says so instead of guessing in
+        // either direction (see dialogInterruptedActError).
         return {
           ok: false,
           status: 'error',
-          error: dialogBlockedActError(a.action, tabId, stallDialog),
+          error: dialogInterruptedActError(a.action, tabId, stallDialog),
           data: {
             action: a.action,
             url: urlBefore,
