@@ -24,6 +24,7 @@ import {
   typeText,
   type Point,
 } from '../input'
+import { commitSeq, commitSince, navigationPending, waitForNavSignal } from '../navWatch'
 import { failuresSince as networkFailuresSince } from '../networkBuffer'
 import { resolve as resolveRef, type StaleReason } from '../snapshotRefs'
 import { rendererResponsive, settle, type SettleResult } from '../settle'
@@ -96,6 +97,19 @@ interface ActArgs {
 const DEFAULT_WAIT_MS = 5_000
 const WAIT_POLL_MS = 100
 const MAX_CONSOLE_IN_RESULT = 5
+/**
+ * How long verification waits for a STARTED navigation to commit before
+ * reporting it as pending instead. Paid only when a navigation the action
+ * itself started is in flight at verification time, which is exactly the
+ * case where the old payload was garbage (settle resolves 'quiet' on the
+ * outgoing document at ~250ms, long before a real commit, so `url_changed`
+ * read false on effectively every navigating click). The common
+ * non-navigating act never enters this wait, and `action: "wait"` never
+ * pays it either: its `timeout_ms` already spends the transport budget's
+ * slack, and it has its own deadline and its own url condition (the +3s
+ * here would blow the cross-repo budget contract in settle.ts).
+ */
+const NAV_COMMIT_WAIT_MS = 3_000
 
 /** Actions that operate on an element and therefore need a resolvable target. */
 const NEEDS_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
@@ -760,6 +774,8 @@ interface VerificationInput {
   tabId: number
   startedAt: number
   urlBefore: string | null
+  /** `commitSeq(tabId)` sampled beside `urlBefore`, before the action. */
+  navSeqBefore: number
   objectId: string | null
   elementSession: Cdp
   inputMode: 'trusted' | 'synthetic' | 'none'
@@ -769,6 +785,20 @@ interface VerificationInput {
 }
 
 async function buildVerification(v: VerificationInput): Promise<Record<string, unknown>> {
+  // The browser-process navigation record is what makes `url_changed`
+  // truthful: settle resolves on the OUTGOING document, so without this a
+  // navigating click reads its own old URL back and reports false. A commit
+  // that already landed needs no wait; a navigation STARTED SINCE THE ACT
+  // BEGAN (the time filter is the attribution: an unrelated load already in
+  // flight is not this action's doing) gets a bounded one; everything else
+  // pays nothing. Any non-commit signal (abort, same-document move, tab
+  // close) ends the wait early rather than riding it out.
+  let commit = commitSince(v.tabId, v.navSeqBefore)
+  if (!commit && v.action !== 'wait' && navigationPending(v.tabId, v.startedAt)) {
+    const signal = await waitForNavSignal(v.tabId, v.navSeqBefore, v.startedAt, NAV_COMMIT_WAIT_MS)
+    if (signal?.kind === 'commit') commit = { url: signal.url, seq: signal.seq }
+  }
+  const pending = commit ? null : navigationPending(v.tabId, v.startedAt)
   const urlAfter = await currentUrl(v.tabId)
   const [targetExists, focused] = await Promise.all([
     stillConnected(v.elementSession, v.objectId),
@@ -785,7 +815,16 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
     action: v.action,
     ...(v.target ? { target: v.target } : {}),
     url: urlAfter,
+    // Post-commit, so a navigating click reports true. The plain comparison
+    // also keeps SPA pushState URL changes truthful (they change the tab URL
+    // with no cross-document commit).
     url_changed: Boolean(v.urlBefore && urlAfter && v.urlBefore !== urlAfter),
+    // A cross-document commit `url_changed` cannot see (same-URL
+    // re-navigation) still reads `navigated: true`.
+    ...(commit ? { navigated: true } : {}),
+    // Started, not yet committed at the bound: the honest in-between. Never
+    // asserted as arrived; re-read shortly.
+    ...(pending ? { navigation_pending: pending.url } : {}),
     ...(targetExists === null ? {} : { target_exists: targetExists }),
     ...(v.previousValue === undefined ? {} : { previous_value: v.previousValue }),
     ...(focused ? { focused } : {}),
@@ -909,6 +948,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   }
 
   const urlBefore = await currentUrl(tabId)
+  const navSeqBefore = commitSeq(tabId)
   const modifiers = modifierMask(a.modifiers)
   const target = a.ref ?? null
 
@@ -944,6 +984,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       tabId,
       startedAt,
       urlBefore,
+      navSeqBefore,
       objectId: null,
       elementSession: tabId,
       inputMode: 'none',
@@ -1566,6 +1607,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     tabId,
     startedAt,
     urlBefore,
+    navSeqBefore,
     objectId,
     elementSession,
     inputMode,
@@ -1573,6 +1615,16 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     previousValue,
     extra,
   })
+  // The commit wait inside buildVerification is the one wait left in this
+  // function that runs after the last dialog checkpoint, and a deferred
+  // beforeunload can open during it. Same rule as every checkpoint above:
+  // a dialog standing now is the story, named with its answer route.
+  {
+    const postVerify = standingDialog(tabId)
+    if (postVerify) {
+      return pendingDialogResult(a.action, target, tabId, postVerify, inputMode, startedAt, extra)
+    }
+  }
   // An action that provably did nothing is a FAILED command, not a successful
   // one carrying a flag. A flag beside a green status reproduces the original
   // bug one level down: the agent that skimmed past `settled: "quiet"` would

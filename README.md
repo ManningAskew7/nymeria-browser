@@ -35,6 +35,9 @@ src/
 │   ├── settle.ts       post-action DOM quiescence probe
 │   ├── snapshotRefs.ts frame-scoped @eN ref table with staleness reasons
 │   ├── consoleBuffer.ts / networkBuffer.ts   CDP capture, filled from attach
+│   ├── navWatch.ts     per-tab navigation lifecycle from webNavigation events
+│   ├── dialogs.ts      Page-domain dialog ownership + answering policy (#169)
+│   ├── delivery.ts     isolated-world input-delivery probe
 │   └── commands/       one executor per wire command type
 ├── popup/
 │   ├── Popup.tsx       connection form + live status card

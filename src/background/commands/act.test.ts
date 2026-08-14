@@ -10,6 +10,7 @@ import {
   standingDialog,
   type StandingDialog as StandingDialogT,
 } from '../dialogs'
+import { installNavWatch, resetForTests as resetNavWatch } from '../navWatch'
 import { resetForTests as resetRefs, set as setRefs } from '../snapshotRefs'
 
 // The dialogs seam is mocked so each test INJECTS a recorded dialog state
@@ -231,6 +232,7 @@ beforeEach(() => {
   resetDebugger()
   resetConsole()
   resetDelivery()
+  resetNavWatch()
   vi.mocked(standingDialog).mockReturnValue(null)
   vi.mocked(chooserInterceptedSince).mockReturnValue(null)
   vi.mocked(resolvedDialogSince).mockReturnValue(null)
@@ -457,24 +459,241 @@ describe('verification payload', () => {
     expect(errors.map((e) => e.text)).toEqual(['POST /cart 500'])
   })
 
-  it('reports a URL change caused by the action', async () => {
+  // The navigation cases mock the TIMELINE honestly: `chrome.tabs.get` keeps
+  // returning the OLD url until a webNavigation commit fires, which is what
+  // real Chrome does. The previous shape here flipped the url the instant
+  // input dispatched, a timeline the browser never produces, and so asserted
+  // `url_changed: true` on code that read false on every real navigating
+  // click (backlog #160; the bug was structurally invisible to its own test).
+  function wireNav() {
+    installNavWatch()
+    const last = (fn: unknown) =>
+      (fn as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as (details: {
+        tabId: number
+        url: string
+        frameId: number
+      }) => void
+    return {
+      beforeNavigate: last(chrome.webNavigation!.onBeforeNavigate.addListener),
+      committed: last(chrome.webNavigation!.onCommitted.addListener),
+    }
+  }
+
+  /** tabs.get answers the OLD url until `flip()` is called. */
+  function urlFlipsOnCommit(newUrl: string): () => void {
+    let committed = false
+    const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
+    get.mockImplementation(async () => ({ id: TAB, url: committed ? newUrl : TAB_URL }))
+    return () => {
+      committed = true
+    }
+  }
+
+  it('reports a navigation whose commit lands after settle resolved on the old document', async () => {
+    // Fake timers freeze Date.now(), so the pre-call beforeNavigate carries
+    // the same timestamp the act samples at entry and the attribution filter
+    // (started at or after the act began) accepts it.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock()
+      const nav = wireNav()
+      const flip = urlFlipsOnCommit('https://example.com/thanks')
+
+      // The navigation is in flight when verification runs; the commit
+      // arrives a beat later, well inside the bounded wait.
+      nav.beforeNavigate({ tabId: TAB, url: 'https://example.com/thanks', frameId: 0 })
+      setTimeout(() => {
+        flip()
+        nav.committed({ tabId: TAB, url: 'https://example.com/thanks', frameId: 0 })
+      }, 30)
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(100)
+      const result = await pending
+
+      const data = result.data as { url_changed: boolean; url: string; navigated?: boolean }
+      expect(data.url_changed).toBe(true)
+      expect(data.url).toBe('https://example.com/thanks')
+      expect(data.navigated).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('reports a still-uncommitted navigation as pending, asserting nothing', async () => {
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock()
+      const nav = wireNav()
+
+      nav.beforeNavigate({ tabId: TAB, url: 'https://slow.example/checkout', frameId: 0 })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      // The commit wait is 3s; nothing ever commits.
+      await vi.advanceTimersByTimeAsync(3_100)
+      const result = await pending
+
+      expect(result.ok).toBe(true)
+      const data = result.data as {
+        url_changed: boolean
+        url: string
+        navigation_pending?: string
+        navigated?: boolean
+      }
+      expect(data.url_changed).toBe(false)
+      expect(data.url).toBe(TAB_URL)
+      expect(data.navigation_pending).toBe('https://slow.example/checkout')
+      expect(data.navigated).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a navigation already in flight before the act is not attributed to it', async () => {
+    // Real timers: the beforeNavigate lands milliseconds before the act
+    // starts, on an earlier Date.now(), which is exactly the unrelated-load
+    // case (meta refresh, someone else's slow navigation) the attribution
+    // filter exists for. No commit wait is paid and nothing is reported.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    const nav = wireNav()
+
+    nav.beforeNavigate({ tabId: TAB, url: 'https://unrelated.example/', frameId: 0 })
+    await new Promise((r) => setTimeout(r, 5))
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as Record<string, unknown>
+    expect('navigation_pending' in data).toBe(false)
+  })
+
+  it('a non-navigating act carries neither navigation field, at zero added latency', async () => {
+    // Fake timers with NO advance: if the commit wait were entered on a
+    // non-navigating act, its 3s timer would never fire and this test would
+    // hang red instead of passing slow.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock()
+      wireNav()
+
+      const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+      const data = result.data as Record<string, unknown>
+      expect(data.url_changed).toBe(false)
+      expect('navigated' in data).toBe(false)
+      expect('navigation_pending' in data).toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('action wait never pays the commit wait, even with a navigation pending', async () => {
+    // wait's timeout_ms already spends the transport budget's slack, so the
+    // +3s would blow the cross-repo contract (settle.ts). Fake timers with
+    // no advance: entering the commit wait would hang this test red.
+    vi.useFakeTimers()
+    try {
+      installCdpMock()
+      const nav = wireNav()
+      nav.beforeNavigate({ tabId: TAB, url: 'https://slow.example/next', frameId: 0 })
+      const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
+      get.mockImplementation(async () => ({ id: TAB, url: 'https://example.com/checkout/done' }))
+
+      const result = await execAct({
+        tab_id: TAB,
+        action: 'wait',
+        wait_for: { url_contains: '/checkout/done' },
+        timeout_ms: 5_000,
+      })
+
+      expect(result.ok).toBe(true)
+      const data = result.data as { navigation_pending?: string }
+      expect(data.navigation_pending, 'the commit CHECK still reports honestly').toBe(
+        'https://slow.example/next',
+      )
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a same-url re-navigation reads navigated without url_changed', async () => {
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock()
+      const nav = wireNav()
+
+      nav.beforeNavigate({ tabId: TAB, url: TAB_URL, frameId: 0 })
+      setTimeout(() => nav.committed({ tabId: TAB, url: TAB_URL, frameId: 0 }), 30)
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(100)
+      const result = await pending
+
+      const data = result.data as { url_changed: boolean; navigated?: boolean }
+      expect(data.url_changed).toBe(false)
+      expect(data.navigated).toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('names a dialog that opens during the verification stage itself', async () => {
+    // The commit wait and the verification reads run after the post-settle
+    // dialog checkpoint; a deferred beforeunload can open exactly there. The
+    // post-verification checkpoint must name it (the #169 invariant), not
+    // return a clean success that never mentions chrome_dialog.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    wireNav()
+    const dialog: StandingDialogT = {
+      type: 'beforeunload',
+      message: '',
+      url: TAB_URL,
+      openedAt: Date.now(),
+      deadlineAt: Date.now() + 60_000,
+    }
+    // Order-based, not call-count-based: the dialog "opens" when the focus
+    // probe (inside buildVerification) hits the wire, after every earlier
+    // checkpoint has already passed.
+    let dialogNow: StandingDialogT | null = null
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const params = args[2] as { expression?: string } | undefined
+      if (params?.expression?.includes('document.activeElement')) dialogNow = dialog
+      return original(...args)
+    })
+    vi.mocked(standingDialog).mockImplementation(() => dialogNow)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as { dialog?: { type?: string; note?: string } }
+    expect(data.dialog?.type).toBe('beforeunload')
+    expect(data.dialog?.note).toMatch(/do not repeat the click/i)
+  })
+
+  it('an SPA pushState url change reports url_changed with no commit', async () => {
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock()
-    // Semantic, not positional: the URL flips once input has been dispatched,
-    // which is what "changed because of the action" means. A positional
-    // once-mock here breaks every time an unrelated `tabs.get` joins the flow
-    // (the attach pre-flight did exactly that).
+    wireNav()
+    // pushState updates the committed tab url synchronously with no
+    // cross-document navigation, so flipping on input IS the honest timeline
+    // for this one case (it was the dishonest one for real navigations).
     const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
     get.mockImplementation(async () => ({
       id: TAB,
-      url: inputEventTypes(cdp).length > 0 ? 'https://example.com/thanks' : TAB_URL,
+      url: inputEventTypes(cdp).length > 0 ? 'https://example.com/app/inbox' : TAB_URL,
     }))
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    const data = result.data as { url_changed: boolean; url: string }
+    const data = result.data as { url_changed: boolean; navigated?: boolean }
     expect(data.url_changed).toBe(true)
-    expect(data.url).toBe('https://example.com/thanks')
+    expect(data.navigated).toBeUndefined()
   })
 
   it('waits for the page to settle and reports the outcome', async () => {

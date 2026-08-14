@@ -288,6 +288,70 @@ describe('suspended-page pre-flight', () => {
   })
 })
 
+describe('page_loading stamp on reads', () => {
+  const healthyRenderer = () => {
+    ;(chrome.debugger.sendCommand as unknown) = vi.fn(async () => ({ result: { value: 1 } }))
+  }
+
+  const runStamped = async (type: string, executor: () => Promise<unknown>, tabStatus: string) => {
+    const results: unknown[] = []
+    setDispatchHooks({ onResult: (_e: unknown, r: unknown) => results.push(r) })
+    ;(globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
+      new Response(JSON.stringify({ received: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })) as unknown as typeof fetch
+    healthyRenderer()
+    ;(chrome.tabs.get as unknown) = vi.fn(async () => ({ id: 1, url: 'https://x.test/', status: tabStatus }))
+
+    const original = EXECUTORS[type as keyof typeof EXECUTORS]
+    ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>)[type] = vi.fn(executor)
+    try {
+      await dispatchBrowserCommand({
+        type: 'browser_command',
+        command_id: `bcmd_stamp_${type}`,
+        command_type: type,
+        args: { tab_id: 1 },
+        timeout_seconds: 30,
+      } as BrowserCommandEvent)
+    } finally {
+      ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>)[type] = original
+    }
+    return results[0] as { ok: boolean; data?: Record<string, unknown> }
+  }
+
+  const success = async () => ({ ok: true, status: 'success', data: { tree: 'ok' } })
+
+  it('stamps a read captured while the tab was still loading', async () => {
+    // A mid-load read returns whatever had committed; without the stamp a
+    // sparse tree is indistinguishable from a sparse page (#160, the
+    // create-then-read residue: any load our own commands did not initiate).
+    const result = await runStamped('snapshot', success, 'loading')
+    expect(result.ok).toBe(true)
+    expect(result.data?.page_loading).toBe(true)
+    expect(result.data?.tree, 'the stamp joins the payload, never replaces it').toBe('ok')
+  })
+
+  it('does not stamp a read against a settled tab', async () => {
+    const result = await runStamped('snapshot', success, 'complete')
+    expect(result.ok).toBe(true)
+    expect(result.data && 'page_loading' in result.data).toBe(false)
+  })
+
+  it('does not stamp a non-reader command, whatever the tab is doing', async () => {
+    const result = await runStamped('act', success, 'loading')
+    expect(result.ok).toBe(true)
+    expect(result.data && 'page_loading' in result.data).toBe(false)
+  })
+
+  it('leaves a failed read untouched', async () => {
+    const failure = async () => ({ ok: false, status: 'error', error: 'boom', data: { partial: true } })
+    const result = await runStamped('extract_text', failure, 'loading')
+    expect(result.ok).toBe(false)
+    expect(result.data && 'page_loading' in result.data).toBe(false)
+  })
+})
+
 describe('owned-dialog pre-flight naming (#169)', () => {
   it('names the standing dialog and its answer route instead of the two-cause guess', async () => {
     vi.useFakeTimers()

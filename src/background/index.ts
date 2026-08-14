@@ -8,6 +8,7 @@ import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { clearWorld as clearDeliveryWorld } from './delivery'
 import { clear as clearRefs } from './snapshotRefs'
 import { installCdpConsoleCapture } from './consoleBuffer'
+import { clearTabNav, installNavWatch } from './navWatch'
 import { clear as clearNetwork, installCdpNetworkCapture } from './networkBuffer'
 import {
   getSnapshot,
@@ -38,6 +39,11 @@ installCdpNetworkCapture()
 // answers what that ownership obliges us to answer. Installed here at the
 // worker top level like the console and network captures.
 installDialogOwnership()
+// Navigation lifecycle (start/commit/abort per tab), the browser-process
+// truth that makes `url_changed` and navigate's outcome honest. Observation
+// only; the ref-clearing onCommitted listener below is invalidation and
+// stays separate.
+installNavWatch()
 
 // A committed navigation invalidates the tab's refs, and destroys the isolated
 // world the delivery probe caches (it dies with its document, so a cached
@@ -54,6 +60,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   clearNetwork(tabId)
   clearDeliveryWorld(tabId)
   clearTabDialogState(tabId)
+  // Wakes any navigation wait with `removed` before dropping state, so a
+  // navigate on a tab the user just closed fails fast instead of riding
+  // its deadline.
+  clearTabNav(tabId)
 })
 
 async function bootstrap(): Promise<void> {

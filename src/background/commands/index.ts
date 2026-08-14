@@ -87,6 +87,7 @@ async function runSingle(type: string, args: unknown): Promise<CommandResult> {
     return { ok: false, status: 'error', error: `unknown command_type: ${String(type)}` }
   }
   const tabId = (args as { tab_id?: unknown } | null)?.tab_id
+  let loadingAtRead = false
   if (READS_THE_PAGE[type as CommandType] && typeof tabId === 'number') {
     // A dialog we own is named outright (#169): faster than the liveness
     // probe, and the message carries the actual remedy (chrome_dialog)
@@ -98,8 +99,19 @@ async function runSingle(type: string, args: unknown): Promise<CommandResult> {
     if (!(await rendererResponsive(tabId, READ_LIVENESS_DEADLINE_MS))) {
       return { ok: false, status: 'error', error: suspendedPageReadError() }
     }
+    // Sampled BEFORE the read: "captured while the tab was still loading" is
+    // the honest stamp, and a read against a mid-load document returns
+    // whatever had committed with nothing else to explain a sparse result.
+    // Annotate-only by decision (2026-08-14): no wait, no new hang class;
+    // the agent decides whether to re-read.
+    const t = await chrome.tabs.get(tabId).catch(() => null)
+    loadingAtRead = t?.status === 'loading'
   }
-  return executor(args)
+  const result = await executor(args)
+  if (loadingAtRead && result.ok && result.data && typeof result.data === 'object' && !Array.isArray(result.data)) {
+    return { ...result, data: { ...(result.data as Record<string, unknown>), page_loading: true } }
+  }
+  return result
 }
 
 export const EXECUTORS: Record<CommandType, Executor> = {
