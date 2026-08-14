@@ -26,13 +26,18 @@ const DETACH_LINGER_MS = 10_000
 /**
  * Domains enabled on every attach so their event streams are never late.
  *
- * `Page` is deliberately NOT here. Enabling it takes ownership of JS dialogs:
- * the client must then answer every `javascriptDialogOpening` with
- * `handleJavaScriptDialog` or the renderer stalls. This extension drives the
- * user's own logged-in browser, so an unanswered dialog wedges a real tab.
- * Backlog #162 carries the design for doing it safely.
+ * `Page` is here DELIBERATELY (#169). Enabling it takes ownership of JS
+ * dialogs: every `javascriptDialogOpening` must be answered with
+ * `handleJavaScriptDialog` or the renderer stalls. That ownership is the
+ * point, not the hazard: `dialogs.ts` listens and answers by policy (alert
+ * acked immediately, confirm/prompt/beforeunload held for the agent with a
+ * timed safe default), so a dialog can never wedge the tab on our watch,
+ * and the file-chooser interception armed below rides the same enable.
+ * Ownership spans exactly the attach and ends with it; a dialog raised
+ * outside an attach is not ours and cannot be (a reactive enable does not
+ * own a dialog already standing; measured).
  */
-const CAPTURE_DOMAINS = ['Runtime', 'Network'] as const
+const CAPTURE_DOMAINS = ['Runtime', 'Network', 'Page'] as const
 
 /**
  * A CDP addressee: a tab (the root page session) or one flattened frame
@@ -80,6 +85,14 @@ interface Session {
   attaching: Promise<void> | null
   /** The in-flight detach a concurrent acquire must wait out, never join. */
   detaching: Promise<void> | null
+  /**
+   * True while a `detachNow` is driving this session (gate included). The
+   * linger can expire AGAIN mid-gate (a gate-time command bumps and releases
+   * the refcount), and a second detachNow would double-detach and double-fire
+   * session end; the first invocation re-checks the world after its gate and
+   * owns the outcome alone.
+   */
+  detachPending: boolean
   domains: Set<string>
   /** Flattened out-of-process iframe sessions, keyed by sessionId. */
   frames: Map<string, FrameSession>
@@ -126,11 +139,12 @@ export class CdpCallTimeout extends Error {
   constructor(method: string, ms: number) {
     super(
       `Chrome did not answer ${method} for this tab within ${Math.round(ms / 1000)}s: ` +
-        'it may be suspended by a page dialog, frozen or discarded mid-command, or ' +
-        'its renderer may be gone. Whether the call took effect is unknown, so do ' +
-        'not repeat an action that changes state without checking. Reload recovers ' +
-        'a discarded or frozen tab; otherwise close it and redo the work in a ' +
-        'fresh one.',
+        'it may be suspended by a page dialog raised before this session was ' +
+        'driving the tab (an owned dialog would have been named to you when it ' +
+        'opened), frozen or discarded mid-command, or its renderer may be gone. ' +
+        'Whether the call took effect is unknown, so do not repeat an action ' +
+        'that changes state without checking. Reload recovers a discarded or ' +
+        'frozen tab; otherwise close it and redo the work in a fresh one.',
     )
     this.name = 'CdpCallTimeout'
   }
@@ -212,6 +226,44 @@ export type CdpEventHandler = (tabId: number, method: string, params: unknown) =
 const eventHandlers = new Set<CdpEventHandler>()
 
 /**
+ * A single gate a voluntary detach must clear first (#169: an owned dialog
+ * must be resolved before the attach that owns it ends). One registrant, the
+ * dialog-ownership module; a registry of many would imply an ordering nobody
+ * has designed. The gate must itself be bounded: `detachNow` awaits it
+ * unconditionally.
+ */
+type DetachGate = (tabId: number) => Promise<void>
+let detachGate: DetachGate | null = null
+
+export function registerDetachGate(gate: DetachGate): void {
+  detachGate = gate
+}
+
+/**
+ * Callbacks run whenever an attach ENDS, on every path: voluntary detach,
+ * external detach, and a detach Chrome never answered. Ownership state keyed
+ * to the attach (standing dialogs) must be reconciled here, not in the
+ * command layer, which never learns about external detaches.
+ */
+type SessionEndHandler = (tabId: number) => void
+const sessionEndHandlers = new Set<SessionEndHandler>()
+
+export function onSessionEnd(handler: SessionEndHandler): () => void {
+  sessionEndHandlers.add(handler)
+  return () => sessionEndHandlers.delete(handler)
+}
+
+function fireSessionEnd(tabId: number): void {
+  for (const handler of sessionEndHandlers) {
+    try {
+      handler(tabId)
+    } catch (e) {
+      logger.warn(`session-end handler failed tab=${tabId}:`, e)
+    }
+  }
+}
+
+/**
  * Subscribe to CDP events for every attached tab. Returns an unsubscribe fn.
  * Handlers must not throw; a throwing handler is logged and skipped so one
  * bad subscriber cannot starve the others.
@@ -283,6 +335,12 @@ export function installDetachHandler(): void {
       err.name = 'CdpDetached'
       for (const p of Array.from(pending)) p.reject(err)
     }
+    // Chrome has already detached: nothing can be sent on this path, so the
+    // gate is not consulted; ownership state is reconciled instead. Fired
+    // whether or not a session entry survives to this point, because the
+    // ownership state lives elsewhere and must not depend on this map's
+    // bookkeeping races.
+    fireSessionEnd(tabId)
     const s = sessions.get(tabId)
     if (!s) return
     if (s.detachTimer) clearTimeout(s.detachTimer)
@@ -302,6 +360,7 @@ function getOrCreate(tabId: number): Session {
       attached: false,
       attaching: null,
       detaching: null,
+      detachPending: false,
       domains: new Set(),
       frames: new Map(),
     }
@@ -446,6 +505,27 @@ async function doAttach(tabId: number, s: Session): Promise<void> {
           sessions.get(tabId)?.domains.add(domain)
         })
         .catch((e: unknown) => logger.warn(`${domain}.enable failed tab=${tabId}:`, e))
+      // Chooser interception is a silent no-op unless the SAME client has
+      // Page enabled, so it must FOLLOW Page.enable; dispatched back-to-back
+      // rather than on the response, because CDP processes one session's
+      // commands in order, and chaining on the response left the first action
+      // of a cold attach a round trip where a chooser could still open
+      // (review, #169). While armed (the whole attach; it dies with the
+      // session), no OS file chooser can open in this tab:
+      // `Page.fileChooserOpened` fires instead and `dialogs.ts` records it
+      // for act to report. Page-wide while armed, so the user's own "Choose
+      // File" during a burst + linger is swallowed too; accepted, and
+      // documented in SKILL.md.
+      if (domain === 'Page') {
+        void boundedCdpCall(
+          tabId,
+          'Page.setInterceptFileChooserDialog',
+          { enabled: true },
+          CDP_CALL_DEADLINE_MS,
+        ).catch((e: unknown) =>
+          logger.warn(`setInterceptFileChooserDialog failed tab=${tabId}:`, e),
+        )
+      }
     }
     // Start discovering cross-origin frames immediately: they attach
     // asynchronously, so arming at attach time means they are usually known
@@ -507,12 +587,42 @@ export function release(tabId: number): void {
 async function detachNow(tabId: number): Promise<void> {
   const s = sessions.get(tabId)
   if (!s) return
+  // Single-flight per session: see `detachPending`. The first invocation
+  // clears any timer a mid-gate release re-armed, so nothing is lost by
+  // yielding here.
+  if (s.detachPending) return
   if (s.refCount > 0) {
     // Someone re-acquired during the linger window.
     s.detachTimer = null
     return
   }
+  s.detachPending = true
   s.detachTimer = null
+  // The gate first (#169): an owned dialog must be resolved before the
+  // attach that owns it ends, so a standing confirm effectively EXTENDS the
+  // linger to its own resolution (answer, user, or the grace default). The
+  // gate's own answer call rides acquire/release, which can bump the
+  // refcount and re-arm a fresh linger timer mid-gate, so both are
+  // re-checked after: a live caller wins and this detach stands down (its
+  // release schedules the next one), and a re-armed timer is cleared so a
+  // second detachNow does not chase this one.
+  if (detachGate) {
+    try {
+      await detachGate(tabId)
+    } catch (e) {
+      logger.warn(`detach gate failed tab=${tabId}:`, e)
+    }
+    if (sessions.get(tabId) !== s) return
+    if (s.refCount > 0) {
+      s.detachTimer = null
+      s.detachPending = false
+      return
+    }
+    if (s.detachTimer) {
+      clearTimeout(s.detachTimer)
+      s.detachTimer = null
+    }
+  }
   // Bounded like every other debugger call: a detach against a wedged tab
   // that never answers must not strand the bookkeeping (or the worker).
   // Whatever happens, the session entry is dropped: Chrome reconciles its own
@@ -538,9 +648,14 @@ async function detachNow(tabId: number): Promise<void> {
     )
   })
   await s.detaching
-  // Guarded: an acquire that waited the detach out may already have dropped
-  // this entry and started a fresh one, which must not be deleted here.
-  if (sessions.get(tabId) === s) sessions.delete(tabId)
+  // Guarded, session end included: an external detach may already have ended
+  // this session (firing session end itself) and a fresh one may be LIVE by
+  // the time a slow detach call answers. A stale session-end here would wipe
+  // the live session's dialog-ownership state (review probe, #169).
+  if (sessions.get(tabId) === s) {
+    sessions.delete(tabId)
+    fireSessionEnd(tabId)
+  }
 }
 
 export interface SendCommandOpts {
@@ -596,6 +711,10 @@ export function resetForTests(): void {
   sessions.clear()
   pendingCalls.clear()
   eventHandlers.clear()
+  // A test-registered gate must not leak into the next test: a never-resolving
+  // one parks every later voluntary detach and masks real behavior. The
+  // dialogs module re-registers its own via `resetDialogsForTests`.
+  detachGate = null
   frameTrackingInstalled = false
   installFrameTracking()
 }

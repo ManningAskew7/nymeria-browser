@@ -4,6 +4,7 @@ import { HttpError, ping, whoami } from './api'
 import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs } from './debuggerSession'
+import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { clearWorld as clearDeliveryWorld } from './delivery'
 import { clear as clearRefs } from './snapshotRefs'
 import { installCdpConsoleCapture } from './consoleBuffer'
@@ -33,6 +34,10 @@ setDispatchHooks({
 // or the post-action verification has nothing to report.
 installCdpConsoleCapture()
 installCdpNetworkCapture()
+// Dialog ownership (#169): Page is enabled on every attach, and this module
+// answers what that ownership obliges us to answer. Installed here at the
+// worker top level like the console and network captures.
+installDialogOwnership()
 
 // A committed navigation invalidates the tab's refs, and destroys the isolated
 // world the delivery probe caches (it dies with its document, so a cached
@@ -48,6 +53,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   clearRefs(tabId)
   clearNetwork(tabId)
   clearDeliveryWorld(tabId)
+  clearTabDialogState(tabId)
 })
 
 async function bootstrap(): Promise<void> {

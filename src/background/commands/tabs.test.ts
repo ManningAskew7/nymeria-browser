@@ -1,6 +1,13 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { expectBeforeunloadAccept } from '../dialogs'
 import { execTabs } from './tabs'
 import { TAB_LOAD_WAIT_MS } from '../settle'
+
+// Only the close-intent seam is stubbed; everything else stays real.
+vi.mock('../dialogs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../dialogs')>()
+  return { ...actual, expectBeforeunloadAccept: vi.fn() }
+})
 
 const TAB = 42
 
@@ -225,5 +232,24 @@ describe('tabs cheap actions', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('tabs close and beforeunload (#169)', () => {
+  it('registers accept-intent before removing, so close always clears the tab', async () => {
+    // Close is the recovery path: a "Leave site?" the close itself raises is
+    // auto-accepted rather than held, and the intent must be registered
+    // BEFORE the remove goes out or the dialog can open unregistered.
+    vi.mocked(expectBeforeunloadAccept).mockClear()
+    installTabsMock({ loadAfterMs: null })
+
+    const result = await execTabs({ action: 'close', tab_id: TAB })
+
+    expect(result.ok).toBe(true)
+    expect(vi.mocked(expectBeforeunloadAccept)).toHaveBeenCalledWith(TAB)
+    const intentOrder = vi.mocked(expectBeforeunloadAccept).mock.invocationCallOrder[0]
+    const removeOrder = (chrome.tabs.remove as unknown as ReturnType<typeof vi.fn>).mock
+      .invocationCallOrder[0]
+    expect(intentOrder).toBeLessThan(removeOrder)
   })
 })

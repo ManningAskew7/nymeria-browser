@@ -25,6 +25,16 @@ import {
 import { failuresSince as networkFailuresSince } from '../networkBuffer'
 import { resolve as resolveRef, type StaleReason } from '../snapshotRefs'
 import { rendererResponsive, settle, type SettleResult } from '../settle'
+import {
+  chooserInterceptedSince,
+  describeResolution,
+  dialogAnswerSentence,
+  raceStandingDialog,
+  resolvedDialogSince,
+  standingDialog,
+  standingDialogPayload,
+  type StandingDialog,
+} from '../dialogs'
 
 /**
  * The one action executor.
@@ -258,9 +268,12 @@ function dispatchedThenStalledError(action: ActionName): string {
  * is the only element on a page whose activation is unrecoverable from here,
  * which is why it earns a check the rest do not.
  *
- * Checked on the ELEMENT rather than by intercepting the chooser, because
- * `Page.setInterceptFileChooserDialog` is page-wide and sticky: leaving it
- * armed means the user clicks their own "Choose File" and nothing happens.
+ * The chooser is ALSO intercepted page-wide while attached (#169:
+ * `Page.setInterceptFileChooserDialog`, armed per attach in
+ * `debuggerSession.ts`), so this element check is no longer the only wall.
+ * It stays because refusing BEFORE dispatch is strictly better where it can
+ * see the input: the refusal teaches the upload route without spending the
+ * action, where interception can only report after the click already ran.
  */
 async function isFileInput(session: Cdp, objectId: string): Promise<boolean> {
   return (
@@ -279,9 +292,9 @@ async function isFileInput(session: Cdp, objectId: string): Promise<boolean> {
  * input exactly as clicking it does.
  *
  * The route this CANNOT see is `<button onclick="input.click()">`: nothing
- * static distinguishes it from any other button. That one is DETECTED after
- * the fact instead, by the file-input watcher on the delivery probe; it
- * cannot be prevented from here (see `fileChooserOpenedError`). Backlog #166.
+ * static distinguishes it from any other button. That one is caught by the
+ * page-wide chooser interception instead (#169), which PREVENTS the picker
+ * and reports it after the fact (see `fileChooserInterceptedError`).
  */
 const OPENS_FILE_CHOOSER = `
   const isFile = (el) => !!el && el.tagName === 'INPUT' && el.type === 'file';
@@ -402,34 +415,80 @@ function fileInputRefusal(target: string | null): string {
 }
 
 /**
- * What to tell an agent whose click reached a file input we could not stop.
+ * What to tell an agent whose action tried to open the OS file chooser and
+ * was stopped by the page-wide interception (#169).
  *
- * We cannot PREVENT this. `Page.setInterceptFileChooserDialog` looks like the
- * answer and is not: Blink applies the suppression through a probe that only
- * visits agents registered by `InspectorPageAgent::enable()`, so with the Page
- * domain disabled the call succeeds, changes nothing, and the OS dialog opens
- * anyway. Enabling Page is not a free fix either: it makes every JS dialog in
- * the user's own tab ours to answer, or the renderer stalls. (`chrome_dialog`
- * does send `Page.enable`, but only reactively, against a tab already holding
- * a dialog.) So detection is all that is available on this path. Backlog #166
- * carries the decision.
- *
- * Hence the wording. It does not claim the dialog was blocked, it says the
- * click landed so a retry would repeat it, and it sends the agent to the human
- * because the human is the only one who can clear the dialog.
+ * `Page.setInterceptFileChooserDialog` is armed for the whole attach (it
+ * needs the same `Page.enable` the dialog ownership rides, which is what
+ * kept it a silent no-op before this pass), so while the agent is driving,
+ * NO picker can open in this tab: Chrome emits `Page.fileChooserOpened`
+ * instead, whatever the route (a JS-driven upload button, an iframe, a
+ * closed shadow root, `showPicker()`, a click the page deferred). The
+ * wording can therefore say the picker did NOT open, which the old
+ * detection-only message had to hedge on; what it must still say is that
+ * the action itself ran, so repeating it is the wrong move.
  */
-function fileChooserOpenedError(action: ActionName, target: string | null): string {
+function fileChooserInterceptedError(action: ActionName, target: string | null): string {
   return (
-    `a ${action} on ${target ?? 'that element'} reached a file input, which is what ` +
-    "opens the operating system's file chooser. If it opened, it is on the user's " +
-    'screen now, sitting over their browser window, and nothing here can close it: ' +
-    'that window is not part of the browser, and keys sent to the tab do not reach ' +
-    `it. ASK THE USER to dismiss it, and do not repeat the ${action}, because each ` +
-    'one stacks another chooser they have to clear by hand. The action itself DID ' +
-    'take effect, so do not retry it for that reason either. To attach a file, find ' +
-    'the file input behind this control (usually hidden, so pass a css= ref) and use ' +
-    'chrome_act(action="upload", ref=..., path="...").'
+    `the ${action} on ${target ?? 'that element'} tried to open the operating ` +
+    "system's file chooser. It was intercepted: no picker opened and the user's " +
+    'browser is fine, but the page is now waiting for a file selection that will ' +
+    `never arrive. Do not repeat the ${action}; it already ran and each repeat ` +
+    'just re-triggers the chooser. To attach a file, find the file input behind ' +
+    'this control (usually hidden, so pass a css= ref) and use ' +
+    'chrome_act(action="upload", ref=..., path="..."), which puts the file ' +
+    'straight into the input.'
   )
+}
+
+/**
+ * The act was blocked BEFORE dispatch by a dialog we own (#169). Unlike
+ * `stalledError`, the cause is known by name, and so is the remedy.
+ */
+function dialogBlockedActError(action: ActionName, tabId: number, d: StandingDialog): string {
+  return (
+    `the ${action} was NOT sent: the tab is showing a ${d.type} dialog: ` +
+    `"${d.message}". The page is paused until it is answered. ` +
+    `${dialogAnswerSentence(tabId, d)}, then retry.`
+  )
+}
+
+/**
+ * The act itself raised a dialog we now own, and the dialog is standing.
+ *
+ * A SUCCESS, deliberately: the input was delivered and did what inputs do,
+ * and the next move (answer the dialog) is named in the payload. Failing the
+ * act here would tell the agent its click did not work, inviting the retry
+ * that double-submits; the #162 precedent is that the payload distinguishes
+ * delivery from outcome.
+ */
+function pendingDialogResult(
+  action: ActionName,
+  target: string | null,
+  tabId: number,
+  d: StandingDialog,
+  inputMode: 'trusted' | 'synthetic' | 'none',
+  startedAt: number,
+  extra: Record<string, unknown>,
+): CommandResult {
+  return {
+    ok: true,
+    status: 'success',
+    data: {
+      action,
+      ...(target ? { target } : {}),
+      input: inputMode,
+      dialog: {
+        ...standingDialogPayload(tabId, d),
+        note:
+          `your ${action} raised this ${d.type} dialog and the page is paused ` +
+          `on it. ${dialogAnswerSentence(tabId, d)}. Do not repeat the ` +
+          `${action}; it was delivered.`,
+      },
+      ...extra,
+      ...localDiagnostics(tabId, startedAt),
+    },
+  }
 }
 
 /**
@@ -456,13 +515,19 @@ function detachedRefError(target: string | null, action: ActionName): string {
 }
 
 function stalledError(action: ActionName): string {
+  // Reached only when NO owned dialog is recorded for the tab: an owned one
+  // returns `dialogBlockedActError` with the dialog named instead. So if a
+  // dialog is the cause here, it predates the attach and chrome_dialog
+  // genuinely cannot answer it (ownership cannot be taken retroactively).
   return (
     `the ${action} was NOT sent: this tab did not run a script for several seconds, ` +
-    'so it could not have received input. Two things do that. A dialog the PAGE ' +
-    'raised (alert, confirm, prompt, or a "Leave site?" on navigation) suspends it ' +
-    'until answered, and chrome_dialog cannot clear it: close the tab and redo the ' +
-    'work in a fresh one. A long-running script suspends it temporarily: wait a few ' +
-    'seconds and retry, and if the retry reports this again it is the dialog.'
+    'so it could not have received input. Two things do that. A dialog raised ' +
+    'BEFORE this session touched the tab (alert, confirm, prompt, or a "Leave ' +
+    'site?") suspends it until answered, and chrome_dialog cannot answer that ' +
+    'one (dialogs are only answerable when raised while the extension is ' +
+    'attached): close the tab and redo the work in a fresh one. A long-running ' +
+    'script suspends it temporarily: wait a few seconds and retry, and if the ' +
+    'retry reports this again it is the dialog.'
   )
 }
 
@@ -741,10 +806,23 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // A dialog the page raised suspends the renderer, and every step below queues
   // behind it: target resolution (`DOM.resolveNode`, or a bare `Runtime.evaluate`
   // for a `css=`/`xpath=` selector), the delivery arm, and settle, whose own
-  // deadline is IN-PAGE and therefore never ticks. Each would wait out its share
-  // of the transport timeout to learn the same thing, so the check is worthless
-  // anywhere but here. It covers every action, not just the ones with probeable
-  // events.
+  // deadline is IN-PAGE and therefore never ticks. A dialog WE own (#169) is
+  // named outright with its answer route; the liveness probe stays behind it
+  // for the causes ownership cannot see (a pre-attach dialog, a long-running
+  // script). It covers every action, not just the ones with probeable events.
+  const preDialog = standingDialog(tabId)
+  if (preDialog) {
+    return {
+      ok: false,
+      status: 'error',
+      error: dialogBlockedActError(a.action, tabId, preDialog),
+      data: {
+        action: a.action,
+        dialog: standingDialogPayload(tabId, preDialog),
+        ...localDiagnostics(tabId, startedAt),
+      },
+    }
+  }
   if (!(await rendererResponsive(tabId))) {
     return {
       ok: false,
@@ -760,11 +838,30 @@ export async function execAct(args: unknown): Promise<CommandResult> {
 
   // `wait` never mutates the page, so it skips target resolution and settle.
   if (a.action === 'wait') {
-    const { found, condition } = await performWait(
+    // Raced against a dialog opening mid-wait (#169): the poll loop's
+    // evaluates would otherwise queue behind the suspended renderer and burn
+    // the whole timeout learning nothing, when the cause is known by name
+    // the moment it opens.
+    const raced = await raceStandingDialog(
       tabId,
-      a.wait_for,
-      a.timeout_ms ?? DEFAULT_WAIT_MS,
+      performWait(tabId, a.wait_for, a.timeout_ms ?? DEFAULT_WAIT_MS),
     )
+    if (raced.kind === 'dialog') {
+      const d = raced.dialog
+      return {
+        ok: false,
+        status: 'error',
+        error:
+          `the wait was interrupted: a ${d.type} dialog opened: "${d.message}". ` +
+          `The page is paused on it. ${dialogAnswerSentence(tabId, d)}.`,
+        data: {
+          action: 'wait',
+          dialog: standingDialogPayload(tabId, d),
+          ...localDiagnostics(tabId, startedAt),
+        },
+      }
+    }
+    const { found, condition } = raced.value
     const data = await buildVerification({
       action: 'wait',
       target: null,
@@ -890,17 +987,11 @@ export async function execAct(args: unknown): Promise<CommandResult> {
 
   // Armed AFTER target resolution so the probe cannot count our own setup: the
   // geometry and hit-test reads run in-page, and neither produces any of the
-  // event types above.
+  // event types above. (The chooser watcher that used to ride this probe is
+  // gone: `Page.fileChooserOpened` + interception cover every route it could
+  // see and the ones it could not; see `fileChooserInterceptedError`.)
   const probeTypes = PROBE_EVENTS[a.action]
-  // The chooser watcher rides the probe that is armed anyway, so it covers
-  // click, double_click and key: a button whose JavaScript opens the picker,
-  // and Enter on a focused control, which are the two shapes that actually
-  // occur. `check`/`uncheck` are ACTIVATES_TARGET but arm no probe, and they
-  // stay that way: a checkbox handler that opens a file chooser is not a real
-  // shape, and arming one would cost an arm and a read on every checkbox to
-  // watch for it.
-  const watchFileChooser = probeTypes !== undefined && ACTIVATES_TARGET.has(a.action)
-  const probe = probeTypes ? await armDelivery(tabId, probeTypes, { watchFileChooser }) : null
+  const probe = probeTypes ? await armDelivery(tabId, probeTypes) : null
 
   try {
     switch (a.action) {
@@ -1219,21 +1310,31 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     return { ok: false, status: 'error', error: `${a.action} failed: ${String(e)}` }
   }
 
-  // Read before settling: a settle that waits for quiet gives a suppressed page
-  // 250ms of nothing to happen in, and the probe should reflect the action, not
-  // the wait.
-  // Read only when this action really did dispatch browser-level input. The
-  // synthetic fallbacks (a click on an element with no layout box goes in as
-  // `this.click()`) produce no trusted event by definition, and `type ""`
-  // dispatches nothing at all; probing either would manufacture a failure for a
-  // page with nothing wrong with it.
-  // The pre-flight cleared the page BEFORE the action. An action can raise a
-  // dialog itself (a click on a submit button with a `beforeunload` handler, a
-  // handler that calls `confirm()`), and that case is at least as common as
-  // acting into a tab that was already blocked. Everything below here is
-  // renderer-bound, including settle, whose own deadline is IN-PAGE and so
-  // never ticks on a suspended page. Ask again before spending any of it.
+  // The act itself can raise a dialog we now own (#169: a click whose handler
+  // calls `confirm()`, a submit into a "Leave site?"). Checked FIRST, before
+  // the liveness probe: when the dialog event has already arrived, the cause
+  // is known by name and the probe would spend 4s confirming what is known.
+  // An `alert` never appears here (it is auto-acknowledged at open and shows
+  // up as `extra.dialog` below, after settle).
+  {
+    const raised = standingDialog(tabId)
+    if (raised) {
+      return pendingDialogResult(a.action, target, tabId, raised, inputMode, startedAt, extra)
+    }
+  }
+  // The pre-flight cleared the page BEFORE the action, and the check above
+  // covers the dialogs we own; this one covers what ownership cannot see (a
+  // handler still blocking the page, an event Chrome has not delivered yet).
+  // Everything below here is renderer-bound, including settle, whose own
+  // deadline is IN-PAGE and so never ticks on a suspended page. Ask again
+  // before spending any of it.
   if (!(await rendererResponsive(tabId))) {
+    // The dialog event can land while the liveness probe is in flight: prefer
+    // the named cause over the guess when it did.
+    const lateDialog = standingDialog(tabId)
+    if (lateDialog) {
+      return pendingDialogResult(a.action, target, tabId, lateDialog, inputMode, startedAt, extra)
+    }
     return {
       ok: false,
       status: 'error',
@@ -1243,18 +1344,12 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   }
 
   let delivered: DeliveryOutcome | null = null
-  let askedForFileChooser = false
   if (probe) {
     // Read on every armed path, so the probe is always disarmed; only ACTED
-    // on for trusted input. The synthetic fallback reaches the element through
-    // `Runtime.callFunctionOn` without `userGesture`, so there is no transient
-    // user activation, and Blink refuses to open a file chooser without one
-    // (it warns on the console and carries on). The click event still fires
-    // and would still trip this watcher, so treating it as a chooser would
-    // send the agent to tell the user about a dialog that cannot exist.
+    // on for trusted input (the synthetic fallbacks produce no trusted event
+    // by definition, and `type ""` dispatches nothing at all).
     const reading = await probe.read()
     if (inputMode === 'trusted') {
-      askedForFileChooser = reading.fileInputClicked
       delivered = reading.outcome
       // The probe watches the top document only, and this tool deliberately
       // acts inside iframes. A zero count there means "not seen here", not
@@ -1270,11 +1365,31 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       extra.input_delivered = delivered
     }
   }
-  // NOT `refused`: nothing was refused and nothing was blocked. The action
-  // happened and so, in all likelihood, did the dialog.
-  if (askedForFileChooser) extra.opened_file_chooser = true
 
   const settleResult = await settle(tabId)
+  // A dialog can open DURING settle too (a deferred handler); the check must
+  // come before `buildVerification`, whose probes are renderer-bound and
+  // would each ride their deadline against the suspended page.
+  {
+    const late = standingDialog(tabId)
+    if (late) {
+      return pendingDialogResult(a.action, target, tabId, late, inputMode, startedAt, extra)
+    }
+  }
+  // A dialog that opened and already resolved during this act is reported as
+  // history: the auto-acknowledged alert is the everyday case, a user
+  // answering their own confirm mid-act the rarer one.
+  {
+    const resolved = resolvedDialogSince(tabId, startedAt)
+    if (resolved) {
+      extra.dialog = {
+        state: 'resolved',
+        type: resolved.type,
+        message: resolved.message,
+        resolution: describeResolution(resolved),
+      }
+    }
+  }
   const data = await buildVerification({
     action: a.action,
     target,
@@ -1293,19 +1408,19 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // bug one level down: the agent that skimmed past `settled: "quiet"` would
   // skim past a new field just as readily. The full verification payload rides
   // along on the failure, so nothing diagnostic is lost.
-  // Checked BEFORE `delivered`, which is the rarer and weaker signal when both
-  // fire: the chooser flag is direct evidence that a click event ran in the
-  // page. It also outranks it on remedy. The undelivered advice ends in "close
-  // the tab", which does not close an OS dialog, so following it would destroy
-  // the tab and leave the picker standing on the user's screen.
-  if (askedForFileChooser) {
-    // Same fallback as the static refusal 400 lines up: a coordinate act has
-    // no ref to quote, but `describePoint` already named what it found there.
+  // The chooser check outranks `delivered`: interception is direct evidence
+  // the action ran in the page, and its remedy (use upload) is the useful
+  // one, where the undelivered advice would send the agent off to recover a
+  // tab with nothing wrong with it.
+  const chooser = chooserInterceptedSince(tabId, startedAt)
+  if (chooser) {
+    // Same fallback as the static refusal above: a coordinate act has no ref
+    // to quote, but `describePoint` already named what it found there.
     return {
       ok: false,
       status: 'error',
-      error: fileChooserOpenedError(a.action, target ?? pointTarget?.description ?? null),
-      data,
+      error: fileChooserInterceptedError(a.action, target ?? pointTarget?.description ?? null),
+      data: { ...data, chooser_intercepted: true },
     }
   }
   if (delivered === 'no') {

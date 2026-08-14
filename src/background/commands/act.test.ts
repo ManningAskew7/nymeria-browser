@@ -3,7 +3,30 @@ import { execAct, __test } from './act'
 import { CdpCallTimeout, resetForTests as resetDebugger } from '../debuggerSession'
 import { push as pushConsole, resetForTests as resetConsole } from '../consoleBuffer'
 import { resetForTests as resetDelivery } from '../delivery'
+import {
+  chooserInterceptedSince,
+  raceStandingDialog,
+  resolvedDialogSince,
+  standingDialog,
+  type StandingDialog as StandingDialogT,
+} from '../dialogs'
 import { resetForTests as resetRefs, set as setRefs } from '../snapshotRefs'
+
+// The dialogs seam is mocked so each test INJECTS a recorded dialog state
+// rather than re-driving the CDP event plumbing (which has its own tests in
+// dialogs.test.ts), the same split the delivery probe uses. Everything not
+// overridden keeps its real implementation, notably the message and payload
+// helpers the assertions below read.
+vi.mock('../dialogs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../dialogs')>()
+  return {
+    ...actual,
+    standingDialog: vi.fn(actual.standingDialog),
+    chooserInterceptedSince: vi.fn(actual.chooserInterceptedSince),
+    resolvedDialogSince: vi.fn(actual.resolvedDialogSince),
+    raceStandingDialog: vi.fn(actual.raceStandingDialog),
+  }
+})
 
 const TAB = 1
 const TAB_URL = 'https://example.com'
@@ -194,6 +217,14 @@ beforeEach(() => {
   resetDebugger()
   resetConsole()
   resetDelivery()
+  vi.mocked(standingDialog).mockReturnValue(null)
+  vi.mocked(chooserInterceptedSince).mockReturnValue(null)
+  vi.mocked(resolvedDialogSince).mockReturnValue(null)
+  // Default: no dialog ever interrupts, the raced work simply resolves.
+  vi.mocked(raceStandingDialog).mockImplementation(async (_tabId, work) => ({
+    kind: 'work' as const,
+    value: await work,
+  }))
 })
 
 describe('trusted input', () => {
@@ -1345,103 +1376,61 @@ describe('the coordinate description', () => {
 })
 
 /**
- * The one wedge nothing can detect after the fact and nothing can undo.
+ * The file chooser, PREVENTED (#169).
  *
  * A JS-driven upload button (`<button onclick="input.click()">`) is invisible
- * to the static guard, and the OS chooser it opens blocks the USER's window
- * while the page keeps reading perfectly healthy: measured on another agent's
- * harness 2026-08-12, which opened three of them and could not close any.
- *
- * Detection is all that is on offer here, and the wording has to be honest
- * about that. CDP can suppress the chooser, but only for a client that has
- * also sent `Page.enable`, which makes us the owner of every JS dialog in the
- * user's own tab: miss one `alert` and the renderer stalls. So the watcher
- * reports what the click did and tells the agent to stop clicking, and no
- * message claims the picker was stopped.
+ * to the static guard, and the OS chooser it used to open blocked the USER's
+ * window while the page kept reading perfectly healthy. Interception
+ * (`Page.setInterceptFileChooserDialog`, armed per attach now that the same
+ * client owns `Page`) stops the picker outright: Chrome emits
+ * `Page.fileChooserOpened` instead, `dialogs.ts` records it, and the act
+ * reports it. These tests mock the dialogs seam and assert what an act DOES
+ * with each recorded outcome; the event-to-record plumbing has its own tests
+ * in dialogs.test.ts, the same split the delivery probe uses.
  */
-describe('file-chooser detection', () => {
-  it('does not pretend to suppress the chooser', async () => {
-    // The suppress call is a silent no-op without Page.enable, so shipping it
-    // would buy nothing and license a message that lies about the outcome.
+describe('file chooser interception', () => {
+  it('arms interception at attach, where the old invariant forbade it', async () => {
+    // The inverse of the pre-#169 test that pinned these methods' ABSENCE:
+    // Page ownership makes interception real instead of a silent no-op, so
+    // the attach arms it eagerly and the act itself never has to.
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     const cdp = installCdpMock()
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    const methods = cdp.mock.calls.map((c) => c[1])
-    expect(methods).not.toContain('Page.setInterceptFileChooserDialog')
-    expect(methods, 'Page.enable would hand us ownership of the tab dialogs').not.toContain(
-      'Page.enable',
-    )
+    const methods = methodsOf(cdp)
+    expect(methods).toContain('Page.enable')
+    expect(methods).toContain('Page.setInterceptFileChooserDialog')
   })
 
-  it('watches for the chooser on the verbs that activate their target', async () => {
+  it('fails the act and says the picker did NOT open', async () => {
+    // A failure, not a success with a flag: the page is waiting on a file
+    // that will never arrive, and the agent must switch to the upload route.
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    const cdp = installCdpMock()
-
-    const result = await execAct({ tab_id: TAB, action: 'key', ref: '@e1', value: 'Enter' })
-
-    expect(result.ok, 'a key act that failed validation would arm and prove nothing').toBe(true)
-
-    // The watcher rides the delivery probe, whose arm expression takes it as
-    // its trailing argument. Enter on a focused control is one of the two
-    // shapes that actually opens a picker.
-    const arm = cdp.mock.calls.find(
-      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('__nymDelivery'),
-    )
-    expect(arm, 'no probe was armed at all').toBeDefined()
-    expect(String((arm![2] as { expression: string }).expression)).toMatch(/,\s*true\)$/)
-  })
-
-  it('does not watch on a verb that cannot reach a file input', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    const cdp = installCdpMock()
-
-    // right_click probes delivery like a click but opens a context menu, so
-    // it pays for the counter and not for the extra listener.
-    await execAct({ tab_id: TAB, action: 'right_click', ref: '@e1' })
-
-    const arm = cdp.mock.calls.find(
-      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('__nymDelivery'),
-    )
-    expect(arm).toBeDefined()
-    expect(String((arm![2] as { expression: string }).expression)).toMatch(/,\s*false\)$/)
-  })
-
-  it('fails the click when the page opened a chooser, and says what to do', async () => {
-    // Reported as a failure, not a success with a note: something is now on
-    // the user's screen that only they can clear, and a flag beside a green
-    // status is the silent no-op this kit exists to remove.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    installCdpMock({ fileChooserOpened: true })
+    installCdpMock()
+    vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect(result.ok).toBe(false)
     const error = String(result.error)
     expect(error).toMatch(/file chooser/i)
-    // The two instructions that keep it from getting worse.
-    expect(error, 'only the user can clear it').toMatch(/ask the user/i)
-    expect(error, 'each retry stacks another picker').toMatch(/do not repeat the click/i)
-    // And it must never claim the picker was stopped, which is what the
-    // suppression that silently no-ops would have had it say. Matched on the
-    // claim, not on the words: "blocking their browser window" is true and
-    // must stay sayable.
-    expect(error).not.toMatch(/suppress|was blocked|prevented|stopped/i)
+    expect(error, 'interception makes this claim honest now').toMatch(/no picker opened/i)
+    expect(error, 'each repeat re-triggers the chooser').toMatch(/do not repeat the click/i)
     // It must name the route that works, with the AGENT-facing signature.
     expect(error).toMatch(/action="upload"/)
     expect(error).toMatch(/path=/)
     expect(error).not.toMatch(/file_base64|file_name/)
-    expect((result.data as { opened_file_chooser?: boolean }).opened_file_chooser).toBe(true)
+    expect((result.data as { chooser_intercepted?: boolean }).chooser_intercepted).toBe(true)
   })
 
-  it('reports the chooser rather than the undelivered input when both fire', async () => {
-    // The undelivered advice ends in "close the tab", which does not close an
-    // OS dialog: following it would destroy the tab and leave the picker up on
-    // the user's screen. The chooser is also the stronger signal of the two,
-    // being direct evidence that a click event ran in the page.
+  it('outranks the undelivered verdict when both fire', async () => {
+    // The undelivered advice ends in "close the tab", which is the wrong
+    // move here: the interception is direct evidence the action ran in the
+    // page, and the useful remedy is the upload route.
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    installCdpMock({ fileChooserOpened: true, deliveryCount: 0 })
+    installCdpMock({ deliveryCount: 0 })
+    vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -1451,55 +1440,36 @@ describe('file-chooser detection', () => {
     expect(error, 'the recovery advice for a dead tab must not win here').not.toMatch(
       /close the tab/i,
     )
-    const data = result.data as { input_delivered?: string; opened_file_chooser?: boolean }
-    expect(data.opened_file_chooser).toBe(true)
+    const data = result.data as { input_delivered?: string; chooser_intercepted?: boolean }
+    expect(data.chooser_intercepted).toBe(true)
     expect(data.input_delivered, 'both facts still ride along on the failure').toBe('no')
   })
 
-  it('names the verb that actually reached the input, not always "click"', async () => {
-    // key is one of the two watched shapes. Telling the agent not to click
-    // again, after a key it never clicked with, is advice it cannot follow.
+  it('names the verb that reached the input, not always "click"', async () => {
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    installCdpMock({ fileChooserOpened: true })
+    installCdpMock()
+    vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
     const result = await execAct({ tab_id: TAB, action: 'key', ref: '@e1', value: 'Enter' })
 
     expect(result.ok).toBe(false)
-    expect(String(result.error)).toMatch(/a key on @e1 reached a file input/)
+    expect(String(result.error)).toMatch(/the key on @e1 tried to open/)
   })
 
   it('names what a coordinate hit, since there is no ref to quote', async () => {
-    // The coordinate path is the likeliest to meet a JS upload button, a
-    // coordinate being what the agent falls back to when no ref resolved.
-    installCdpMock({ fileChooserOpened: true, pointDescription: 'button "Attach"' })
+    installCdpMock({ pointDescription: 'button "Attach"' })
+    vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [100, 200] })
 
     expect(result.ok).toBe(false)
-    expect(String(result.error)).toMatch(/button "Attach" reached a file input/)
-  })
-
-  it('does not report a chooser on the synthetic path, which cannot open one', async () => {
-    // No layout box, so the click goes through Runtime.callFunctionOn without
-    // userGesture. Blink refuses to open a chooser without transient user
-    // activation, so the page's own input.click() still fires the event this
-    // watcher sees while no dialog can appear. Reporting one would send the
-    // agent to tell the user about a dialog that does not exist, and abort
-    // the rest of the batch behind it.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    installCdpMock({ geometry: null, fileChooserOpened: true })
-
-    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
-
-    const data = result.data as { input?: string; opened_file_chooser?: boolean }
-    expect(data.input, 'the premise of this test is the synthetic fallback').toBe('synthetic')
-    expect(data.opened_file_chooser).toBeUndefined()
-    expect(result.ok).toBe(true)
+    expect(String(result.error)).toMatch(/button "Attach" tried to open/)
   })
 
   it('keeps the full verification payload on that failure', async () => {
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
-    installCdpMock({ fileChooserOpened: true })
+    installCdpMock()
+    vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -1516,8 +1486,126 @@ describe('file-chooser detection', () => {
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect(result.ok).toBe(true)
-    expect(
-      (result.data as { opened_file_chooser?: boolean }).opened_file_chooser,
-    ).toBeUndefined()
+    expect((result.data as { chooser_intercepted?: boolean }).chooser_intercepted).toBeUndefined()
+  })
+})
+
+/**
+ * Dialogs the extension OWNS during an act (#169).
+ *
+ * The dialogs module records what opened and what resolved; these tests
+ * assert what an act does with each state. A standing dialog before the act
+ * refuses by name; one the act itself raised returns a SUCCESS carrying the
+ * answer route (the input was delivered, and failing it would invite the
+ * double-submitting retry); one that already resolved (the auto-acked alert)
+ * rides the payload as history.
+ */
+describe('owned dialogs during an act', () => {
+  const CONFIRM: StandingDialogT = {
+    type: 'confirm',
+    message: 'Delete this item?',
+    url: TAB_URL,
+    openedAt: Date.now(),
+    deadlineAt: Date.now() + 60_000,
+  }
+
+  it('refuses by name when a dialog is standing before the act', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock()
+    vi.mocked(standingDialog).mockReturnValue(CONFIRM)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toMatch(/NOT sent/)
+    expect(error).toMatch(/confirm dialog: "Delete this item\?"/)
+    expect(error).toMatch(/chrome_dialog\(tab_id=1/)
+    expect(error, 'the fallback must be named or the agent cannot plan').toMatch(
+      /dismissed automatically/,
+    )
+    expect(methodsOf(cdp), 'nothing may be dispatched into a paused page').not.toContain(
+      'Input.dispatchMouseEvent',
+    )
+  })
+
+  it('reports a dialog the act itself raised as a success with the answer route', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    // Standing: not before the act (first call), standing after dispatch.
+    vi.mocked(standingDialog).mockReturnValueOnce(null).mockReturnValue(CONFIRM)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok, 'the input WAS delivered; failing it invites a double-submit').toBe(true)
+    const data = result.data as {
+      dialog?: { type?: string; message?: string; note?: string; answer_with?: string }
+    }
+    expect(data.dialog?.type).toBe('confirm')
+    expect(data.dialog?.message).toBe('Delete this item?')
+    expect(data.dialog?.note).toMatch(/do not repeat the click/i)
+    expect(data.dialog?.answer_with).toMatch(/chrome_dialog\(tab_id=1/)
+  })
+
+  it('prefers the named dialog over the stall guess when the event lands late', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ rendererHangsAfterDispatch: true })
+    // Not standing at either early check; known by the time the liveness
+    // probe has failed.
+    vi.mocked(standingDialog)
+      .mockReturnValueOnce(null)
+      .mockReturnValueOnce(null)
+      .mockReturnValue(CONFIRM)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { dialog?: { message?: string } }
+    expect(data.dialog?.message, 'the guess would say "two things do that"').toBe(
+      'Delete this item?',
+    )
+  })
+
+  it('reports an auto-acknowledged alert as history on a normal success', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    vi.mocked(resolvedDialogSince).mockReturnValue({
+      type: 'alert',
+      message: 'Saved!',
+      openedAt: Date.now(),
+      resolvedAt: Date.now(),
+      accepted: true,
+      by: 'policy',
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as {
+      dialog?: { type?: string; message?: string; resolution?: string }
+      settled?: unknown
+    }
+    expect(data.dialog?.type).toBe('alert')
+    expect(data.dialog?.message).toBe('Saved!')
+    expect(data.dialog?.resolution).toMatch(/auto-acknowledged/)
+    expect(data.settled, 'an acked alert does not cost the verification payload').toBeDefined()
+  })
+
+  it('interrupts a wait when a dialog opens instead of burning the timeout', async () => {
+    installCdpMock()
+    vi.mocked(raceStandingDialog).mockResolvedValue({ kind: 'dialog', dialog: CONFIRM })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'wait',
+      wait_for: { text: 'Done' },
+      timeout_ms: 5_000,
+    })
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toMatch(/wait was interrupted/)
+    expect(error).toMatch(/confirm dialog opened: "Delete this item\?"/)
+    expect(error).toMatch(/chrome_dialog\(tab_id=1/)
   })
 })

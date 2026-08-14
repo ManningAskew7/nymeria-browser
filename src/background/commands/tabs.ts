@@ -1,4 +1,5 @@
 import type { CommandResult } from '../../shared/types'
+import { expectBeforeunloadAccept } from '../dialogs'
 import { TAB_LOAD_WAIT_MS, waitForTabComplete, watchForTabComplete } from '../settle'
 
 interface TabsArgs {
@@ -77,6 +78,12 @@ export async function execTabs(args: unknown): Promise<CommandResult> {
     }
     case 'close': {
       if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'close requires tab_id' }
+      // Close is the recovery path and must always clear the tab, so a
+      // beforeunload it raises is auto-accepted rather than held for the
+      // agent (#169). Only effective while the tab is attached (ownership
+      // rides the attach); an unattached "Leave site?" tab can still refuse
+      // its own close, which SKILL.md's matrix covers.
+      expectBeforeunloadAccept(a.tab_id)
       await chrome.tabs.remove(a.tab_id)
       return { ok: true, status: 'success', data: { closed: a.tab_id } }
     }

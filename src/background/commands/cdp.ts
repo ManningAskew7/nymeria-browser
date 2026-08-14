@@ -35,10 +35,13 @@ const CDP_ESCAPE_DEADLINE_MS = 55_000
  *  - Script execution: page-context JS is one invisible call from reading a
  *    token and sending it anywhere. Page.reload is in this class for its
  *    scriptToEvaluateOnLoad parameter; the tabs command already reloads.
- *  - Wedge enables: nothing consumes Fetch, Debugger or Page events (the
- *    console and network buffers read the CAPTURE_DOMAINS this session
- *    enables at attach), so these deliver nothing and can wedge the tab
- *    with paused requests, debugger pauses or unanswerable dialogs.
+ *  - Wedge enables: enabling Fetch or Debugger delivers nothing (no
+ *    listener consumes their events) and can wedge the tab with paused
+ *    requests or debugger pauses. Page IS consumed now (#169: the session
+ *    enables it at attach and dialogs.ts answers its events by policy),
+ *    which is exactly why a raw re-enable stays refused: ownership is
+ *    already taken, with an answering policy attached, and a second client
+ *    state fighting it buys nothing.
  */
 export const CDP_DENIED_METHODS = new Set([
   // Credential-store reads

@@ -1,7 +1,15 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { dispatchBrowserCommand, EXECUTORS, setDispatchHooks } from './index'
+import { standingDialog } from '../dialogs'
 import { setConfig } from '../../utils/storage'
 import type { BrowserCommandEvent } from '../../shared/types'
+
+// Stubbed so a test can INJECT an owned standing dialog; the event plumbing
+// behind the real implementation has its own tests in dialogs.test.ts.
+vi.mock('../dialogs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../dialogs')>()
+  return { ...actual, standingDialog: vi.fn(actual.standingDialog) }
+})
 
 beforeEach(async () => {
   await setConfig({ baseUrl: 'http://api.test', token: 'nym_unit' })
@@ -274,6 +282,54 @@ describe('suspended-page pre-flight', () => {
       } finally {
         ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>).snapshot = original
       }
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+describe('owned-dialog pre-flight naming (#169)', () => {
+  it('names the standing dialog and its answer route instead of the two-cause guess', async () => {
+    vi.useFakeTimers()
+    try {
+      // The renderer IS suspended, but the cause is known by name: the named
+      // message must win over the generic suspended-page guess, and no
+      // liveness probe should even be spent.
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn(() => new Promise<never>(() => {}))
+      vi.mocked(standingDialog).mockReturnValueOnce({
+        type: 'confirm',
+        message: 'Delete this item?',
+        url: 'https://example.com',
+        openedAt: Date.now(),
+        deadlineAt: Date.now() + 60_000,
+      })
+
+      const results: unknown[] = []
+      setDispatchHooks({ onResult: (_e: unknown, r: unknown) => results.push(r) })
+      ;(globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
+        new Response(JSON.stringify({ received: true }), {
+          status: 200,
+          headers: { 'Content-Type': 'application/json' },
+        })) as unknown as typeof fetch
+      const pending = dispatchBrowserCommand({
+        type: 'browser_command',
+        command_id: 'bcmd_dialog_named',
+        command_type: 'snapshot',
+        args: { tab_id: 1 },
+        timeout_seconds: 30,
+      } as BrowserCommandEvent)
+      await vi.advanceTimersByTimeAsync(30_000)
+      await pending
+      const result = results[0] as { ok: boolean; error?: string }
+
+      expect(result.ok).toBe(false)
+      const error = String(result.error)
+      expect(error).toMatch(/confirm dialog: "Delete this item\?"/)
+      expect(error).toMatch(/chrome_dialog\(tab_id=1/)
+      expect(error).toMatch(/dismissed automatically/)
+      expect(error, 'the generic guess must not leak in beside the named cause').not.toMatch(
+        /long-running script/i,
+      )
     } finally {
       vi.useRealTimers()
     }

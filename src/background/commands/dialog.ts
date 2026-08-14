@@ -1,5 +1,6 @@
 import type { CommandResult } from '../../shared/types'
-import { CdpCallTimeout, sendCommand, TabUnusable } from '../debuggerSession'
+import { answerStandingDialog, describeResolution } from '../dialogs'
+import { isAttached } from '../debuggerSession'
 
 interface DialogArgs {
   tab_id: number
@@ -8,35 +9,69 @@ interface DialogArgs {
 }
 
 /**
- * Sized INSIDE this command's 5s backend budget, unlike the 15s default,
- * which the backend would always outrun here: dialog is aimed at a suspended
- * tab by definition, so its calls hanging is the expected failure, and the
- * honest named timeout has to arrive before the transport gives up and
- * blames the extension.
+ * Answer the standing JS dialog the extension owns on this tab (#169).
+ *
+ * Ownership comes from `Page` being enabled on every attach: a dialog raised
+ * while the agent is driving is recorded by `dialogs.ts` and held for up to
+ * its grace window, and this command answers it from the BROWSER process, so
+ * the suspended renderer is irrelevant. What it cannot do, ever, is answer a
+ * dialog raised while no attach was live: a reactive enable does not own a
+ * dialog already standing (measured), so those cases return an honest
+ * explanation instead of a timeout, and the recovery matrix in SKILL.md
+ * still applies to them.
  */
-const DIALOG_CALL_DEADLINE_MS = 3_500
-
 export async function execDialog(args: unknown): Promise<CommandResult> {
   const a = args as DialogArgs
   if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'tab_id required' }
   if (a.action !== 'accept' && a.action !== 'dismiss') {
     return { ok: false, status: 'error', error: "action must be 'accept' or 'dismiss'" }
   }
-  try {
-    const opts = { deadlineMs: DIALOG_CALL_DEADLINE_MS }
-    await sendCommand(a.tab_id, 'Page.enable', {}, opts)
-    await sendCommand(a.tab_id, 'Page.handleJavaScriptDialog', {
-      accept: a.action === 'accept',
-      ...(a.prompt_text != null ? { promptText: a.prompt_text } : {}),
-    }, opts)
-    return { ok: true, status: 'success', data: { action: a.action } }
-  } catch (e) {
-    // The session layer's failures carry their own diagnosis and remedy;
-    // wrapping them as "no pending dialog?" would misattribute exactly the
-    // cases they exist to name.
-    if (e instanceof CdpCallTimeout || e instanceof TabUnusable) {
-      return { ok: false, status: 'error', error: e.message }
-    }
-    return { ok: false, status: 'error', error: `dialog failed (no pending dialog?): ${String(e)}` }
+  const result = await answerStandingDialog(
+    a.tab_id,
+    a.action === 'accept',
+    a.prompt_text ?? undefined,
+  )
+  switch (result.outcome) {
+    case 'answered':
+      return {
+        ok: true,
+        status: 'success',
+        data: {
+          action: a.action,
+          dialog: { type: result.dialog.type, message: result.dialog.message },
+        },
+      }
+    case 'already-resolved':
+      return {
+        ok: false,
+        status: 'error',
+        error:
+          `no dialog is standing on this tab: the last one, a ${result.last.type} ` +
+          `("${result.last.message}"), was ${describeResolution(result.last)}. ` +
+          'Nothing was sent.',
+      }
+    case 'none':
+      return {
+        ok: false,
+        status: 'error',
+        error:
+          'no dialog is standing on this tab. Dialogs are owned and answerable only ' +
+          'while the extension is attached (from the first chrome_* command on the ' +
+          'tab until shortly after the last); one raised outside that window can ' +
+          `only be cleared by the user or by closing the tab.${
+            isAttached(a.tab_id)
+              ? ''
+              : ' This tab is not currently attached, so if a dialog is on screen now, it is that case.'
+          } Nothing was sent.`,
+      }
+    case 'failed':
+      return {
+        ok: false,
+        status: 'error',
+        error:
+          `answering the ${result.dialog.type} ("${result.dialog.message}") failed: ` +
+          `${result.error}. If it is no longer on screen, the user likely answered ` +
+          'it first; re-read the page to see where things stand.',
+      }
   }
 }

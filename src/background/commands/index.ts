@@ -13,6 +13,7 @@ import { execNetwork } from './network'
 import { execScreenshot } from './screenshot'
 import { execSnapshot } from './snapshot'
 import { execTabs } from './tabs'
+import { dialogBlockedReadError, standingDialog } from '../dialogs'
 import { READ_LIVENESS_DEADLINE_MS, rendererResponsive, suspendedPageReadError } from '../settle'
 
 type Executor = (args: unknown) => Promise<CommandResult>
@@ -48,9 +49,11 @@ const MAX_RESULT_BYTES = 8_000_000
  * gating them would break it. `history` is the same. `console` and `network`
  * read local buffers fed by CDP events and need nothing from the page, which
  * makes them the diagnostics an agent reaches for once a tab goes quiet.
- * `dialog` is aimed at a suspended tab by definition. `batch` is not itself a
- * page read; its sub-commands come back through here individually. `cdp` is
- * the raw escape hatch and must not be second-guessed.
+ * `dialog` answers the recorded standing dialog from the BROWSER process
+ * (#169), so the suspended renderer it exists to relieve is irrelevant to
+ * it, and gating it would deadlock the cure on the disease. `batch` is not
+ * itself a page read; its sub-commands come back through here individually.
+ * `cdp` is the raw escape hatch and must not be second-guessed.
  *
  * `screenshot` was a false at first, on the theory that its image comes from
  * the compositor, not the renderer, so a picture of a frozen page is exactly
@@ -85,6 +88,13 @@ async function runSingle(type: string, args: unknown): Promise<CommandResult> {
   }
   const tabId = (args as { tab_id?: unknown } | null)?.tab_id
   if (READS_THE_PAGE[type as CommandType] && typeof tabId === 'number') {
+    // A dialog we own is named outright (#169): faster than the liveness
+    // probe, and the message carries the actual remedy (chrome_dialog)
+    // instead of the two-cause guess.
+    const dialog = standingDialog(tabId)
+    if (dialog) {
+      return { ok: false, status: 'error', error: dialogBlockedReadError(tabId, dialog) }
+    }
     if (!(await rendererResponsive(tabId, READ_LIVENESS_DEADLINE_MS))) {
       return { ok: false, status: 'error', error: suspendedPageReadError() }
     }

@@ -4,6 +4,8 @@ import {
   activeTabs,
   installDetachHandler,
   isAttached,
+  onSessionEnd,
+  registerDetachGate,
   release,
   resetForTests,
   sendCommand,
@@ -211,5 +213,99 @@ describe('CDP call deadlines', () => {
     // A fresh session must start cold, not ride the dead entry.
     await acquire(9)
     expect(chrome.debugger.attach).toHaveBeenCalledTimes(2)
+  })
+})
+
+describe('detach single-flight and session end (#169 review)', () => {
+  it('a linger expiring during an open gate does not start a second detach or double-fire session end', async () => {
+    // A mid-gate command (console/network ride acquire+release without the
+    // dispatch dialog gate) re-arms the linger, whose expiry used to enter a
+    // SECOND detachNow and a second gate; when the dialog resolved, one
+    // attach produced two detaches and two session-end fires (review probe).
+    const gateResolvers: Array<() => void> = []
+    registerDetachGate(() => new Promise<void>((resolve) => gateResolvers.push(resolve)))
+    const ends: number[] = []
+    const off = onSessionEnd((tabId) => ends.push(tabId))
+
+    await acquire(7)
+    release(7)
+    await vi.advanceTimersByTimeAsync(10_100) // detachNow #1 blocks in the gate
+    expect(gateResolvers.length).toBe(1)
+
+    await acquire(7) // a mid-gate command bumps and releases the refcount
+    release(7)
+    await vi.advanceTimersByTimeAsync(10_100) // its linger expires mid-gate
+
+    expect(gateResolvers.length, 'one detach drives the session; the second linger yields').toBe(1)
+    for (const resolve of gateResolvers) resolve()
+    await vi.advanceTimersByTimeAsync(100)
+    expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
+    expect(ends, 'ownership ends once, not once per linger').toEqual([7])
+    off()
+  })
+
+  it('a detach Chrome answered late does not fire session end into the replacement session', async () => {
+    // Sequence: voluntary detach hangs -> Chrome detaches externally (session
+    // end fires, honestly) -> the agent re-attaches and is driving again ->
+    // the old detach finally answers. Unguarded, that stale completion fired
+    // session end AGAIN, wiping the live session's dialog ownership state.
+    registerDetachGate(async () => undefined) // pass-through; the gate is not under test here
+    const ends: number[] = []
+    const off = onSessionEnd((tabId) => ends.push(tabId))
+    installDetachHandler()
+    const addListener = chrome.debugger.onDetach.addListener as ReturnType<typeof vi.fn>
+    const onDetach = addListener.mock.calls.at(-1)?.[0] as (
+      source: { tabId?: number },
+      reason: string,
+    ) => void
+    let resolveDetach: () => void = () => {}
+    ;(chrome.debugger.detach as unknown) = vi.fn(
+      () => new Promise<void>((resolve) => (resolveDetach = resolve)),
+    )
+
+    await acquire(7)
+    release(7)
+    await vi.advanceTimersByTimeAsync(10_100) // voluntary detach starts and hangs
+    onDetach({ tabId: 7 }, 'target_closed')
+    expect(ends).toEqual([7])
+
+    await acquire(7) // fresh session, driving again
+    resolveDetach() // the stale detach finally answers
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(ends, 'the stale detach must not end the LIVE session').toEqual([7])
+    expect(isAttached(7)).toBe(true)
+    release(7)
+    off()
+  })
+})
+
+describe('capture domains at attach (#169)', () => {
+  it('enables Page with the capture domains and arms chooser interception', async () => {
+    // The inverse of the pre-#169 posture, which deliberately excluded Page.
+    // Ownership is taken eagerly so a dialog raised by the agent's own
+    // action is always owned, and interception must chain AFTER Page.enable
+    // (it is a silent no-op for a client without Page enabled).
+    const send = vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({}))
+    ;(chrome.debugger.sendCommand as unknown) = send
+
+    await acquire(7)
+    await vi.advanceTimersByTimeAsync(0)
+
+    const methods = send.mock.calls.map((c) => c[1] as string)
+    expect(methods).toEqual(
+      expect.arrayContaining([
+        'Runtime.enable',
+        'Network.enable',
+        'Page.enable',
+        'Page.setInterceptFileChooserDialog',
+      ]),
+    )
+    expect(
+      methods.indexOf('Page.setInterceptFileChooserDialog'),
+      'interception must follow its enable, not race it',
+    ).toBeGreaterThan(methods.indexOf('Page.enable'))
+    const arm = send.mock.calls.find((c) => c[1] === 'Page.setInterceptFileChooserDialog')
+    expect(arm?.[2]).toEqual({ enabled: true })
   })
 })

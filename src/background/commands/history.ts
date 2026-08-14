@@ -1,4 +1,10 @@
 import type { CommandResult } from '../../shared/types'
+import {
+  blockedByDialogError,
+  raceStandingDialog,
+  standingDialog,
+  standingDialogPayload,
+} from '../dialogs'
 import { clear as clearRefs } from '../snapshotRefs'
 import { TAB_LOAD_WAIT_MS, waitForTabComplete } from '../settle'
 
@@ -38,8 +44,30 @@ export async function execHistory(args: unknown): Promise<CommandResult> {
     }
   }
   clearRefs(a.tab_id)
-  const complete = await waitForTabComplete(a.tab_id, TAB_LOAD_WAIT_MS)
+  // Same dialog race as navigate (#169): a beforeunload can hold a
+  // back/forward exactly as it holds a navigation, and the honest failure
+  // names it instead of riding the wait.
+  const outcome = await raceStandingDialog(
+    a.tab_id,
+    waitForTabComplete(a.tab_id, TAB_LOAD_WAIT_MS),
+  )
   const after = await chrome.tabs.get(a.tab_id).catch(() => null)
+
+  // Same belt as navigate: the complete-read can win on the OLD page while a
+  // beforeunload stands; a dialog standing NOW is the story either way.
+  const dialog = outcome.kind === 'dialog' ? outcome.dialog : standingDialog(a.tab_id)
+  if (dialog) {
+    return {
+      ok: false,
+      status: 'error',
+      error: blockedByDialogError(a.tab_id, dialog),
+      data: {
+        direction: a.direction,
+        url: after?.url,
+        dialog: standingDialogPayload(a.tab_id, dialog),
+      },
+    }
+  }
 
   return {
     ok: true,
@@ -49,7 +77,7 @@ export async function execHistory(args: unknown): Promise<CommandResult> {
       url: after?.url,
       title: after?.title,
       url_changed: Boolean(before?.url && after?.url && before.url !== after.url),
-      complete,
+      complete: outcome.kind === 'work' && outcome.value,
     },
   }
 }

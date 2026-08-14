@@ -1,5 +1,17 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { raceStandingDialog, standingDialog } from '../dialogs'
 import { execNavigate } from './navigate'
+
+// The dialogs seam is mocked so a test can INJECT a dialog opening mid-load;
+// the event plumbing has its own tests in dialogs.test.ts.
+vi.mock('../dialogs', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../dialogs')>()
+  return {
+    ...actual,
+    raceStandingDialog: vi.fn(actual.raceStandingDialog),
+    standingDialog: vi.fn(actual.standingDialog),
+  }
+})
 
 const TAB = 1
 const START = 'https://example.com/'
@@ -37,6 +49,13 @@ function installTabsMock(opts: { landsOn: string; status?: string; startUrl?: st
 
 beforeEach(() => {
   vi.restoreAllMocks()
+  // Restored to no-op above; the default must be "no dialog ever opens",
+  // i.e. the raced work simply resolves.
+  vi.mocked(raceStandingDialog).mockImplementation(async (_tabId, work) => ({
+    kind: 'work' as const,
+    value: await work,
+  }))
+  vi.mocked(standingDialog).mockReturnValue(null)
 })
 
 describe('execNavigate', () => {
@@ -68,4 +87,57 @@ describe('execNavigate', () => {
     expect(result.ok).toBe(true)
   })
 
+})
+
+describe('beforeunload holds the navigation (#169)', () => {
+  it('fails fast, names the dialog, and stays honest about where the tab is', async () => {
+    // Before ownership this was the documented lie: ok:true with the tab
+    // still on its old page. The dialog signal now wins the race against the
+    // load wait, and the answer route is real.
+    installTabsMock({ landsOn: START, status: 'loading' })
+    vi.mocked(raceStandingDialog).mockResolvedValue({
+      kind: 'dialog',
+      dialog: {
+        type: 'beforeunload' as const,
+        message: '',
+        url: START,
+        openedAt: Date.now(),
+        deadlineAt: Date.now() + 60_000,
+      },
+    })
+
+    const result = await execNavigate({ tab_id: TAB, url: TARGET })
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toMatch(/asked to confirm leaving/)
+    expect(error).toMatch(/chrome_dialog\(tab_id=1, action="accept"\)/)
+    expect(error, 'unsaved state is the user cue').toMatch(/unsaved/)
+    const data = result.data as { url?: string; requested_url?: string; dialog?: unknown }
+    expect(data.url, 'the tab has NOT moved and the payload must say so').toBe(START)
+    expect(data.requested_url).toBe(TARGET)
+    expect(data.dialog).toBeDefined()
+  })
+
+  it('catches a dialog even when a stale complete-read wins the race', async () => {
+    // waitForTabComplete can win by reading the OLD page's status:"complete"
+    // before the load it just triggered starts (settle.ts documents exactly
+    // this trap), and a beforeunload standing at that instant would ride the
+    // early-out back to the pre-#169 dishonest success. Whichever way the
+    // race goes, a dialog standing NOW is the story.
+    installTabsMock({ landsOn: START })
+    vi.mocked(standingDialog).mockReturnValue({
+      type: 'beforeunload' as const,
+      message: '',
+      url: START,
+      openedAt: Date.now(),
+      deadlineAt: Date.now() + 60_000,
+    })
+
+    const result = await execNavigate({ tab_id: TAB, url: TARGET })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/asked to confirm leaving/)
+    expect((result.data as { url?: string }).url).toBe(START)
+  })
 })

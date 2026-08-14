@@ -184,14 +184,20 @@ export function withDeadline<T>(work: Promise<T>, ms: number): Promise<T | null>
  * dialog is holding it or a script is still running.
  */
 export function suspendedPageReadError(): string {
+  // Reached only when NO owned dialog is recorded for the tab: the dispatch
+  // pre-flight names an owned one outright (#169), so if a dialog is the
+  // cause here it predates the attach and chrome_dialog genuinely cannot
+  // answer it (ownership cannot be taken retroactively).
   return (
     'this read could not run: the tab did not run a script for several seconds, so ' +
-    'nothing could be read from it. Two things do that. A dialog the PAGE raised ' +
-    '(alert, confirm, prompt, or a "Leave site?" on navigation) suspends it until ' +
-    'answered, and chrome_dialog cannot clear it: navigate the tab away, or close it ' +
-    'and redo the work in a fresh one. A long-running script suspends it temporarily: ' +
-    'wait a few seconds and retry, and if the retry reports this again it is the ' +
-    'dialog. Nothing was changed on the page either way.'
+    'nothing could be read from it. Two things do that. A dialog raised BEFORE ' +
+    'this session touched the tab (alert, confirm, prompt, or a "Leave site?") ' +
+    'suspends it until answered, and chrome_dialog cannot answer that one ' +
+    '(dialogs are only answerable when raised while the extension was driving ' +
+    'the tab): close the tab and redo the work in a fresh one. A long-running ' +
+    'script suspends it temporarily: wait a few seconds and retry, and if the ' +
+    'retry reports this again it is the dialog. Nothing was changed on the page ' +
+    'either way.'
   )
 }
 
