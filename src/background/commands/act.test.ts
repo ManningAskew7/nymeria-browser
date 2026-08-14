@@ -585,35 +585,46 @@ describe('verification payload', () => {
       expect(data.url_changed).toBe(false)
       expect('navigated' in data).toBe(false)
       expect('navigation_pending' in data).toBe(false)
+      // #168: a wait-less act also runs no wait loop. The fused wait's poll
+      // timer would equally hang this test red if it were entered here.
+      expect('condition' in data).toBe(false)
+      expect('found' in data).toBe(false)
     } finally {
       vi.useRealTimers()
     }
   })
 
-  it('action wait never pays the commit wait, even with a navigation pending', async () => {
-    // wait's timeout_ms already spends the transport budget's slack, so the
-    // +3s would blow the cross-repo contract (settle.ts). Fake timers with
-    // no advance: entering the commit wait would hang this test red.
+  it('a wait rides the bounded commit wait and reports the commit it catches', async () => {
+    // The old exemption ("wait never pays the commit wait") was budget-born
+    // and died with the +15s transport slack: a wait whose page is mid-
+    // navigation now waits the bounded beat like every other action and
+    // reports `navigated` instead of leaving the honest in-between as the
+    // final word.
     vi.useFakeTimers()
     try {
-      installCdpMock()
+      installCdpMock({ bodyText: 'Done' })
       const nav = wireNav()
-      nav.beforeNavigate({ tabId: TAB, url: 'https://slow.example/next', frameId: 0 })
-      const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
-      get.mockImplementation(async () => ({ id: TAB, url: 'https://example.com/checkout/done' }))
+      const flip = urlFlipsOnCommit('https://example.com/thanks')
+      nav.beforeNavigate({ tabId: TAB, url: 'https://example.com/thanks', frameId: 0 })
+      setTimeout(() => {
+        flip()
+        nav.committed({ tabId: TAB, url: 'https://example.com/thanks', frameId: 0 })
+      }, 30)
 
-      const result = await execAct({
+      const pending = execAct({
         tab_id: TAB,
         action: 'wait',
-        wait_for: { url_contains: '/checkout/done' },
+        wait_for: { text: 'Done' },
         timeout_ms: 5_000,
       })
+      await vi.advanceTimersByTimeAsync(100)
+      const result = await pending
 
       expect(result.ok).toBe(true)
-      const data = result.data as { navigation_pending?: string }
-      expect(data.navigation_pending, 'the commit CHECK still reports honestly').toBe(
-        'https://slow.example/next',
-      )
+      const data = result.data as { found?: boolean; navigated?: boolean; url?: string }
+      expect(data.found).toBe(true)
+      expect(data.navigated).toBe(true)
+      expect(data.url).toBe('https://example.com/thanks')
     } finally {
       vi.useRealTimers()
     }
@@ -746,6 +757,314 @@ describe('verification payload', () => {
 
     expect(result.ok).toBe(true)
     expect((result.data as { found: boolean }).found).toBe(true)
+  })
+
+  // ---- fused wait conditions (#168): any action can carry wait_for/timeout_ms.
+
+  it('a click carrying wait_for_text returns when the text appears, not at the timeout', async () => {
+    // The text lands 500ms after the click; the poll must see it and return
+    // early. If the wait rode its 10s timeout instead, the 1s advance below
+    // would leave the act unresolved and this test would hang red.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock()
+      let body = 'still loading'
+      const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+      const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+      send.mockImplementation(async (...args: unknown[]) => {
+        const params = args[2] as { expression?: string } | undefined
+        const e = params?.expression
+        if (e?.includes('innerText.includes')) {
+          const needle = e.slice(e.indexOf('includes(') + 9, e.lastIndexOf(')'))
+          return { result: { value: body.includes(JSON.parse(needle)) } }
+        }
+        return original(...args)
+      })
+      setTimeout(() => {
+        body = 'Order confirmed'
+      }, 500)
+
+      const pending = execAct({
+        tab_id: TAB,
+        action: 'click',
+        ref: '@e1',
+        wait_for: { text: 'Order confirmed' },
+        timeout_ms: 10_000,
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+      const result = await pending
+
+      expect(result.ok).toBe(true)
+      const data = result.data as { condition?: string; found?: boolean; waited_ms?: number }
+      expect(data.condition).toBe('text:Order confirmed')
+      expect(data.found).toBe(true)
+      expect(data.waited_ms, 'returned at the text, not the timeout').toBeLessThan(2_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('an unmet condition on a delivered click succeeds with found: false, not an error', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ bodyText: 'still loading' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'click',
+      ref: '@e1',
+      wait_for: { text: 'Order confirmed' },
+      timeout_ms: 150,
+    })
+
+    expect(result.ok, 'the input WAS delivered; failing conflates delivery with outcome').toBe(true)
+    expect(result.error).toBeUndefined()
+    const data = result.data as { condition?: string; found?: boolean; input_delivered?: string }
+    expect(data.found).toBe(false)
+    expect(data.condition).toBe('text:Order confirmed')
+    expect(data.input_delivered).toBe('yes')
+  })
+
+  it('timeout_ms with no condition widens the one settle and never arms a condition', async () => {
+    // A bare timeout is a patience knob, not a named outcome: the settle
+    // window itself is widened (visible in the probe's in-page deadline) and
+    // no condition/found is emitted, so mere page quiescence can never gate
+    // a batch.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1', timeout_ms: 3_000 })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown> & { settled?: { reason: string } }
+    expect('condition' in data).toBe(false)
+    expect('found' in data).toBe(false)
+    expect(data.settled?.reason).toBe('quiet')
+    const settleProbes = cdp.mock.calls.filter(
+      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('MutationObserver'),
+    )
+    expect(settleProbes, 'one settle, not a settle plus a second probe').toHaveLength(1)
+    expect(String((settleProbes[0][2] as { expression: string }).expression)).toContain('3000')
+  })
+
+  it('timeout_ms: 0 runs no wait at all, matching the backend reading of it as unset', async () => {
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      const cdp = installCdpMock()
+
+      const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1', timeout_ms: 0 })
+
+      expect(result.ok).toBe(true)
+      const data = result.data as Record<string, unknown>
+      expect('condition' in data).toBe(false)
+      expect('found' in data).toBe(false)
+      const settleProbes = cdp.mock.calls.filter(
+        (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('MutationObserver'),
+      )
+      expect(settleProbes).toHaveLength(1)
+      expect(
+        String((settleProbes[0][2] as { expression: string }).expression),
+        'the default window, not a zero-length one',
+      ).toContain('5000')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a dialog opening during the widened settle is named, not ridden out', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    const confirm: StandingDialogT = {
+      type: 'confirm',
+      message: 'Leave?',
+      url: TAB_URL,
+      openedAt: Date.now(),
+      deadlineAt: Date.now() + 60_000,
+    }
+    vi.mocked(raceStandingDialog).mockResolvedValue({ kind: 'dialog', dialog: confirm })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1', timeout_ms: 60_000 })
+
+    expect(result.ok, 'the input WAS delivered; the dialog is the story').toBe(true)
+    const data = result.data as { dialog?: { type?: string; message?: string } }
+    expect(data.dialog?.type).toBe('confirm')
+    expect(data.dialog?.message).toBe('Leave?')
+  })
+
+  it('names the condition that was MET when several are armed', async () => {
+    // Conditions are OR'd; the payload must name the one that held, not the
+    // highest-priority one, because `condition` now feeds the batch gate.
+    const url = 'https://example.com/done'
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), url)
+    installCdpMock({ bodyText: 'still loading' })
+    const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
+    get.mockImplementation(async () => ({ id: TAB, url }))
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'click',
+      ref: '@e1',
+      wait_for: { text: 'Welcome', url_contains: '/done' },
+      timeout_ms: 500,
+    })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { condition?: string; found?: boolean }
+    expect(data.found).toBe(true)
+    expect(data.condition).toBe('url_contains:/done')
+  })
+
+  it('a throw out of the ref condition keeps polling instead of escaping post-dispatch', async () => {
+    // A `css=` resolve is a bare evaluate that rejects during a navigation
+    // or a debugger detach. Post-#168 this loop runs AFTER input was
+    // dispatched: a throw escaping it would lose the whole verification
+    // payload and read as "nothing was sent", the double-submit invitation.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const params = args[2] as { expression?: string; contextId?: number } | undefined
+      if (params?.expression?.includes('querySelector') && params.contextId === undefined) {
+        throw new Error('Inspected target navigated or closed')
+      }
+      return original(...args)
+    })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'click',
+      ref: '@e1',
+      wait_for: { ref: 'css=.toast' },
+      timeout_ms: 250,
+    })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { found?: boolean; condition?: string; input_delivered?: string }
+    expect(data.found).toBe(false)
+    expect(data.condition).toBe('ref:css=.toast')
+    expect(data.input_delivered, 'the payload survives the throw').toBe('yes')
+  })
+
+  it('wait_for_ref on a click is satisfied by the element appearing', async () => {
+    setRefs(
+      TAB,
+      new Map([
+        ['e1', { backendNodeId: 100 }],
+        ['e2', { backendNodeId: 200 }],
+      ]),
+      TAB_URL,
+    )
+    installCdpMock()
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'click',
+      ref: '@e1',
+      wait_for: { ref: '@e2' },
+      timeout_ms: 500,
+    })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { condition?: string; found?: boolean }
+    expect(data.condition).toBe('ref:@e2')
+    expect(data.found).toBe(true)
+  })
+
+  it('a met condition does not cost navigation honesty: the commit is still awaited', async () => {
+    // The M6 case: a toast lands on the OUTGOING document (found at ~0ms)
+    // while the click's navigation is still in flight. An exemption keyed on
+    // "a wait ran" would skip the commit wait and report navigation_pending
+    // where the identical wait-less click reports navigated: true. The +15s
+    // transport slack pays for the honest answer; take it.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ bodyText: 'Saved' })
+      const nav = wireNav()
+      const flip = urlFlipsOnCommit('https://example.com/thanks')
+      nav.beforeNavigate({ tabId: TAB, url: 'https://example.com/thanks', frameId: 0 })
+      setTimeout(() => {
+        flip()
+        nav.committed({ tabId: TAB, url: 'https://example.com/thanks', frameId: 0 })
+      }, 30)
+
+      const pending = execAct({
+        tab_id: TAB,
+        action: 'click',
+        ref: '@e1',
+        wait_for: { text: 'Saved' },
+      })
+      await vi.advanceTimersByTimeAsync(100)
+      const result = await pending
+
+      expect(result.ok).toBe(true)
+      const data = result.data as {
+        found?: boolean
+        navigated?: boolean
+        url_changed?: boolean
+        url?: string
+      }
+      expect(data.found).toBe(true)
+      expect(data.navigated).toBe(true)
+      expect(data.url_changed).toBe(true)
+      expect(data.url).toBe('https://example.com/thanks')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a dialog opening during a fused wait is named, not burned through', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ bodyText: 'still loading' })
+    const confirm: StandingDialogT = {
+      type: 'confirm',
+      message: 'Delete this item?',
+      url: TAB_URL,
+      openedAt: Date.now(),
+      deadlineAt: Date.now() + 60_000,
+    }
+    vi.mocked(raceStandingDialog).mockResolvedValue({ kind: 'dialog', dialog: confirm })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'click',
+      ref: '@e1',
+      wait_for: { text: 'Done' },
+      timeout_ms: 500,
+    })
+
+    expect(result.ok, 'the input WAS delivered; the dialog is the story').toBe(true)
+    const data = result.data as { dialog?: { type?: string; message?: string; note?: string } }
+    expect(data.dialog?.type).toBe('confirm')
+    expect(data.dialog?.message).toBe('Delete this item?')
+    expect(data.dialog?.note).toMatch(/do not repeat the click/i)
+  })
+
+  it('a conclusively undelivered click does not burn the wait timeout first', async () => {
+    // Fake timers with no advance: running the 60s wait before the inevitable
+    // undelivered failure would hang this test red.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ deliveryCount: 0 })
+
+      const result = await execAct({
+        tab_id: TAB,
+        action: 'click',
+        ref: '@e1',
+        wait_for: { text: 'Done' },
+        timeout_ms: 60_000,
+      })
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/received no event/)
+      const data = result.data as Record<string, unknown>
+      expect('found' in data, 'no wait ran, so no wait outcome is claimed').toBe(false)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
 

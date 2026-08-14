@@ -1,4 +1,5 @@
 import type { CommandResult } from '../../shared/types'
+import { commitSeq, commitSince, navigationPending } from '../navWatch'
 
 /**
  * Run several commands in one round trip.
@@ -26,7 +27,10 @@ export interface BatchAction {
 interface BatchArgs {
   tab_id?: number
   actions?: BatchAction[]
-  /** Escape hatch for a sequence that deliberately spans a navigation. */
+  /**
+   * Escape hatch for a sequence that deliberately spans a navigation: a URL
+   * change, a same-URL reload, or a navigation still in flight at step end.
+   */
   continue_on_url_change?: boolean
 }
 
@@ -103,6 +107,8 @@ export async function execBatch(args: unknown, run: SingleRunner): Promise<Comma
     const action = actions[i]
     // A per-action tab_id may be present; otherwise inherit the batch's.
     const actionArgs = { tab_id: a.tab_id, ...(action.args ?? {}) }
+    const stepStart = Date.now()
+    const seqBefore = typeof a.tab_id === 'number' ? commitSeq(a.tab_id) : 0
     let result: CommandResult
     try {
       result = await run(action.type, actionArgs)
@@ -121,15 +127,80 @@ export async function execBatch(args: unknown, run: SingleRunner): Promise<Comma
       break
     }
 
-    const urlAfter = await urlOf(a.tab_id)
-    const navigated = Boolean(urlBefore && urlAfter && urlBefore !== urlAfter)
-    urlBefore = urlAfter
-    if (navigated && i < actions.length - 1 && !a.continue_on_url_change) {
+    // #168 gate: a step that armed a wait condition and did not see it is a
+    // checkpoint the agent asked for. The step itself succeeded (its input
+    // was delivered, which is why this is not the failure branch above); the
+    // remaining actions were written against a page state that never
+    // arrived, so they do not run. No escape hatch: the gate is armed
+    // explicitly per action, and not arming it is the bypass.
+    const d = result.data as Record<string, unknown> | undefined
+    if (
+      i < actions.length - 1 &&
+      action.type === 'act' &&
+      d &&
+      d.found === false &&
+      typeof d.condition === 'string'
+    ) {
       abortedReason =
-        `the page navigated to ${urlAfter} after action ${i + 1} ("${action.type}"). ` +
-        'The remaining actions were written against the previous page, so they were not run. ' +
-        'Read the new page and continue from there.'
+        `action ${i + 1} ("act") was delivered, but its wait condition (${d.condition}) ` +
+        'was not met. The remaining actions were written against a page state that never ' +
+        'arrived, so they were not run.'
       break
+    }
+    // The mirror of the gate: a MET condition is consent to whatever page
+    // change it implies. "Click sign in, wait for 'Welcome back'" names the
+    // navigation as the expected outcome, so aborting on it would refuse the
+    // exact sequence the agent wrote. Steps after a met condition run against
+    // the page state the agent asked to see.
+    const met =
+      action.type === 'act' && d !== undefined && d.found === true && typeof d.condition === 'string'
+
+    // A dialog left STANDING by a successful step stops the batch: every
+    // executor refuses on a standing dialog, so charging on only converts
+    // this named cause into a one-step-later refusal, and the tail would run
+    // against a page paused on a question the agent has not answered.
+    const dialog = d?.dialog as
+      | { state?: string; type?: string; message?: string; answer_with?: string }
+      | undefined
+    if (i < actions.length - 1 && dialog?.state === 'standing') {
+      abortedReason =
+        `action ${i + 1} ("${action.type}") left a ${dialog.type ?? 'page'} dialog standing` +
+        (dialog.message ? `: "${dialog.message}"` : '') +
+        '. The page is paused on it, so the remaining actions were not run. Answer it with ' +
+        `${dialog.answer_with ?? 'chrome_dialog'}, then continue from there.`
+      break
+    }
+
+    const urlAfter = await urlOf(a.tab_id)
+    // The browser-process record catches what a URL compare cannot: a
+    // same-URL commit (a reload) replaces the document and kills every ref
+    // minted before it. The compare stays because it catches what the record
+    // cannot: an SPA move changes the URL with no commit.
+    const urlChanged = Boolean(urlBefore && urlAfter && urlBefore !== urlAfter)
+    const committed = typeof a.tab_id === 'number' && Boolean(commitSince(a.tab_id, seqBefore))
+    const pending = typeof a.tab_id === 'number' ? navigationPending(a.tab_id, stepStart) : null
+    urlBefore = urlAfter
+    if (i < actions.length - 1 && !a.continue_on_url_change && !met) {
+      if (committed || urlChanged) {
+        abortedReason = urlChanged
+          ? `the page navigated to ${urlAfter} after action ${i + 1} ("${action.type}"). ` +
+            'The remaining actions were written against the previous page, so they were not run. ' +
+            'Read the new page and continue from there.'
+          : `a new document committed at ${urlAfter} after action ${i + 1} ("${action.type}") ` +
+            '(a reload: same URL, new page). The refs the remaining actions were written ' +
+            'against died with the old document, so they were not run. Re-read the page and ' +
+            'continue from there.'
+        break
+      }
+      // Started, not yet committed: the page is ABOUT to be replaced, which
+      // is the exact footgun the abort above exists for, one beat earlier.
+      if (pending) {
+        abortedReason =
+          `a navigation to ${pending.url} was still in flight after action ${i + 1} ` +
+          `("${action.type}"). The remaining actions were written against the previous page, ` +
+          'so they were not run. Read the new page once it arrives and continue from there.'
+        break
+      }
     }
   }
 

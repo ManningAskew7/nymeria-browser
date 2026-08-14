@@ -104,10 +104,13 @@ const MAX_CONSOLE_IN_RESULT = 5
  * case where the old payload was garbage (settle resolves 'quiet' on the
  * outgoing document at ~250ms, long before a real commit, so `url_changed`
  * read false on effectively every navigating click). The common
- * non-navigating act never enters this wait, and `action: "wait"` never
- * pays it either: its `timeout_ms` already spends the transport budget's
- * slack, and it has its own deadline and its own url condition (the +3s
- * here would blow the cross-repo budget contract in settle.ts).
+ * non-navigating act never enters this wait. Wait-carrying calls (#168,
+ * `action: "wait"` included) pay it like everyone else: the act transport
+ * budget reserves +15s beyond the agent's own timeout (chrome_browser.py
+ * sizes the override), so the bounded +3s fits, and exempting them was
+ * reviewed to cost exactly the honesty this record exists for (a navigating
+ * click with a met condition would report `navigation_pending` where its
+ * wait-less twin reports `navigated: true`).
  */
 const NAV_COMMIT_WAIT_MS = 3_000
 
@@ -794,7 +797,7 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
   // pays nothing. Any non-commit signal (abort, same-document move, tab
   // close) ends the wait early rather than riding it out.
   let commit = commitSince(v.tabId, v.navSeqBefore)
-  if (!commit && v.action !== 'wait' && navigationPending(v.tabId, v.startedAt)) {
+  if (!commit && navigationPending(v.tabId, v.startedAt)) {
     const signal = await waitForNavSignal(v.tabId, v.navSeqBefore, v.startedAt, NAV_COMMIT_WAIT_MS)
     if (signal?.kind === 'commit') commit = { url: signal.url, seq: signal.seq }
   }
@@ -866,23 +869,26 @@ async function performWait(
   timeoutMs: number,
 ): Promise<{ found: boolean; condition: string }> {
   const deadline = Date.now() + timeoutMs
-  const condition = waitFor?.text
-    ? `text:${waitFor.text}`
-    : waitFor?.ref
-      ? `ref:${waitFor.ref}`
-      : waitFor?.url_contains
-        ? `url_contains:${waitFor.url_contains}`
-        : 'settle'
+  // Conditions are OR'd: the first to hold wins and is the one NAMED, so a
+  // `found: true` is never a claim about a condition that was not met. Only
+  // a timeout names them all.
+  const parts: string[] = []
+  if (waitFor?.text) parts.push(`text:${waitFor.text}`)
+  if (waitFor?.ref) parts.push(`ref:${waitFor.ref}`)
+  if (waitFor?.url_contains) parts.push(`url_contains:${waitFor.url_contains}`)
 
-  if (!waitFor || (!waitFor.text && !waitFor.ref && !waitFor.url_contains)) {
+  if (!waitFor || parts.length === 0) {
     const result = await settle(tabId, { maxMs: timeoutMs })
-    return { found: result.settled, condition }
+    return { found: result.settled, condition: 'settle' }
   }
+  const allConditions = parts.join(' | ')
 
   for (;;) {
     if (waitFor.url_contains) {
       const url = await currentUrl(tabId)
-      if (url && url.includes(waitFor.url_contains)) return { found: true, condition }
+      if (url && url.includes(waitFor.url_contains)) {
+        return { found: true, condition: `url_contains:${waitFor.url_contains}` }
+      }
     }
     if (waitFor.text) {
       try {
@@ -890,20 +896,28 @@ async function performWait(
           expression: `document.body ? document.body.innerText.includes(${JSON.stringify(waitFor.text)}) : false`,
           returnByValue: true,
         })
-        if (resp.result?.value === true) return { found: true, condition }
+        if (resp.result?.value === true) return { found: true, condition: `text:${waitFor.text}` }
       } catch {
         // Context churn mid-wait: keep polling until the deadline.
       }
     }
     if (waitFor.ref) {
-      const url = await currentUrl(tabId)
-      const target = await resolveTarget(tabId, waitFor.ref, url)
-      if (target.ok) {
-        const connected = await stillConnected(tabId, target.objectId)
-        if (connected !== false) return { found: true, condition }
+      try {
+        const url = await currentUrl(tabId)
+        const target = await resolveTarget(tabId, waitFor.ref, url)
+        if (target.ok) {
+          const connected = await stillConnected(tabId, target.objectId)
+          if (connected !== false) return { found: true, condition: `ref:${waitFor.ref}` }
+        }
+      } catch {
+        // Same class as the text branch, and it matters more here: a `css=`
+        // resolve is a bare evaluate that rejects during a navigation or a
+        // debugger detach, and post-#168 this loop runs AFTER input was
+        // dispatched, so a throw escaping it would lose the verification
+        // payload and read as "nothing was sent". Keep polling instead.
       }
     }
-    if (Date.now() >= deadline) return { found: false, condition }
+    if (Date.now() >= deadline) return { found: false, condition: allConditions }
     await new Promise((r) => setTimeout(r, WAIT_POLL_MS))
   }
 }
@@ -960,7 +974,12 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     // the moment it opens.
     const raced = await raceStandingDialog(
       tabId,
-      performWait(tabId, a.wait_for, a.timeout_ms ?? DEFAULT_WAIT_MS),
+      performWait(
+        tabId,
+        a.wait_for,
+        // timeout_ms <= 0 is treated as unset, matching the backend's reading.
+        typeof a.timeout_ms === 'number' && a.timeout_ms > 0 ? a.timeout_ms : DEFAULT_WAIT_MS,
+      ),
     )
     if (raced.kind === 'dialog') {
       const d = raced.dialog
@@ -1577,7 +1596,36 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     }
   }
 
-  const settleResult = await settle(tabId)
+  // #168: `timeout_ms` WITHOUT a condition is a patience knob, not a named
+  // outcome. It widens this one settle window (one probe, one verdict, under
+  // `settled`) and deliberately emits no `condition`/`found`, so mere page
+  // quiescence can never gate a batch. Raced because the widened window is
+  // agent-sized: a dialog opening mid-settle would otherwise block its whole
+  // length before being named. timeout_ms <= 0 is treated as unset, matching
+  // the backend's own reading. Not widened when delivery already conclusively
+  // failed: the failure below is the story.
+  const hasWaitCondition = Boolean(
+    a.wait_for && (a.wait_for.text || a.wait_for.ref || a.wait_for.url_contains),
+  )
+  const agentTimeoutMs = typeof a.timeout_ms === 'number' && a.timeout_ms > 0 ? a.timeout_ms : null
+  let settleResult: SettleResult
+  if (!hasWaitCondition && agentTimeoutMs !== null && delivered !== 'no') {
+    const racedSettle = await raceStandingDialog(tabId, settle(tabId, { maxMs: agentTimeoutMs }))
+    if (racedSettle.kind === 'dialog') {
+      return pendingDialogResult(
+        a.action,
+        target,
+        tabId,
+        racedSettle.dialog,
+        inputMode,
+        startedAt,
+        extra,
+      )
+    }
+    settleResult = racedSettle.value
+  } else {
+    settleResult = await settle(tabId)
+  }
   // A dialog can open DURING settle too (a deferred handler); the check must
   // come before `buildVerification`, whose probes are renderer-bound and
   // would each ride their deadline against the suspended page.
@@ -1586,6 +1634,27 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     if (late) {
       return pendingDialogResult(a.action, target, tabId, late, inputMode, startedAt, extra)
     }
+  }
+  // #168: a NAMED wait condition is honoured here, after settle and with no
+  // dialog standing, so it is judged against the page the act produced. A
+  // condition already true costs one poll (~0ms). Skipped when the act has
+  // already conclusively failed (undelivered input, an intercepted chooser):
+  // the failure below is the story, and the wait would burn its whole
+  // timeout learning nothing. Dialog-raced for the same reason the wait
+  // branch is: the poll's evaluates would queue behind a suspended renderer
+  // and spend the timeout on a cause known by name the moment it opened.
+  if (hasWaitCondition && delivered !== 'no' && !chooserInterceptedSince(tabId, startedAt)) {
+    const waitStart = Date.now()
+    const raced = await raceStandingDialog(
+      tabId,
+      performWait(tabId, a.wait_for, agentTimeoutMs ?? DEFAULT_WAIT_MS),
+    )
+    if (raced.kind === 'dialog') {
+      return pendingDialogResult(a.action, target, tabId, raced.dialog, inputMode, startedAt, extra)
+    }
+    extra.condition = raced.value.condition
+    extra.found = raced.value.found
+    extra.waited_ms = Date.now() - waitStart
   }
   // A dialog that opened and already resolved during this act is reported as
   // history: the auto-acknowledged alert is the everyday case, a user

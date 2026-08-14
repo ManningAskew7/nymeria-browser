@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import type { CommandResult } from '../../shared/types'
 import { execBatch, MAX_BATCH_ACTIONS } from './batch'
+import { installNavWatch, resetForTests as resetNavWatch } from '../navWatch'
 
 const TAB = 1
 
@@ -23,7 +24,23 @@ function scriptUrls(urls: string[]): void {
   })
 }
 
+/** Wire navWatch and hand back its webNavigation listeners for firing. */
+function wireNav() {
+  installNavWatch()
+  const last = (fn: unknown) =>
+    (fn as ReturnType<typeof vi.fn>).mock.calls.at(-1)?.[0] as (details: {
+      tabId: number
+      url: string
+      frameId: number
+    }) => void
+  return {
+    beforeNavigate: last(chrome.webNavigation!.onBeforeNavigate.addListener),
+    committed: last(chrome.webNavigation!.onCommitted.addListener),
+  }
+}
+
 beforeEach(() => {
+  resetNavWatch()
   scriptUrls(['https://example.com'])
 })
 
@@ -118,6 +135,171 @@ describe('execBatch', () => {
         actions: [{ type: 'act' }, { type: 'act' }],
         continue_on_url_change: true,
       },
+      run,
+    )
+
+    expect(result.ok).toBe(true)
+    expect(run).toHaveBeenCalledTimes(2)
+  })
+
+  it('stops at an unmet wait condition: the gate the agent armed (#168)', async () => {
+    const run = vi.fn(async (type: string) =>
+      okResult(type === 'act' ? { found: false, condition: 'text:Order confirmed' } : {}),
+    )
+
+    const result = await execBatch(
+      { tab_id: TAB, actions: [{ type: 'act' }, { type: 'snapshot' }, { type: 'act' }] },
+      run,
+    )
+
+    expect(result.ok).toBe(false)
+    const data = result.data as {
+      results: { ok: boolean }[]
+      aborted: string
+      completed: number
+      remaining: number
+    }
+    expect(data.aborted).toMatch(/wait condition \(text:Order confirmed\) was not met/)
+    expect(data.results[0].ok, 'the act itself succeeded; the gate is not its failure').toBe(true)
+    expect(data.completed).toBe(1)
+    expect(data.remaining).toBe(2)
+    expect(run).toHaveBeenCalledTimes(1)
+  })
+
+  it('an unmet condition on the last action gates nothing', async () => {
+    const run = vi.fn(async () => okResult({ found: false, condition: 'text:x' }))
+
+    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }] }, run)
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { aborted?: string }).aborted).toBeUndefined()
+  })
+
+  it('a met condition does not stop the batch', async () => {
+    const run = vi.fn(async () => okResult({ found: true, condition: 'text:Saved' }))
+
+    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }, { type: 'act' }] }, run)
+
+    expect(result.ok).toBe(true)
+    expect(run).toHaveBeenCalledTimes(2)
+  })
+
+  it('a met condition carries the batch across the navigation it implies', async () => {
+    // "Click sign in, wait for 'Welcome back', then act on the new page" is
+    // the canonical sequence. The met condition IS the consent: aborting on
+    // the very navigation the agent named as the expected outcome would
+    // refuse the sequence the feature was built for.
+    let url = 'https://example.com/login'
+    const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
+    get.mockImplementation(async () => ({ id: TAB, url }))
+    const nav = wireNav()
+    const run = vi.fn(async (_type: string, args: unknown) => {
+      const a = args as { wait_for?: { text?: string } }
+      if (a.wait_for?.text) {
+        url = 'https://example.com/home'
+        nav.committed({ tabId: TAB, url, frameId: 0 })
+        return okResult({ found: true, condition: `text:${a.wait_for.text}` })
+      }
+      return okResult({})
+    })
+
+    const result = await execBatch(
+      {
+        tab_id: TAB,
+        actions: [
+          { type: 'act', args: { action: 'click', wait_for: { text: 'Welcome back' } } },
+          { type: 'act', args: { action: 'click', coordinate: [10, 10] } },
+        ],
+      },
+      run,
+    )
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { aborted?: string }).aborted).toBeUndefined()
+    expect(run).toHaveBeenCalledTimes(2)
+  })
+
+  it('a step that leaves a dialog standing stops the batch with the answer route', async () => {
+    // Every executor refuses on a standing dialog, so charging on would only
+    // convert this named cause into a one-step-later refusal, with the tail
+    // aimed at a page paused on an unanswered question.
+    const run = vi.fn(async () =>
+      okResult({
+        dialog: {
+          state: 'standing',
+          type: 'confirm',
+          message: 'Delete this item?',
+          answer_with: 'chrome_dialog(tab_id=1, action="accept" or "dismiss")',
+        },
+      }),
+    )
+
+    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }, { type: 'act' }] }, run)
+
+    expect(result.ok).toBe(false)
+    const data = result.data as { aborted: string }
+    expect(data.aborted).toMatch(/confirm dialog standing/)
+    expect(data.aborted).toMatch(/Delete this item\?/)
+    expect(data.aborted).toMatch(/chrome_dialog\(tab_id=1/)
+    expect(run).toHaveBeenCalledTimes(1)
+  })
+
+  it('a RESOLVED dialog in the payload does not stop the batch', async () => {
+    // An auto-acknowledged alert is history, not a standing question.
+    const run = vi.fn(async () =>
+      okResult({ dialog: { state: 'resolved', type: 'alert', message: 'Saved!' } }),
+    )
+
+    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }, { type: 'act' }] }, run)
+
+    expect(result.ok).toBe(true)
+    expect(run).toHaveBeenCalledTimes(2)
+  })
+
+  it('a same-URL commit (reload) aborts the remainder: refs died with the document', async () => {
+    scriptUrls(['https://example.com/cart'])
+    const nav = wireNav()
+    const run = vi.fn(async () => {
+      nav.committed({ tabId: TAB, url: 'https://example.com/cart', frameId: 0 })
+      return okResult()
+    })
+
+    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }, { type: 'act' }] }, run)
+
+    expect(result.ok).toBe(false)
+    const data = result.data as { aborted: string }
+    expect(data.aborted).toMatch(/same URL, new page/)
+    expect(run).toHaveBeenCalledTimes(1)
+  })
+
+  it('a navigation still in flight at step end stops the batch a beat early', async () => {
+    scriptUrls(['https://example.com/cart'])
+    const nav = wireNav()
+    const run = vi.fn(async () => {
+      nav.beforeNavigate({ tabId: TAB, url: 'https://slow.example/next', frameId: 0 })
+      return okResult()
+    })
+
+    const result = await execBatch({ tab_id: TAB, actions: [{ type: 'act' }, { type: 'act' }] }, run)
+
+    expect(result.ok).toBe(false)
+    const data = result.data as { aborted: string }
+    expect(data.aborted).toMatch(/still in flight/)
+    expect(data.aborted).toMatch(/slow\.example\/next/)
+    expect(run).toHaveBeenCalledTimes(1)
+  })
+
+  it('continue_on_url_change also spans a reload and an in-flight navigation', async () => {
+    scriptUrls(['https://example.com/cart'])
+    const nav = wireNav()
+    const run = vi.fn(async () => {
+      nav.committed({ tabId: TAB, url: 'https://example.com/cart', frameId: 0 })
+      nav.beforeNavigate({ tabId: TAB, url: 'https://slow.example/next', frameId: 0 })
+      return okResult()
+    })
+
+    const result = await execBatch(
+      { tab_id: TAB, actions: [{ type: 'act' }, { type: 'act' }], continue_on_url_change: true },
       run,
     )
 
