@@ -1,9 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   dispatchKey,
+  FOCUS_LANDED_FN,
+  HIT_TEST_FN,
   InputDispatchStalled,
   insertText,
   modifierMask,
+  TEXT_ENTRY_FN,
   trustedClick,
   trustedHover,
   trustedWheel,
@@ -390,5 +393,129 @@ describe('dispatch ack deadline', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+/**
+ * The three in-page function strings below run for real here (happy-dom),
+ * because #160 flagged exactly this class of gap: a probe string no test
+ * ever executes is unverified logic wearing a tested function's name.
+ */
+function pageFn<T>(src: string): (this: Element, ...args: unknown[]) => T {
+  return new Function(`return (${src})`)() as (this: Element, ...args: unknown[]) => T
+}
+
+describe('hitTest containment (executed in-page fn)', () => {
+  const hitTestFn = pageFn<{ hit: boolean; blocker?: string }>(HIT_TEST_FN)
+
+  function domWithTopmost(topmost: Element | null) {
+    ;(document as unknown as { elementFromPoint: () => Element | null }).elementFromPoint = () =>
+      topmost
+  }
+
+  beforeEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  it('accepts the target itself, a descendant, and an ancestor', () => {
+    document.body.innerHTML = '<div id="wrap"><button id="btn"><span id="icon"></span></button></div>'
+    const wrap = document.getElementById('wrap') as Element
+    const btn = document.getElementById('btn') as Element
+    const icon = document.getElementById('icon') as Element
+
+    domWithTopmost(btn)
+    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true })
+    domWithTopmost(icon)
+    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true })
+    domWithTopmost(wrap)
+    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true })
+  })
+
+  it('names a sibling blocker by tag, id, and first two classes', () => {
+    // The CodeMirror 5 shape: render surface and hidden textarea are
+    // siblings, so neither containment direction can accept it.
+    document.body.innerHTML =
+      '<div><textarea id="cm-input"></textarea><pre id="line1" class="CodeMirror-line cm-text extra"></pre></div>'
+    const textarea = document.getElementById('cm-input') as Element
+    const pre = document.getElementById('line1') as Element
+
+    domWithTopmost(pre)
+    expect(hitTestFn.call(textarea, 1, 1)).toEqual({
+      hit: false,
+      blocker: 'pre#line1.CodeMirror-line.cm-text',
+    })
+  })
+
+  it('reports nothing-at-point as offscreen rather than as a blocker', () => {
+    document.body.innerHTML = '<button id="btn"></button>'
+    domWithTopmost(null)
+    const out = hitTestFn.call(document.getElementById('btn') as Element, 1, 1)
+    expect(out.hit).toBe(false)
+    expect(out.blocker).toMatch(/offscreen/)
+  })
+})
+
+describe('text-entry classification (executed in-page fn)', () => {
+  const isTextEntry = pageFn<boolean>(TEXT_ENTRY_FN)
+
+  function el(html: string): Element {
+    document.body.innerHTML = html
+    return document.body.firstElementChild as Element
+  }
+
+  it('accepts the text-entry family: textarea, text-like inputs, contenteditable, textbox roles', () => {
+    expect(isTextEntry.call(el('<textarea></textarea>'))).toBe(true)
+    expect(isTextEntry.call(el('<input type="text">'))).toBe(true)
+    expect(isTextEntry.call(el('<input type="email">'))).toBe(true)
+    expect(isTextEntry.call(el('<input>'))).toBe(true)
+    expect(isTextEntry.call(el('<div contenteditable="true"></div>'))).toBe(true)
+    expect(isTextEntry.call(el('<div role="textbox"></div>'))).toBe(true)
+    expect(isTextEntry.call(el('<div role="searchbox"></div>'))).toBe(true)
+  })
+
+  it('rejects everything a covered click must still refuse on: buttons, checkboxes, plain elements', () => {
+    expect(isTextEntry.call(el('<button></button>'))).toBe(false)
+    expect(isTextEntry.call(el('<input type="checkbox">'))).toBe(false)
+    expect(isTextEntry.call(el('<input type="radio">'))).toBe(false)
+    expect(isTextEntry.call(el('<input type="submit">'))).toBe(false)
+    expect(isTextEntry.call(el('<input type="file">'))).toBe(false)
+    expect(isTextEntry.call(el('<div></div>'))).toBe(false)
+    expect(isTextEntry.call(el('<a href="#"></a>'))).toBe(false)
+  })
+})
+
+describe('focus landed (executed in-page fn)', () => {
+  const focusLanded = pageFn<boolean>(FOCUS_LANDED_FN)
+
+  it('is true when focus is on the target or inside it', () => {
+    document.body.innerHTML =
+      '<div id="editor"><textarea id="inner"></textarea></div><input id="other">'
+    const editor = document.getElementById('editor') as Element
+    const inner = document.getElementById('inner') as HTMLElement
+
+    inner.focus()
+    expect(focusLanded.call(inner)).toBe(true)
+    expect(focusLanded.call(editor), 'focus inside the target counts').toBe(true)
+  })
+
+  it('is false when nothing is focused at all (activeElement is body)', () => {
+    // The vacuous-truth trap: with nothing focused, document.activeElement is
+    // body, and body.contains(target) is true for every light-DOM target. A
+    // non-focusable overlay (a plain div banner) that swallows the click
+    // leaves focus exactly there, and this must read as a miss, not a landing.
+    document.body.innerHTML = '<textarea id="cm"></textarea><div id="banner"></div>'
+    const cm = document.getElementById('cm') as Element
+    ;(document.activeElement as HTMLElement | null)?.blur?.()
+
+    expect(focusLanded.call(cm)).toBe(false)
+  })
+
+  it('is false when focus went somewhere unrelated', () => {
+    document.body.innerHTML = '<textarea id="cm"></textarea><input id="other">'
+    const cm = document.getElementById('cm') as Element
+    const other = document.getElementById('other') as HTMLElement
+
+    other.focus()
+    expect(focusLanded.call(cm)).toBe(false)
   })
 })

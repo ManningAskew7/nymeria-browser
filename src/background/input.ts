@@ -281,6 +281,19 @@ export interface HitTest {
   blocker?: string
 }
 
+/** In-page body of `hitTest`, exported so its containment logic is testable
+ *  as executed code rather than an unexercised string. */
+export const HIT_TEST_FN = `function(x, y){
+  const top = document.elementFromPoint(x, y);
+  if (!top) return { hit: false, blocker: 'nothing at point (offscreen?)' };
+  if (top === this || this.contains(top) || top.contains(this)) return { hit: true };
+  const id = top.id ? '#' + top.id : '';
+  const cls = typeof top.className === 'string' && top.className
+    ? '.' + top.className.trim().split(/\\s+/).slice(0, 2).join('.')
+    : '';
+  return { hit: false, blocker: top.tagName.toLowerCase() + id + cls };
+}`
+
 /**
  * Does a click at `point` actually land on this element?
  *
@@ -288,23 +301,62 @@ export interface HitTest {
  * point is the difference between "clicked the thing" and "clicked the
  * overlay and reported success". Naming the interceptor lets the agent
  * dismiss it instead of retrying blindly.
+ *
+ * Containment in EITHER direction counts as a hit; what it cannot see is a
+ * SIBLING that fronts for the target (a hidden-textarea editor's render
+ * surface, a styled checkbox's span). The click guard in act.ts owns that
+ * case: text-entry targets get the click delivered and verified by focus,
+ * everything else gets a refusal that teaches the deliberate click-through.
  */
 export async function hitTest(target: Cdp, objectId: string, point: Point): Promise<HitTest> {
-  return callOn<HitTest>(
-    target,
-    objectId,
-    `function(x, y){
-      const top = document.elementFromPoint(x, y);
-      if (!top) return { hit: false, blocker: 'nothing at point (offscreen?)' };
-      if (top === this || this.contains(top) || top.contains(this)) return { hit: true };
-      const id = top.id ? '#' + top.id : '';
-      const cls = typeof top.className === 'string' && top.className
-        ? '.' + top.className.trim().split(/\\s+/).slice(0, 2).join('.')
-        : '';
-      return { hit: false, blocker: top.tagName.toLowerCase() + id + cls };
-    }`,
-    [point.x, point.y],
-  )
+  return callOn<HitTest>(target, objectId, HIT_TEST_FN, [point.x, point.y])
+}
+
+/** In-page body of `textEntryTarget`. Keys on what the AX tree can actually
+ *  mint a ref to: tag semantics or an explicit role attribute (a div only
+ *  computes to an AX textbox via role=), plus contenteditable, which covers
+ *  CodeMirror 6. Only CodeMirror 5 still uses the hidden-textarea pattern;
+ *  Monaco's EditContext div rides the role branch. */
+export const TEXT_ENTRY_FN = `function(){
+  const tag = (this.tagName || '').toLowerCase();
+  if (tag === 'textarea') return true;
+  
+  if (tag === 'input') {
+    const t = (this.type || 'text').toLowerCase();
+    return ['button','submit','reset','checkbox','radio','image','file','range','color'].indexOf(t) === -1;
+  }
+  if (this.isContentEditable) return true;
+  const role = ((this.getAttribute && this.getAttribute('role')) || '').toLowerCase();
+  return ['textbox','searchbox','combobox'].indexOf(role) !== -1;
+}`
+
+/** Is this element a text-entry control (the class whose covered clicks are
+ *  delivered and verified rather than refused)? */
+export async function textEntryTarget(target: Cdp, objectId: string): Promise<boolean> {
+  return callOn<boolean>(target, objectId, TEXT_ENTRY_FN)
+}
+
+/** In-page body of `focusLandedIn`: did focus end up on, inside, or wrapping
+ *  this element? `getRootNode()` first so a target inside a shadow root reads
+ *  its own root's activeElement (document.activeElement stops at the host). */
+export const FOCUS_LANDED_FN = `function(){
+  const root = this.getRootNode ? this.getRootNode() : document;
+  const a = (root && root.activeElement) || document.activeElement;
+  if (!a || a === document.body || a === document.documentElement) return false;
+  return a === this || this.contains(a) || a.contains(this);
+}`
+
+/**
+ * The outcome check behind a clicked-through covered click: editors route a
+ * click on their render surface to their real input themselves (CM5 focuses
+ * its hidden textarea in its own mousedown handler), so focus landing in the
+ * target is the click having worked, and focus anywhere else means the
+ * covering element likely consumed it. Measured against Claude for Chrome's
+ * harness 2026-08-14: its unverified version types into the void when an
+ * editor mis-routes, with a confident success message.
+ */
+export async function focusLandedIn(target: Cdp, objectId: string): Promise<boolean> {
+  return callOn<boolean>(target, objectId, FOCUS_LANDED_FN)
 }
 
 /** Bitfield of buttons currently HELD, which is not the same as the button

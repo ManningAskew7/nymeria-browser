@@ -77,6 +77,12 @@ interface MockOptions {
   fileChooserOpened?: boolean
   /** What `elementFromPoint` finds under a bare coordinate. */
   pointDescription?: string
+  /** true classifies the ref'd element as a text-entry control (#174). */
+  textEntry?: boolean
+  /** Whether focus landed in the target after a clicked-through covered click. */
+  focusLanded?: boolean
+  /** Thrown by the focus read, to model a context destroyed by a navigation. */
+  focusReadThrows?: string
   /** true models a document containing iframes, where the probe sees one only. */
   pageHasFrames?: boolean
   /** false models a target inside an iframe the probe never watched. */
@@ -110,6 +116,9 @@ function installCdpMock(opts: MockOptions = {}) {
     pointDescription = 'body',
     pageHasFrames = false,
     targetInTopDocument = true,
+    textEntry = false,
+    focusLanded = true,
+    focusReadThrows,
   } = opts
   const PROBE_CONTEXT = 77
   let dispatched = false
@@ -146,6 +155,11 @@ function installCdpMock(opts: MockOptions = {}) {
         return { result: { value: geometry } }
       }
       if (fn.includes('const isFile =')) return { result: { value: isFileInput } }
+      if (fn.includes('isContentEditable')) return { result: { value: textEntry } }
+      if (fn.includes('activeElement')) {
+        if (focusReadThrows) throw new Error(focusReadThrows)
+        return { result: { value: focusLanded } }
+      }
       if (fn.includes('elementFromPoint')) return { result: { value: hit } }
       if (fn.includes('isConnected')) {
         if (connectedThrows === 'timeout') throw new CdpCallTimeout('Runtime.callFunctionOn', 15_000)
@@ -280,6 +294,86 @@ describe('trusted input', () => {
     expect((result.data as { intercepted_by: string }).intercepted_by).toBe('div#cookie-banner')
     // Nothing was clicked: refusing beats clicking the overlay.
     expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('teaches the deliberate click-through in the refusal: the exact coordinate, both readings', async () => {
+    // #174: the guard cannot tell a genuine overlay from the target's own
+    // widget fronting for it (a styled checkbox's span), so the refusal must
+    // hand over both exits rather than dead-ending on "dismiss the overlay".
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({ hit: { hit: false, blocker: 'span.styled-box' } })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    // Default mock geometry centers on (50, 60).
+    expect(result.error).toMatch(/coordinate=\[50, 60\]/)
+    expect(result.error).toMatch(/target's own widget/)
+    expect((result.data as { click_point: number[] }).click_point).toEqual([50, 60])
+  })
+
+  it('delivers a covered click on a text-entry target and verifies it by focus (#174)', async () => {
+    // The CodePen case: CodeMirror 5's render surface (`pre.CodeMirror-line`)
+    // is a SIBLING of the hidden textarea the ref resolves to, so containment
+    // can never accept it. The editor routes a surface click to its input in
+    // its own mousedown handler; refusing was blocking a click that works.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({
+      hit: { hit: false, blocker: 'pre.CodeMirror-line' },
+      textEntry: true,
+      focusLanded: true,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+    const data = result.data as { input: string; clicked_through: string }
+    expect(data.input).toBe('trusted')
+    expect(data.clicked_through).toBe('pre.CodeMirror-line')
+  })
+
+  it('keeps the clicked-through result honest when the page dies under the focus read', async () => {
+    // A navigation or re-render destroys the execution context mid-read. The
+    // click still went out; a raw "Cannot find context" error would hide that
+    // and blaming the blocker would be a guess.
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock({
+      hit: { hit: false, blocker: 'pre.CodeMirror-line' },
+      textEntry: true,
+      focusReadThrows: 'Cannot find context with specified id',
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/was delivered/)
+    expect(result.error).toMatch(/page changed before/)
+    expect(result.error).not.toMatch(/Cannot find context/)
+    expect((result.data as { click_delivered: boolean }).click_delivered).toBe(true)
+  })
+
+  it('reports a clicked-through covered click honestly when focus never reaches the target', async () => {
+    // A genuine overlay over a text field: the click was delivered (that is a
+    // side effect the agent must know about) but the covering element likely
+    // consumed it. Claude for Chrome's unverified version of this path types
+    // into the void with a confident success message (measured 2026-08-14).
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({
+      hit: { hit: false, blocker: 'div#signup-modal' },
+      textEntry: true,
+      focusLanded: false,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/focus did not land/)
+    expect(result.error).toMatch(/Re-read the page/)
+    // The click DID go out: the payload must own the side effect.
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+    expect((result.data as { click_delivered: boolean }).click_delivered).toBe(true)
+    expect((result.data as { intercepted_by: string }).intercepted_by).toBe('div#signup-modal')
   })
 
   it('fills by inserting text into the focused element and reports the previous value', async () => {
@@ -548,6 +642,23 @@ describe('execAct target resolution', () => {
         ),
     )
     expect(forced, 'must not fall back to forcing the property').toBe(false)
+  })
+
+  it('teaches check/uncheck an exit they can actually take: a coordinate CLICK, not a coordinate check', async () => {
+    // check/uncheck are ref-only verbs (NEEDS_TARGET, not coordinate-capable),
+    // so "repeat the check with coordinate=..." would be refused on arrival.
+    // The styled-checkbox exit is a plain click on the covering element, then
+    // a state read to confirm the toggle.
+    installCdpMock({ hit: { hit: false, blocker: 'span.styled-box' }, value: null })
+    setRefs(TAB, new Map([['e1', { backendNodeId: 77 }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/action="click"/)
+    expect(result.error).toMatch(/coordinate=\[50, 60\]/)
+    expect(result.error).not.toMatch(/repeat the check with coordinate/)
+    expect(result.error).toMatch(/confirm/)
   })
 })
 

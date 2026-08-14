@@ -8,8 +8,10 @@ import {
   dispatchKey,
   elementGeometry,
   focusElement,
+  focusLandedIn,
   hitTest,
   InputDispatchStalled,
+  textEntryTarget,
   insertText,
   modifierMask,
   frameOffset,
@@ -438,6 +440,61 @@ function fileChooserInterceptedError(action: ActionName, target: string | null):
     'this control (usually hidden, so pass a css= ref) and use ' +
     'chrome_act(action="upload", ref=..., path="..."), which puts the file ' +
     'straight into the input.'
+  )
+}
+
+/**
+ * A covered point on a target that is NOT text entry: refuse, but teach both
+ * exits (#174). The blocker may be a genuine overlay, or it may be the
+ * target's own widget fronting for it (a styled checkbox's span, an editor
+ * render surface on a target the classifier missed), and the guard cannot
+ * tell those apart, so the copy names both and hands over the exact
+ * coordinate for a deliberate click-through instead of dead-ending.
+ */
+function coveredPointError(
+  action: ActionName,
+  target: string | null,
+  blocker: string | undefined,
+  point: { x: number; y: number },
+): string {
+  const x = Math.round(point.x)
+  const y = Math.round(point.y)
+  // check/uncheck are ref-only verbs, so "repeat with coordinate" would be
+  // refused on arrival; their exit is a plain click plus a state read.
+  const override =
+    action === 'check' || action === 'uncheck'
+      ? `click it deliberately with action="click" and coordinate=[${x}, ${y}] ` +
+        '(no ref), then re-read the control to confirm its state changed'
+      : `repeat the ${action} with coordinate=[${x}, ${y}] and no ref to ` +
+        'click it deliberately. For text entry, fill or type on the ref ' +
+        'works without any click'
+  return (
+    `the ${action} point for ${target ?? 'that element'} is covered by ` +
+    `${blocker ?? 'another element'}. If that is a real overlay (cookie ` +
+    'banner, modal, sticky header), dismiss it or scroll it out of the way ' +
+    "and retry. If it looks like part of the target's own widget (a styled " +
+    `control, an editor surface), the covering element is what a person ` +
+    `would click: ${override}.`
+  )
+}
+
+/**
+ * The covered click on a TEXT-ENTRY target was delivered (editors route a
+ * surface click to their real input themselves, so refusing was the wrong
+ * move) but focus did not land in the target, which is the one observable
+ * that separates "the editor took it" from "the covering element consumed
+ * it". Honest failure, side effect included: the click happened.
+ */
+function clickedThroughButFocusMissedError(
+  action: ActionName,
+  target: string | null,
+  blocker: string | undefined,
+): string {
+  return (
+    `the ${action} was delivered at ${target ?? 'the target'}'s point, but ` +
+    `${blocker ?? 'a covering element'} was over it and focus did not land ` +
+    'in the target, so the covering element likely received the click. ' +
+    'Re-read the page to see what changed before retrying or typing.'
   )
 }
 
@@ -1024,23 +1081,76 @@ export async function execAct(args: unknown): Promise<CommandResult> {
           await scrollIntoView(elementSession, objectId)
           const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
+            const composed = await dispatchPoint(geo.point)
             const ht = await hitTest(elementSession, objectId, geo.point)
+            let clickThrough: string | null = null
             if (!ht.hit) {
-              return {
-                ok: false,
-                status: 'error',
-                error:
-                  `the click point for ${target} is covered by ${ht.blocker ?? 'another element'}. ` +
-                  'Dismiss the overlay (or scroll it out of the way) and retry.',
-                data: { intercepted_by: ht.blocker ?? null },
+              // #174: a hidden-input editor's render surface (CodeMirror 5,
+              // Monaco) is a SIBLING of the real input, so containment can
+              // never accept it. A click there is exactly what a person
+              // does, and the editor routes it to its input itself; for
+              // text-entry targets deliver the click and verify by focus.
+              // Everything else keeps the refusal, which now teaches the
+              // deliberate click-through instead of dead-ending.
+              const textEntry = await textEntryTarget(elementSession, objectId)
+              if (!textEntry) {
+                return {
+                  ok: false,
+                  status: 'error',
+                  error: coveredPointError(a.action, target, ht.blocker, composed),
+                  data: {
+                    intercepted_by: ht.blocker ?? null,
+                    click_point: [Math.round(composed.x), Math.round(composed.y)],
+                  },
+                }
               }
+              clickThrough = ht.blocker ?? 'a covering element'
             }
-            await trustedClick(tabId, await dispatchPoint(geo.point), {
+            await trustedClick(tabId, composed, {
               button,
               clickCount,
               modifiers,
             })
             inputMode = 'trusted'
+            if (clickThrough) {
+              // A beat first: editors focus their input synchronously in
+              // their own mousedown handler, but some defer to a queued
+              // task, and reading focus before it runs would fail an
+              // otherwise-good click.
+              await new Promise((resolve) => setTimeout(resolve, 100))
+              // Deadlined like the check/uncheck read-back: a click that
+              // raises a dialog asynchronously would park this read for the
+              // whole transport timeout, and a stall here means the click
+              // landed, which is what the caught error reports.
+              let landed: boolean
+              try {
+                landed = await ackWithinDeadline(focusLandedIn(elementSession, objectId))
+              } catch (e) {
+                if (e instanceof InputDispatchStalled) throw e
+                // The context died under the read (a navigation or re-render,
+                // possibly caused by the click itself). The click went out;
+                // the outcome is unknown; blaming the blocker would be a
+                // guess. Say exactly what is known.
+                return {
+                  ok: false,
+                  status: 'error',
+                  error:
+                    `the ${a.action} was delivered, but the page changed before its ` +
+                    'outcome could be verified (a navigation or re-render). Re-read ' +
+                    `the page to see what happened before repeating the ${a.action}.`,
+                  data: { intercepted_by: ht.blocker ?? null, click_delivered: true },
+                }
+              }
+              if (!landed) {
+                return {
+                  ok: false,
+                  status: 'error',
+                  error: clickedThroughButFocusMissedError(a.action, target, ht.blocker),
+                  data: { intercepted_by: ht.blocker ?? null, click_delivered: true },
+                }
+              }
+              extra.clicked_through = clickThrough
+            }
           } else {
             // No layout box (hidden, zero-size). Synthetic dispatch is the only
             // way in, and the result says so rather than implying a real click.
@@ -1152,18 +1262,24 @@ export async function execAct(args: unknown): Promise<CommandResult> {
           await scrollIntoView(elementSession, objectId)
           const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
+            const composed = await dispatchPoint(geo.point)
             const ht = await hitTest(elementSession, objectId, geo.point)
             if (!ht.hit) {
+              // Checkboxes are not text entry, so no click-through here; the
+              // styled-checkbox pattern (hidden input behind a styled span)
+              // exits via the taught coordinate click instead, and the state
+              // read that follows any check verifies the outcome.
               return {
                 ok: false,
                 status: 'error',
-                error:
-                  `the ${a.action} point for ${target} is covered by ${ht.blocker ?? 'another element'}. ` +
-                  'Dismiss the overlay and retry.',
-                data: { intercepted_by: ht.blocker ?? null },
+                error: coveredPointError(a.action, target, ht.blocker, composed),
+                data: {
+                  intercepted_by: ht.blocker ?? null,
+                  click_point: [Math.round(composed.x), Math.round(composed.y)],
+                },
               }
             }
-            await trustedClick(tabId, await dispatchPoint(geo.point), { modifiers })
+            await trustedClick(tabId, composed, { modifiers })
             inputMode = 'trusted'
           }
           // Deadlined for the same reason the dispatch itself is, and this is
