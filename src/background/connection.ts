@@ -186,7 +186,19 @@ export function isRunning(): boolean {
 }
 
 export async function ensureConnected(): Promise<void> {
-  if (running) return
+  if (running) {
+    // The heartbeat alarm exists to bound reconnection at about a minute,
+    // and the backend's #172 dispatch grace is sized to that promise. A
+    // pending backoff can be scheduled up to 60s+jitter out (and survives
+    // as long as this worker does), so an alarm that finds one waiting
+    // preempts it and connects now instead of letting the retry outlive
+    // the window the alarm guarantees.
+    if (retryTimer) {
+      clearRetry()
+      await connectOnce()
+    }
+    return
+  }
   const { baseUrl, token } = await getConfig()
   if (baseUrl && token) await startConnection()
 }
