@@ -2318,3 +2318,306 @@ describe('owned dialogs during an act', () => {
     expect(error).toMatch(/chrome_dialog\(tab_id=1/)
   })
 })
+
+describe('wall-clock budget (#162)', () => {
+  it('a type whose healthy dispatches outlive the budget fails in time with exact progress', async () => {
+    // The measured class: two deadlined dispatches per character, each ack
+    // comfortably inside its 8s deadline, the SUM past the wire budget. The
+    // old outcome was the backend's bare "timed out after 30s" with NO
+    // payload; this is the payload that replaces it.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      const cdp = installCdpMock()
+      const inner = cdp.getMockImplementation()!
+      cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
+        if (method === 'Input.dispatchKeyEvent') vi.setSystemTime(Date.now() + 1_000)
+        return inner(target, method as never, params as never)
+      })
+      const ctx = { deadline: Date.now() + 4_500, budgetMs: 30_000 }
+
+      const result = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'abcdef' }, ctx)
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/30s time budget ran out while typing/)
+      expect(String(result.error)).toMatch(/3 of 6 characters/)
+      expect(String(result.error), 'must warn off re-sending the whole value').toMatch(/PARTIAL/)
+      const data = result.data as Record<string, unknown>
+      expect(data.budget_exhausted).toBe(true)
+      expect(data.delivered_count).toBe(3)
+      expect(data.requested_count).toBe(6)
+      expect(data.progress_unit).toBe('characters')
+      expect(data.input, 'input DID go in; the payload must say so').toBe('trusted')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('budget exhausted before dispatch says NOTHING was delivered, and nothing was', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock()
+    const ctx = { deadline: Date.now() - 1, budgetMs: 30_000 }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' }, ctx)
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/NOTHING was delivered/)
+    const data = result.data as Record<string, unknown>
+    expect(data.budget_exhausted).toBe(true)
+    expect(data.input).toBe('none')
+    // The claim must be true: no input event may have gone out.
+    expect(inputEventTypes(cdp)).toEqual([])
+  })
+
+  it('budget spent AFTER delivery cheapens verification instead of failing the act', async () => {
+    // The other half of the honesty rule: a delivered action is never failed
+    // because its verification got cheaper. The renderer-bound enrichments
+    // (focused, target_exists) are skipped; the local facts still report.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      const cdp = installCdpMock()
+      const inner = cdp.getMockImplementation()!
+      cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
+        if (
+          method === 'Input.dispatchMouseEvent' &&
+          (params as { type?: string })?.type === 'mouseReleased'
+        ) {
+          vi.setSystemTime(Date.now() + 60_000)
+        }
+        return inner(target, method as never, params as never)
+      })
+      const ctx = { deadline: Date.now() + 5_000, budgetMs: 30_000 }
+
+      const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' }, ctx)
+
+      expect(result.ok).toBe(true)
+      const data = result.data as Record<string, unknown>
+      expect(data.input).toBe('trusted')
+      expect(data.input_delivered).toBe('yes')
+      expect('focused' in data, 'renderer-bound enrichment is skipped past the deadline').toBe(false)
+      expect('target_exists' in data).toBe(false)
+      expect(data.settled).toBeDefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a fused wait clamps its window to the remaining budget and marks the clamp', async () => {
+    // Outside a batch the backend sizes the act budget around the declared
+    // wait, so the clamp is a no-op; inside one, the clock is shared and a
+    // 10s ask against 1s of remaining budget gets the honest 1s. The advance
+    // runs PAST the unclamped ask on purpose: were the clamp broken, the wait
+    // would ride its full 10s and the waited_ms assertion fails loudly,
+    // instead of the test hanging into a murky timeout.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      installCdpMock({ bodyText: 'nothing relevant here' })
+      const ctx = { deadline: Date.now() + 1_000, budgetMs: 30_000 }
+
+      const pending = execAct(
+        { tab_id: TAB, action: 'key', value: 'End', wait_for: { text: 'NeverShows' }, timeout_ms: 10_000 },
+        ctx,
+      )
+      await vi.advanceTimersByTimeAsync(12_000)
+      const result = await pending
+
+      expect(result.ok).toBe(true)
+      const data = result.data as Record<string, unknown>
+      expect(data.found).toBe(false)
+      expect(data.condition).toBe('text:NeverShows')
+      expect(Number(data.waited_ms), 'the 10s ask must clamp to the ~1s remaining').toBeLessThan(2_000)
+      expect(data.budget_clamped, 'a miss on a shortened window must say the window was short').toBe(true)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a bare wait on a spent budget names the budget, never "wait timed out"', async () => {
+    // The wait branch returns before the shared pre-dispatch checkpoint, so
+    // it carries its own check. Without it, a spent clock produced a 0ms
+    // window and "wait timed out on text:x": the page blamed for a wait that
+    // never ran.
+    installCdpMock()
+    const ctx = { deadline: Date.now() - 1, budgetMs: 30_000 }
+
+    const result = await execAct({ tab_id: TAB, action: 'wait', wait_for: { text: 'x' }, timeout_ms: 5_000 }, ctx)
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/30s time budget/)
+    expect(String(result.error)).not.toMatch(/wait timed out/)
+    const data = result.data as Record<string, unknown>
+    expect(data.budget_exhausted).toBe(true)
+    expect(data.input).toBe('none')
+  })
+
+  it('a clamped bare wait that misses blames the clamp, with the marker', async () => {
+    vi.useFakeTimers()
+    try {
+      installCdpMock({ bodyText: 'nothing relevant here' })
+      const ctx = { deadline: Date.now() + 1_000, budgetMs: 30_000 }
+
+      const pending = execAct({ tab_id: TAB, action: 'wait', wait_for: { text: 'NeverShows' }, timeout_ms: 10_000 }, ctx)
+      await vi.advanceTimersByTimeAsync(12_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/clamped from 10000ms/)
+      const data = result.data as Record<string, unknown>
+      expect(data.budget_clamped).toBe(true)
+      expect(Number(data.waited_ms)).toBeLessThan(2_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('the widened settle clamps its in-page deadline to the remaining budget', async () => {
+    // The settle probe runs IN the page for its whole window (one evaluate,
+    // not a poll), so an unclamped 20s ask against ~1.5s of budget would
+    // still be sitting in the page when the backend gave up. The in-page
+    // deadline is where the clamp must land to matter (#168's pattern).
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ settleValue: 'deadline' })
+    const ctx = { deadline: Date.now() + 1_500, budgetMs: 30_000 }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1', timeout_ms: 20_000 }, ctx)
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect(data.budget_clamped, 'an unsettled clamped window must carry the marker').toBe(true)
+    const settleProbes = cdp.mock.calls.filter(
+      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('MutationObserver'),
+    )
+    expect(settleProbes).toHaveLength(1)
+    const expr = String((settleProbes[0][2] as { expression: string }).expression)
+    const deadlineMs = Number(expr.match(/Date\.now\(\) \+ (\d+)/)?.[1])
+    expect(deadlineMs, 'the 20s ask must shrink to the ~1.5s remaining').toBeLessThanOrEqual(1_500)
+    expect(deadlineMs).toBeGreaterThan(0)
+  })
+
+  it('a budget dying on the preparatory hover says NO click was pressed, not "mid-action"', async () => {
+    // The zero-delivered clicks branch: the prep mouseMoved ate the clock, so
+    // the check before the FIRST press throws with delivered 0. "Mid-click"
+    // or "see what state that left the control in" would both be claims about
+    // input that never happened.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      const cdp = installCdpMock()
+      const inner = cdp.getMockImplementation()!
+      cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
+        if (
+          method === 'Input.dispatchMouseEvent' &&
+          (params as { type?: string })?.type === 'mouseMoved'
+        ) {
+          vi.setSystemTime(Date.now() + 60_000)
+        }
+        return inner(target, method as never, params as never)
+      })
+      const ctx = { deadline: Date.now() + 5_000, budgetMs: 30_000 }
+
+      const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' }, ctx)
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/before the click's click was pressed/)
+      expect(String(result.error)).not.toMatch(/mid-/)
+      const data = result.data as Record<string, unknown>
+      expect(data.delivered_count).toBe(0)
+      expect(data.input).toBe('none')
+      // No press may have gone out; the prep move alone presses nothing.
+      const mouseTypes = cdp.mock.calls
+        .filter((c) => c[1] === 'Input.dispatchMouseEvent')
+        .map((c) => (c[2] as { type: string }).type)
+      expect(mouseTypes).toEqual(['mouseMoved'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a drag that cannot afford its press is refused with nothing sent', async () => {
+    // The drag arm re-checks the clock AFTER destination resolution, because
+    // that resolution can eat what the shared pre-dispatch checkpoint saw as
+    // remaining, and once the press goes out the drag MUST complete (a held
+    // button is worse than a refusal). Refusing here is the last moment
+    // "NOTHING was delivered" is still true.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      const cdp = installCdpMock()
+      const inner = cdp.getMockImplementation()!
+      cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
+        // Destination geometry (getBoundingClientRect) burns the whole clock.
+        if (
+          method === 'Runtime.callFunctionOn' &&
+          String((params as { functionDeclaration?: string })?.functionDeclaration).includes('getBoundingClientRect')
+        ) {
+          vi.setSystemTime(Date.now() + 6_000)
+        }
+        return inner(target, method as never, params as never)
+      })
+      const ctx = { deadline: Date.now() + 5_000, budgetMs: 30_000 }
+
+      const result = await execAct({ tab_id: TAB, action: 'drag', coordinate: [10, 10], to_ref: '@e1' }, ctx)
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/NOTHING was delivered/)
+      const data = result.data as Record<string, unknown>
+      expect(data.budget_exhausted).toBe(true)
+      expect(data.input).toBe('none')
+      // The claim must be true: no mouse event may have gone out.
+      expect(inputEventTypes(cdp)).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a degraded drag says so: the glide was dropped and the payload marks it', async () => {
+    // Zero-glide drags can register as plain clicks on delta-tracking pages,
+    // so ok:true alone would be an unverified claim.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      const cdp = installCdpMock()
+      const inner = cdp.getMockImplementation()!
+      cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
+        // The press lands, then the clock dies: glide unaffordable.
+        if (
+          method === 'Input.dispatchMouseEvent' &&
+          (params as { type?: string })?.type === 'mousePressed'
+        ) {
+          vi.setSystemTime(Date.now() + 60_000)
+        }
+        return inner(target, method as never, params as never)
+      })
+      const ctx = { deadline: Date.now() + 5_000, budgetMs: 30_000 }
+
+      const result = await execAct({ tab_id: TAB, action: 'drag', coordinate: [10, 10], to_ref: '@e1' }, ctx)
+
+      expect(result.ok).toBe(true)
+      const data = result.data as Record<string, unknown>
+      expect(data.drag_degraded).toBe(true)
+      expect(data.drag_moves_sent).toBe(0)
+      // The button was still released: press and release both went out.
+      const mouseTypes = cdp.mock.calls
+        .filter((c) => c[1] === 'Input.dispatchMouseEvent')
+        .map((c) => (c[2] as { type: string }).type)
+      expect(mouseTypes).toContain('mousePressed')
+      expect(mouseTypes).toContain('mouseReleased')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('no context means no budget: the act behaves exactly as before', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect('budget_exhausted' in data).toBe(false)
+    expect(data.focused, 'no deadline, no enrichment skip').toBeDefined()
+  })
+})

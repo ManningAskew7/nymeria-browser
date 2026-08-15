@@ -1,5 +1,6 @@
 import { backgroundLogger as logger } from '../../utils/logger'
 import { postCommandResult } from '../api'
+import { BUDGET_RESERVE_MS, type ExecContext } from '../budget'
 import type { BrowserCommandEvent, CommandResult, CommandType } from '../../shared/types'
 import { execAct } from './act'
 import { execBatch } from './batch'
@@ -16,7 +17,7 @@ import { execTabs } from './tabs'
 import { dialogBlockedReadError, standingDialog } from '../dialogs'
 import { READ_LIVENESS_DEADLINE_MS, rendererResponsive, suspendedPageReadError } from '../settle'
 
-type Executor = (args: unknown) => Promise<CommandResult>
+type Executor = (args: unknown, ctx?: ExecContext) => Promise<CommandResult>
 
 /**
  * Safety valve on the result body, not a model-facing cap.
@@ -81,7 +82,7 @@ const READS_THE_PAGE: Record<CommandType, boolean> = {
   cdp: false,
 }
 
-async function runSingle(type: string, args: unknown): Promise<CommandResult> {
+async function runSingle(type: string, args: unknown, ctx?: ExecContext): Promise<CommandResult> {
   const executor = EXECUTORS[type as CommandType]
   if (!executor) {
     return { ok: false, status: 'error', error: `unknown command_type: ${String(type)}` }
@@ -107,7 +108,7 @@ async function runSingle(type: string, args: unknown): Promise<CommandResult> {
     const t = await chrome.tabs.get(tabId).catch(() => null)
     loadingAtRead = t?.status === 'loading'
   }
-  const result = await executor(args)
+  const result = await executor(args, ctx)
   if (loadingAtRead && result.ok && result.data && typeof result.data === 'object' && !Array.isArray(result.data)) {
     return { ...result, data: { ...(result.data as Record<string, unknown>), page_loading: true } }
   }
@@ -120,7 +121,7 @@ export const EXECUTORS: Record<CommandType, Executor> = {
   history: execHistory,
   snapshot: execSnapshot,
   act: execAct,
-  batch: (args) => execBatch(args, runSingle),
+  batch: (args, ctx) => execBatch(args, runSingle, ctx),
   extract_text: execExtractText,
   screenshot: execScreenshot,
   console: execConsole,
@@ -175,12 +176,26 @@ export function setDispatchHooks(h: DispatchHooks): void {
 export async function dispatchBrowserCommand(event: BrowserCommandEvent): Promise<void> {
   const { command_id, command_type, args } = event
   hooks.onStart?.(event)
+  // The floor keeps a small wire budget from producing a spent-on-arrival
+  // deadline: a command always gets at least a second of working room, and
+  // the reserve absorbs the rest. Unreachable with today's backend (its
+  // smallest published budget is 5s), kept as cross-repo drift insurance;
+  // even fired, a 1s deadline stays inside the backend's `timeout_s + 1`
+  // wait for every integer timeout, so the payload still lands.
+  const budgetMs =
+    typeof event.timeout_seconds === 'number' && event.timeout_seconds > 0
+      ? event.timeout_seconds * 1000
+      : null
+  const ctx: ExecContext | undefined =
+    budgetMs === null
+      ? undefined
+      : { deadline: Date.now() + Math.max(budgetMs - BUDGET_RESERVE_MS, 1_000), budgetMs }
   let payload: CommandResult
   // Through `runSingle`, the same entry a batch's sub-commands use. These were
   // two parallel paths that each looked up the executor themselves, so
   // anything added to one silently missed the other. Keep it one path.
   try {
-    payload = await runSingle(String(command_type), args)
+    payload = await runSingle(String(command_type), args, ctx)
   } catch (e) {
     payload = { ok: false, status: 'error', error: errorToString(e) }
   }

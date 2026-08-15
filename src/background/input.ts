@@ -1,3 +1,4 @@
+import { budgetSpent } from './budget'
 import { sendCommand, type Cdp } from './debuggerSession'
 
 /**
@@ -65,6 +66,38 @@ export class InputDispatchStalled extends Error {
     super('the renderer did not finish processing the dispatched event')
     this.name = 'InputDispatchStalled'
     this.landed = landed
+  }
+}
+
+/**
+ * The command's wall-clock budget ran out between gestures (#162).
+ *
+ * Distinct from `InputDispatchStalled` in both mechanism and meaning: no
+ * dispatch is hanging, the SUM of many healthy, individually-acked dispatches
+ * simply reached the wire budget (`typeText` is two deadlined dispatches per
+ * character, so a page spending a second per keystroke overruns a 30s budget
+ * on a longish value with every single ack comfortably inside its deadline).
+ * The progress fields are the honesty: input DID go in, and the failure copy
+ * must say exactly how much, because "re-send the whole thing" against a
+ * field holding a partial value is the double-entry bug this exists to
+ * prevent.
+ *
+ * Thrown only at GESTURE BOUNDARIES (before a character, before a press,
+ * between the clicks of a double-click), never mid-gesture: aborting between
+ * a mousePressed and its mouseReleased would leave the button held in the
+ * page, a worse state than spending one more bounded ack to finish cleanly.
+ */
+export class InputBudgetExhausted extends Error {
+  readonly delivered: number
+  readonly requested: number
+  readonly unit: 'characters' | 'clicks'
+
+  constructor(delivered: number, requested: number, unit: 'characters' | 'clicks') {
+    super(`the command's time budget ran out after ${delivered} of ${requested} ${unit}`)
+    this.name = 'InputBudgetExhausted'
+    this.delivered = delivered
+    this.requested = requested
+    this.unit = unit
   }
 }
 
@@ -402,7 +435,7 @@ export async function trustedHover(target: Cdp, point: Point, modifiers = 0): Pr
 export async function trustedClick(
   target: Cdp,
   point: Point,
-  opts: { button?: MouseButton; clickCount?: number; modifiers?: number } = {},
+  opts: { button?: MouseButton; clickCount?: number; modifiers?: number; deadline?: number | null } = {},
 ): Promise<void> {
   const button = opts.button ?? 'left'
   const modifiers = opts.modifiers ?? 0
@@ -411,26 +444,58 @@ export async function trustedClick(
   // been pressed yet, so this is a click that did NOT go out.
   await mouseEvent(target, 'mouseMoved', point, { modifiers, preparatory: true })
   for (let n = 1; n <= clickCount; n += 1) {
+    // Checked before the press, never between press and release: a click is
+    // atomic once its button is down. Between the clicks of a double-click is
+    // a boundary, and one delivered click is what the thrown progress says.
+    if (budgetSpent(opts.deadline)) throw new InputBudgetExhausted(n - 1, clickCount, 'clicks')
     await mouseEvent(target, 'mousePressed', point, { button, clickCount: n, modifiers })
     await mouseEvent(target, 'mouseReleased', point, { button, clickCount: n, modifiers })
   }
 }
 
-export async function trustedDrag(target: Cdp, from: Point, to: Point, modifiers = 0): Promise<void> {
+export interface DragOutcome {
+  /** True when any of the glide moves were skipped for budget. */
+  degraded: boolean
+  /** Intermediate moves actually dispatched between press and release. */
+  movesSent: number
+}
+
+export async function trustedDrag(
+  target: Cdp,
+  from: Point,
+  to: Point,
+  modifiers = 0,
+  deadline?: number | null,
+): Promise<DragOutcome> {
+  // The caller owns the "can this drag afford to start" question (act.ts
+  // refuses pre-dispatch); once the press below goes out, the only good exit
+  // is a release, whatever the clock says: a held button is a worse state
+  // than a degraded drag.
   await mouseEvent(target, 'mouseMoved', from, { modifiers, preparatory: true })
   await mouseEvent(target, 'mousePressed', from, { button: 'left', clickCount: 1, modifiers })
   // A couple of intermediate moves: drag implementations that listen for
   // movement deltas ignore a single teleporting move.
   const steps = 4
+  let movesSent = 0
   for (let i = 1; i <= steps; i += 1) {
+    // Budget spent mid-drag: skip the remaining glide moves and go straight
+    // to the release at the destination. The degrade is REPORTED, never
+    // hidden: with zero moves between press and release, a delta-listening
+    // drag implementation sees no movement at all (the only earlier move is
+    // the preparatory one at the origin), and Chrome can even read
+    // press-here release-there as a plain click on the common ancestor. The
+    // caller marks the payload so the agent verifies instead of trusting.
+    if (budgetSpent(deadline)) break
     await mouseEvent(
       target,
       'mouseMoved',
       { x: from.x + ((to.x - from.x) * i) / steps, y: from.y + ((to.y - from.y) * i) / steps },
       { button: 'left', held: 'left', modifiers },
     )
+    movesSent += 1
   }
   await mouseEvent(target, 'mouseReleased', to, { button: 'left', clickCount: 1, modifiers })
+  return { degraded: movesSent < steps, movesSent }
 }
 
 /**
@@ -508,9 +573,15 @@ export async function dispatchKey(target: Cdp, key: string, modifiers = 0): Prom
 }
 
 /** Per-character key events, for widgets that need keydown/keyup per key. */
-export async function typeText(target: Cdp, text: string): Promise<void> {
-  for (const ch of text) {
-    await dispatchKey(target, ch)
+export async function typeText(target: Cdp, text: string, deadline?: number | null): Promise<void> {
+  const chars = Array.from(text)
+  for (let i = 0; i < chars.length; i += 1) {
+    // The #162 case this whole mechanism was filed for: two deadlined
+    // dispatches per character means a slow page overruns the wire budget
+    // with every individual ack healthy. Checked per character so the throw
+    // carries exactly how much of the value is now IN the field.
+    if (budgetSpent(deadline)) throw new InputBudgetExhausted(i, chars.length, 'characters')
+    await dispatchKey(target, chars[i])
   }
 }
 

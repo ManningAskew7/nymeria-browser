@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { raceStandingDialog, standingDialog } from '../dialogs'
 import { clearTabNav, installNavWatch, resetForTests as resetNavWatch } from '../navWatch'
+import { installStatusWatch, resetForTests as resetStatusWatch } from '../statusWatch'
 import { execNavigate } from './navigate'
 
 // The dialogs seam is mocked so a test can INJECT a dialog opening mid-load;
@@ -31,6 +32,21 @@ function wireNav() {
     errorOccurred: last(chrome.webNavigation!.onErrorOccurred.addListener),
     fragmentUpdated: last(chrome.webNavigation!.onReferenceFragmentUpdated.addListener),
   }
+}
+
+type ResponseListener = (details: {
+  tabId: number
+  url: string
+  statusCode: number
+  type: string
+  timeStamp?: number
+}) => void
+
+/** Re-bind statusWatch onto the fresh chrome mock, handing back its listener. */
+function wireStatus(): ResponseListener {
+  installStatusWatch()
+  const fn = chrome.webRequest!.onResponseStarted.addListener as ReturnType<typeof vi.fn>
+  return fn.mock.calls.at(-1)?.[0] as ResponseListener
 }
 
 /**
@@ -65,6 +81,7 @@ function installTabsMock(opts: { landsOn: string; status?: string; startUrl?: st
 beforeEach(() => {
   vi.restoreAllMocks()
   resetNavWatch()
+  resetStatusWatch()
   // Restored to no-op above; the default must be "no dialog ever opens",
   // i.e. the raced work simply resolves.
   vi.mocked(raceStandingDialog).mockImplementation(async (_tabId, work) => ({
@@ -172,6 +189,114 @@ describe('same-document navigation (finding F1)', () => {
     expect(data.url).toBe(target)
     expect(data.complete).toBe(true)
     expect(data.same_document).toBe(true)
+  })
+})
+
+describe('HTTP status on the committed document (#175)', () => {
+  it('carries the status when the recorder saw the main-frame response', async () => {
+    // The lie-by-omission this closes, measured 2026-08-12: an error page
+    // COMMITS like any other page, so a 404 returned ok:true with the error
+    // page's title and no status anywhere.
+    const nav = wireNav()
+    const status = wireStatus()
+    installTabsMock({
+      landsOn: TARGET,
+      onUpdate: () => {
+        status({ tabId: TAB, url: TARGET, statusCode: 404, type: 'main_frame' })
+        nav.beforeNavigate({ tabId: TAB, url: TARGET, frameId: 0 })
+        nav.committed({ tabId: TAB, url: TARGET, frameId: 0 })
+      },
+    })
+
+    const result = await execNavigate({ tab_id: TAB, url: TARGET })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { http_status?: number; http_status_hint?: string }
+    expect(data.http_status).toBe(404)
+    expect('http_status_hint' in data, 'only the auth pair carries a hint').toBe(false)
+  })
+
+  it('a 401 carries the auth hint: input to this tab is about to be dead', async () => {
+    // The original incident: a navigate onto a Basic-auth 401 returned
+    // ok:true, complete:true while Chrome was already discarding every input
+    // event sent to the tab.
+    const nav = wireNav()
+    const status = wireStatus()
+    installTabsMock({
+      landsOn: TARGET,
+      onUpdate: () => {
+        status({ tabId: TAB, url: TARGET, statusCode: 401, type: 'main_frame' })
+        nav.beforeNavigate({ tabId: TAB, url: TARGET, frameId: 0 })
+        nav.committed({ tabId: TAB, url: TARGET, frameId: 0 })
+      },
+    })
+
+    const result = await execNavigate({ tab_id: TAB, url: TARGET })
+
+    const data = result.data as { http_status?: number; http_status_hint?: string }
+    expect(data.http_status).toBe(401)
+    expect(String(data.http_status_hint)).toMatch(/suppress/i)
+  })
+
+  it('omits status entirely when no record exists (grant absent)', async () => {
+    // The graceful-degradation contract: without the webRequest host grant
+    // the listener never fires, and an absent field is the honest shape.
+    // Claiming 200 here would be inventing data.
+    const nav = wireNav()
+    wireStatus()
+    installTabsMock({
+      landsOn: TARGET,
+      onUpdate: () => {
+        nav.beforeNavigate({ tabId: TAB, url: TARGET, frameId: 0 })
+        nav.committed({ tabId: TAB, url: TARGET, frameId: 0 })
+      },
+    })
+
+    const result = await execNavigate({ tab_id: TAB, url: TARGET })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect('http_status' in data).toBe(false)
+    expect('http_status_hint' in data).toBe(false)
+  })
+
+  it('does not claim a status recorded for some other load', async () => {
+    const nav = wireNav()
+    const status = wireStatus()
+    installTabsMock({
+      landsOn: TARGET,
+      onUpdate: () => {
+        status({ tabId: TAB, url: 'https://unrelated.example/x', statusCode: 500, type: 'main_frame' })
+        nav.beforeNavigate({ tabId: TAB, url: TARGET, frameId: 0 })
+        nav.committed({ tabId: TAB, url: TARGET, frameId: 0 })
+      },
+    })
+
+    const result = await execNavigate({ tab_id: TAB, url: TARGET })
+
+    expect('http_status' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('never claims a status on a same-document move: no request happened', async () => {
+    const nav = wireNav()
+    const status = wireStatus()
+    const target = 'https://docs.example/guide#install'
+    installTabsMock({
+      landsOn: target,
+      startUrl: target,
+      onUpdate: () => {
+        // Even with a fresh matching record standing (say, from the load
+        // moments earlier), a fragment move fetched nothing.
+        status({ tabId: TAB, url: 'https://docs.example/guide', statusCode: 200, type: 'main_frame' })
+        nav.fragmentUpdated({ tabId: TAB, url: target, frameId: 0 })
+      },
+    })
+
+    const result = await execNavigate({ tab_id: TAB, url: target })
+
+    const data = result.data as Record<string, unknown>
+    expect(data.same_document).toBe(true)
+    expect('http_status' in data).toBe(false)
   })
 })
 

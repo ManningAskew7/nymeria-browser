@@ -52,7 +52,7 @@ interface MockChrome {
   }
   storage: { local: StorageArea; sync: StorageArea }
   alarms: { create: ReturnType<typeof vi.fn>; onAlarm: { addListener: ReturnType<typeof vi.fn> } }
-  permissions: { request: ReturnType<typeof vi.fn> }
+  permissions: { request: ReturnType<typeof vi.fn>; contains: ReturnType<typeof vi.fn> }
   tabs: {
     query: ReturnType<typeof vi.fn>
     create: ReturnType<typeof vi.fn>
@@ -83,6 +83,9 @@ interface MockChrome {
     onReferenceFragmentUpdated: { addListener: ReturnType<typeof vi.fn> }
     onHistoryStateUpdated: { addListener: ReturnType<typeof vi.fn> }
   }
+  webRequest?: {
+    onResponseStarted: { addListener: ReturnType<typeof vi.fn> }
+  }
   notifications?: { create: ReturnType<typeof vi.fn> }
 }
 
@@ -97,7 +100,10 @@ function makeMockChrome(): MockChrome {
     },
     storage: { local: makeStorageArea(), sync: makeStorageArea() },
     alarms: { create: vi.fn(), onAlarm: { addListener: vi.fn() } },
-    permissions: { request: vi.fn().mockResolvedValue(true) },
+    permissions: {
+      request: vi.fn().mockResolvedValue(true),
+      contains: vi.fn().mockResolvedValue(true),
+    },
     tabs: {
       _tabs: [
         { id: 1, url: 'https://example.com', title: 'Example', active: true, windowId: 100, index: 0, status: 'complete' },
@@ -158,6 +164,9 @@ function makeMockChrome(): MockChrome {
       onErrorOccurred: { addListener: vi.fn() },
       onReferenceFragmentUpdated: { addListener: vi.fn() },
       onHistoryStateUpdated: { addListener: vi.fn() },
+    },
+    webRequest: {
+      onResponseStarted: { addListener: vi.fn() },
     },
     notifications: { create: vi.fn() },
   }

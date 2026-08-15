@@ -9,6 +9,7 @@ import { clearWorld as clearDeliveryWorld } from './delivery'
 import { clear as clearRefs } from './snapshotRefs'
 import { installCdpConsoleCapture } from './consoleBuffer'
 import { clearTabNav, installNavWatch } from './navWatch'
+import { clearTabStatus, installStatusWatch } from './statusWatch'
 import { clear as clearNetwork, installCdpNetworkCapture } from './networkBuffer'
 import {
   getSnapshot,
@@ -44,6 +45,10 @@ installDialogOwnership()
 // only; the ref-clearing onCommitted listener below is invalidation and
 // stays separate.
 installNavWatch()
+// Main-frame HTTP status per tab (#175), the half of navigation truth
+// webNavigation cannot see. Inert until the user grants the optional host
+// permission from the popup; consumers treat "no record" as unknown.
+installStatusWatch()
 
 // A committed navigation invalidates the tab's refs, and destroys the isolated
 // world the delivery probe caches (it dies with its document, so a cached
@@ -60,6 +65,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   clearNetwork(tabId)
   clearDeliveryWorld(tabId)
   clearTabDialogState(tabId)
+  clearTabStatus(tabId)
   // Wakes any navigation wait with `removed` before dropping state, so a
   // navigate on a tab the user just closed fails fast instead of riding
   // its deadline.

@@ -1,5 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { expectBeforeunloadAccept } from '../dialogs'
+import { statusPayload } from '../statusWatch'
 import { TAB_LOAD_WAIT_MS, waitForTabComplete, watchForTabComplete } from '../settle'
 
 interface TabsArgs {
@@ -43,6 +44,7 @@ export async function execTabs(args: unknown): Promise<CommandResult> {
     }
     case 'create': {
       if (!a.url) return { ok: false, status: 'error', error: 'create requires url' }
+      const t0 = Date.now()
       const tab = await chrome.tabs.create({ url: a.url })
       if (typeof tab.id !== 'number') {
         // No id means nothing downstream can address this tab, and a success
@@ -66,7 +68,18 @@ export async function execTabs(args: unknown): Promise<CommandResult> {
       // without this the payload could say `status: "complete"` next to
       // `complete: false`.
       const complete = waited || loaded.status === 'complete'
-      return { ok: true, status: 'success', data: { tab: describe(loaded), complete } }
+      return {
+        ok: true,
+        status: 'success',
+        data: {
+          tab: describe(loaded),
+          complete,
+          // #175: same claim rules as navigate's committed branch. Create is
+          // the kit's recommended first step, so it has the identical
+          // error-page blind spot; absent means unknown, never OK.
+          ...statusPayload(tab.id, t0, [loaded.url]),
+        },
+      }
     }
     case 'switch': {
       if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'switch requires tab_id' }
@@ -89,6 +102,7 @@ export async function execTabs(args: unknown): Promise<CommandResult> {
     }
     case 'reload': {
       if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'reload requires tab_id' }
+      const t0 = Date.now()
       // Armed BEFORE the reload: the tab still reads `complete` from the old
       // document at this point, so anything with an already-complete early-out
       // would return instantly having waited for nothing.
@@ -108,7 +122,14 @@ export async function execTabs(args: unknown): Promise<CommandResult> {
       return {
         ok: true,
         status: 'success',
-        data: { reloaded: a.tab_id, complete, ...(reloaded ? { tab: describe(reloaded) } : {}) },
+        data: {
+          reloaded: a.tab_id,
+          complete,
+          ...(reloaded ? { tab: describe(reloaded) } : {}),
+          // #175: a reload re-fetches the document, so a page that started
+          // serving errors since the first load shows it here.
+          ...statusPayload(a.tab_id, t0, [reloaded?.url]),
+        },
       }
     }
     default:

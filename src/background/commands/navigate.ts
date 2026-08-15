@@ -14,6 +14,7 @@ import {
   waitForNavSignal,
 } from '../navWatch'
 import { clear as clearRefs } from '../snapshotRefs'
+import { statusPayload } from '../statusWatch'
 import { TAB_LOAD_WAIT_MS, waitForTabComplete } from '../settle'
 
 // NB `history.ts` (back/forward) still determines its outcome the OLD way
@@ -205,6 +206,13 @@ export async function execNavigate(args: unknown): Promise<CommandResult> {
           url: (finalTab ?? tab)?.url ?? nav.url,
           title: (finalTab ?? tab)?.title,
           complete: nav.complete,
+          // #175: the HTTP status behind the committed document, when the
+          // webRequest grant lets it be seen. An error page commits like any
+          // other, so without this a 404/500/401 reads as a clean success;
+          // absent means UNKNOWN (no grant, or no matching record), never OK.
+          // Only the committed branch may claim one: a same-document move has
+          // no request, and the failure branches never arrived.
+          ...statusPayload(a.tab_id, t0, [nav.url, (finalTab ?? tab)?.url]),
         },
       }
     case 'same-document':

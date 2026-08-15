@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { expectBeforeunloadAccept } from '../dialogs'
+import { installStatusWatch, resetForTests as resetStatusWatch } from '../statusWatch'
 import { execTabs } from './tabs'
 import { TAB_LOAD_WAIT_MS } from '../settle'
 
@@ -70,7 +71,23 @@ function installTabsMock(
 
 beforeEach(() => {
   vi.useRealTimers()
+  resetStatusWatch()
 })
+
+type ResponseListener = (details: {
+  tabId: number
+  url: string
+  statusCode: number
+  type: string
+  timeStamp?: number
+}) => void
+
+/** Re-bind statusWatch onto the fresh chrome mock, handing back its listener. */
+function wireStatus(): ResponseListener {
+  installStatusWatch()
+  const fn = chrome.webRequest!.onResponseStarted.addListener as ReturnType<typeof vi.fn>
+  return fn.mock.calls.at(-1)?.[0] as ResponseListener
+}
 
 describe('tabs create', () => {
   it('does not return until the page has actually loaded', async () => {
@@ -139,7 +156,6 @@ describe('tabs create', () => {
       vi.useRealTimers()
     }
   })
-})
 
   it('trusts the re-read when the completion lands in the listener gap', async () => {
     // waitForTabComplete reads the status and only then attaches its listener,
@@ -183,6 +199,45 @@ describe('tabs create', () => {
       vi.useRealTimers()
     }
   })
+})
+
+describe('HTTP status on create and reload (#175)', () => {
+  it('create carries the loaded document status: the kit flow has the same blind spot', async () => {
+    installTabsMock({ loadAfterMs: 10 })
+    const status = wireStatus()
+
+    const pending = execTabs({ action: 'create', url: 'https://example.com/' })
+    // Fired mid-load, after create sampled its clock: the shape a real
+    // response event takes.
+    status({ tabId: TAB, url: 'https://example.com/loaded', statusCode: 500, type: 'main_frame' })
+    const result = await pending
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { http_status?: number }).http_status).toBe(500)
+  })
+
+  it('create omits status when the recorder never saw the load', async () => {
+    installTabsMock({ loadAfterMs: 10 })
+    wireStatus()
+
+    const result = await execTabs({ action: 'create', url: 'https://example.com/' })
+
+    expect(result.ok).toBe(true)
+    expect('http_status' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('reload carries the re-fetched document status', async () => {
+    installTabsMock({ loadAfterMs: 10, initialStatus: 'complete' })
+    const status = wireStatus()
+
+    const pending = execTabs({ action: 'reload', tab_id: TAB })
+    status({ tabId: TAB, url: 'https://example.com/loaded', statusCode: 404, type: 'main_frame' })
+    const result = await pending
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { http_status?: number }).http_status).toBe(404)
+  })
+})
 
 describe('tabs reload', () => {
   it('waits for the NEW document, not the old one that still reads complete', async () => {

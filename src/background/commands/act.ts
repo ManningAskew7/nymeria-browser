@@ -3,6 +3,13 @@ import { readSince as consoleSince } from '../consoleBuffer'
 import { CdpCallTimeout, frameSessions, sendCommand, TabUnusable, type Cdp } from '../debuggerSession'
 import { absenceIsConclusive, armDelivery, type DeliveryOutcome } from '../delivery'
 import {
+  budgetLabel,
+  budgetLeft,
+  budgetSpent,
+  clampToDeadline,
+  type ExecContext,
+} from '../budget'
+import {
   ackWithinDeadline,
   callOn,
   dispatchKey,
@@ -10,6 +17,7 @@ import {
   focusElement,
   focusLandedIn,
   hitTest,
+  InputBudgetExhausted,
   InputDispatchStalled,
   textEntryTarget,
   insertText,
@@ -27,7 +35,7 @@ import {
 import { commitSeq, commitSince, navigationPending, waitForNavSignal } from '../navWatch'
 import { failuresSince as networkFailuresSince } from '../networkBuffer'
 import { resolve as resolveRef, type StaleReason } from '../snapshotRefs'
-import { rendererResponsive, settle, type SettleResult } from '../settle'
+import { DEFAULT_MAX_MS, rendererResponsive, settle, type SettleResult } from '../settle'
 import {
   chooserInterceptedSince,
   describeResolution,
@@ -624,6 +632,52 @@ function stalledError(action: ActionName): string {
   )
 }
 
+/**
+ * Failure copy for a mid-gesture budget overrun (#162). The whole point of
+ * the wall-clock budget is that this copy arrives INSTEAD of the backend's
+ * payload-less transport timeout, so it must carry what that timeout could
+ * not: exactly how much input is now in the page, and what to do about it.
+ */
+function budgetExhaustedMidActionError(
+  action: ActionName,
+  e: InputBudgetExhausted,
+  budgetMs: number | null,
+): string {
+  const budget = budgetLabel(budgetMs)
+  if (e.unit === 'characters') {
+    return (
+      `${budget} ran out while typing: ${e.delivered} of ${e.requested} characters were ` +
+      'delivered, so the field now holds a PARTIAL value. Re-read it before continuing, ' +
+      'and finish the remainder rather than re-sending the whole text. If the page is ' +
+      'just slow, retry with a larger timeout_ms.'
+    )
+  }
+  // clicks. Zero delivered means the budget died on the FIRST press check:
+  // nothing went out, and "mid-action" or "what state that left the control
+  // in" would both be claims about input that never happened.
+  if (e.delivered === 0) {
+    return (
+      `${budget} ran out before the ${action}'s click was pressed: nothing was ` +
+      'delivered. The pre-flight steps consumed it, which usually means the tab is ' +
+      'responding very slowly. Retry, with a larger timeout_ms if it persists.'
+    )
+  }
+  return (
+    `${budget} ran out mid-${action}: ${e.delivered} of ${e.requested} clicks were ` +
+    'delivered. Re-read the page to see what state that left the control in before retrying.'
+  )
+}
+
+/** The pre-dispatch twin: the budget went on pre-flight, so nothing went out. */
+function budgetExhaustedBeforeDispatchError(action: ActionName, budgetMs: number | null): string {
+  return (
+    `${budgetLabel(budgetMs)} ran out before the ${action}'s input was sent: NOTHING was ` +
+    'delivered. The pre-flight steps (attach, liveness, target resolution) consumed it, ' +
+    'which usually means the tab is responding very slowly. Retry, with a larger ' +
+    'timeout_ms if it persists.'
+  )
+}
+
 type TargetResolution =
   /** `session` is the CDP addressee that OWNS the node: a cross-origin frame
    *  has its own session, and its objectIds are meaningless anywhere else. */
@@ -783,6 +837,9 @@ interface VerificationInput {
   elementSession: Cdp
   inputMode: 'trusted' | 'synthetic' | 'none'
   settleResult: SettleResult | null
+  /** The command's wall-clock deadline (#162), or null. Required so a new
+   *  call site cannot silently opt out of the budget. */
+  budgetDeadline: number | null
   previousValue?: string | null
   extra?: Record<string, unknown>
 }
@@ -798,15 +855,30 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
   // close) ends the wait early rather than riding it out.
   let commit = commitSince(v.tabId, v.navSeqBefore)
   if (!commit && navigationPending(v.tabId, v.startedAt)) {
-    const signal = await waitForNavSignal(v.tabId, v.navSeqBefore, v.startedAt, NAV_COMMIT_WAIT_MS)
+    // Clamped to the remaining budget (#162): the commit wait is bounded
+    // anyway, but past the deadline every millisecond here is one the honest
+    // payload does not have.
+    const commitWait =
+      v.budgetDeadline === null
+        ? NAV_COMMIT_WAIT_MS
+        : Math.max(0, Math.min(NAV_COMMIT_WAIT_MS, v.budgetDeadline - Date.now()))
+    const signal = await waitForNavSignal(v.tabId, v.navSeqBefore, v.startedAt, commitWait)
     if (signal?.kind === 'commit') commit = { url: signal.url, seq: signal.seq }
   }
   const pending = commit ? null : navigationPending(v.tabId, v.startedAt)
   const urlAfter = await currentUrl(v.tabId)
-  const [targetExists, focused] = await Promise.all([
-    stillConnected(v.elementSession, v.objectId),
-    describeFocused(v.tabId),
-  ])
+  // Budget spent AFTER the input went in: verification gets cheaper, the
+  // delivered action is never failed for it (#162). The renderer-bound
+  // enrichment probes are skipped; everything local (url, nav record,
+  // console, network) still reports, and `budget_clamped` marks the skip so
+  // the absent fields read as "not asked", never "not there".
+  const enrichmentSkipped = budgetSpent(v.budgetDeadline)
+  const [targetExists, focused] = enrichmentSkipped
+    ? [null, null]
+    : await Promise.all([
+        stillConnected(v.elementSession, v.objectId),
+        describeFocused(v.tabId),
+      ])
   const errors = consoleSince(v.tabId, v.startedAt, {
     only_errors: true,
     limit: MAX_CONSOLE_IN_RESULT,
@@ -835,6 +907,7 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
     ...(v.settleResult ? { settled: v.settleResult } : {}),
     ...(errors.length ? { console_errors: errors } : {}),
     ...(failedRequests.length ? { failed_requests: failedRequests } : {}),
+    ...(enrichmentSkipped ? { budget_clamped: true } : {}),
     ...(v.extra ?? {}),
   }
 }
@@ -922,13 +995,26 @@ async function performWait(
   }
 }
 
-export async function execAct(args: unknown): Promise<CommandResult> {
+export async function execAct(args: unknown, ctx?: ExecContext): Promise<CommandResult> {
   const a = args as ActArgs
   if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'tab_id required' }
   if (!a.action) return { ok: false, status: 'error', error: 'action required' }
 
   const tabId = a.tab_id
   const startedAt = Date.now()
+  // #162: the wire budget as one wall clock over the whole command. Every
+  // stage below is individually bounded, but bounds are ADDITIVE: a cold
+  // attach plus geometry plus per-character dispatches plus settle plus the
+  // verification probes can each stay inside its own deadline and still sum
+  // past the transport timeout, whose backend copy carries NO payload. The
+  // budget converts that into an in-time honest answer: input helpers throw
+  // `InputBudgetExhausted` at gesture boundaries (a failure naming exact
+  // progress), and post-dispatch stages clamp or skip (a delivered action is
+  // never failed by its verification getting cheaper).
+  const budgetDeadline = ctx?.deadline ?? null
+  const budgetMs = ctx?.budgetMs ?? null
+  const budgetLeftMs = () => budgetLeft(budgetDeadline)
+  const clampToBudget = (ms: number) => clampToDeadline(ms, budgetDeadline)
 
   // FIRST, before anything that touches the renderer.
   //
@@ -968,19 +1054,36 @@ export async function execAct(args: unknown): Promise<CommandResult> {
 
   // `wait` never mutates the page, so it skips target resolution and settle.
   if (a.action === 'wait') {
+    // #162: this branch returns before the pre-dispatch checkpoint below, so
+    // it carries its own. A spent clock is named as the BUDGET: "wait timed
+    // out" would blame the page for a wait that never ran.
+    if (budgetLeftMs() <= 0) {
+      return {
+        ok: false,
+        status: 'error',
+        error: budgetExhaustedBeforeDispatchError('wait', budgetMs),
+        data: {
+          action: 'wait',
+          url: urlBefore,
+          budget_exhausted: true,
+          input: 'none',
+          ...localDiagnostics(tabId, startedAt),
+        },
+      }
+    }
+    // timeout_ms <= 0 is treated as unset, matching the backend's reading.
+    // Clamped to the command budget (#162): outside a batch the backend
+    // sizes the budget to fit the wait, so the clamp is a no-op; inside
+    // one, the shared clock is the honest bound, and a clamped window that
+    // misses is marked so the miss is never read as the page's failure.
+    const askedWaitMs =
+      typeof a.timeout_ms === 'number' && a.timeout_ms > 0 ? a.timeout_ms : DEFAULT_WAIT_MS
+    const waitWindowMs = clampToBudget(askedWaitMs)
     // Raced against a dialog opening mid-wait (#169): the poll loop's
     // evaluates would otherwise queue behind the suspended renderer and burn
     // the whole timeout learning nothing, when the cause is known by name
     // the moment it opens.
-    const raced = await raceStandingDialog(
-      tabId,
-      performWait(
-        tabId,
-        a.wait_for,
-        // timeout_ms <= 0 is treated as unset, matching the backend's reading.
-        typeof a.timeout_ms === 'number' && a.timeout_ms > 0 ? a.timeout_ms : DEFAULT_WAIT_MS,
-      ),
-    )
+    const raced = await raceStandingDialog(tabId, performWait(tabId, a.wait_for, waitWindowMs))
     if (raced.kind === 'dialog') {
       const d = raced.dialog
       return {
@@ -997,6 +1100,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       }
     }
     const { found, condition } = raced.value
+    const waitClamped = waitWindowMs < askedWaitMs
     const data = await buildVerification({
       action: 'wait',
       target: null,
@@ -1008,9 +1112,28 @@ export async function execAct(args: unknown): Promise<CommandResult> {
       elementSession: tabId,
       inputMode: 'none',
       settleResult: null,
-      extra: { condition, found, waited_ms: Date.now() - startedAt },
+      budgetDeadline,
+      extra: {
+        condition,
+        found,
+        waited_ms: Date.now() - startedAt,
+        ...(waitClamped && !found ? { budget_clamped: true } : {}),
+      },
     })
-    return { ok: found, status: found ? 'success' : 'error', data, ...(found ? {} : { error: `wait timed out on ${condition}` }) }
+    return {
+      ok: found,
+      status: found ? 'success' : 'error',
+      data,
+      ...(found
+        ? {}
+        : {
+            error: waitClamped
+              ? `wait timed out on ${condition} after ~${waitWindowMs}ms: the window was ` +
+                `clamped from ${askedWaitMs}ms by the command's time budget, so the ` +
+                'condition may not have been watched long enough to appear'
+              : `wait timed out on ${condition}`,
+          }),
+    }
   }
 
   let objectId: string | null = null
@@ -1121,6 +1244,26 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // read as "what the drag hit".
   if (pointTarget) extra[a.action === 'drag' ? 'hit_from' : 'hit'] = pointTarget.description
 
+  // #162: the last pre-dispatch checkpoint. Pre-flight (attach, liveness,
+  // resolution, geometry) spends against the same wall clock as everything
+  // else; when it consumed the whole budget, say NOTHING was delivered and
+  // mean it, before a probe is armed or any input goes out.
+  if (budgetLeftMs() <= 0) {
+    return {
+      ok: false,
+      status: 'error',
+      error: budgetExhaustedBeforeDispatchError(a.action, budgetMs),
+      data: {
+        action: a.action,
+        ...(target ? { target } : {}),
+        url: urlBefore,
+        budget_exhausted: true,
+        input: 'none',
+        ...localDiagnostics(tabId, startedAt),
+      },
+    }
+  }
+
   // Armed AFTER target resolution so the probe cannot count our own setup: the
   // geometry and hit-test reads run in-page, and neither produces any of the
   // event types above. (The chooser watcher that used to ride this probe is
@@ -1170,6 +1313,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
               button,
               clickCount,
               modifiers,
+              deadline: budgetDeadline,
             })
             inputMode = 'trusted'
             if (clickThrough) {
@@ -1219,7 +1363,12 @@ export async function execAct(args: unknown): Promise<CommandResult> {
             extra.synthetic_reason = 'element has no layout box (hidden or zero-size)'
           }
         } else if (explicitPoint) {
-          await trustedClick(tabId, explicitPoint, { button, clickCount, modifiers })
+          await trustedClick(tabId, explicitPoint, {
+            button,
+            clickCount,
+            modifiers,
+            deadline: budgetDeadline,
+          })
           inputMode = 'trusted'
         }
         break
@@ -1264,7 +1413,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
           previousValue = await readValue(elementSession, objectId)
         }
         if (a.value) {
-          await typeText(tabId, a.value)
+          await typeText(tabId, a.value, budgetDeadline)
           inputMode = 'trusted'
         }
         break
@@ -1339,7 +1488,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
                 },
               }
             }
-            await trustedClick(tabId, composed, { modifiers })
+            await trustedClick(tabId, composed, { modifiers, deadline: budgetDeadline })
             inputMode = 'trusted'
           }
           // Deadlined for the same reason the dispatch itself is, and this is
@@ -1422,7 +1571,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
         const direction = a.direction ?? 'down'
         const deltaX = direction === 'left' ? -amount : direction === 'right' ? amount : 0
         const deltaY = direction === 'up' ? -amount : direction === 'down' ? amount : 0
-        const at = pointFrom(a.coordinate) ?? (await viewportCentre(tabId))
+        const at = pointFrom(a.coordinate) ?? (await viewportCentre(tabId, budgetDeadline))
         await trustedWheel(tabId, at, { x: deltaX, y: deltaY }, modifiers)
         inputMode = 'trusted'
         extra.scrolled = { direction, amount_px: amount }
@@ -1470,14 +1619,62 @@ export async function execAct(args: unknown): Promise<CommandResult> {
             error: 'drag needs a resolvable source (ref or coordinate) and a to_ref destination',
           }
         }
-        await trustedDrag(tabId, from, to, modifiers)
+        // The destination resolution above can eat the remaining budget, and
+        // once the press goes out the drag MUST complete (a held button is
+        // worse). So the can-this-afford-to-start question is answered here,
+        // where refusing still honestly means nothing was delivered.
+        if (budgetLeftMs() <= 0) {
+          return {
+            ok: false,
+            status: 'error',
+            error: budgetExhaustedBeforeDispatchError('drag', budgetMs),
+            data: {
+              action: 'drag',
+              ...(target ? { target } : {}),
+              url: urlBefore,
+              budget_exhausted: true,
+              input: 'none',
+              ...localDiagnostics(tabId, startedAt),
+            },
+          }
+        }
+        const dragOutcome = await trustedDrag(tabId, from, to, modifiers, budgetDeadline)
         inputMode = 'trusted'
+        if (dragOutcome.degraded) {
+          // A zero-glide drag may not have registered as a drag at all; the
+          // marker is what keeps `ok: true` from being an unverified claim.
+          extra.drag_degraded = true
+          extra.drag_moves_sent = dragOutcome.movesSent
+        }
         break
       }
       default:
         return { ok: false, status: 'error', error: `unknown action: ${String(a.action)}` }
     }
   } catch (e) {
+    if (e instanceof InputBudgetExhausted) {
+      // #162: the sum of healthy dispatches reached the wire budget. This is
+      // the failure that replaces the backend's payload-less transport
+      // timeout, so the payload carries the exact progress: with
+      // `delivered_count > 0` the page HOLDS partial input (a half-typed
+      // field), and re-sending the whole value is the bug the copy warns off.
+      return {
+        ok: false,
+        status: 'error',
+        error: budgetExhaustedMidActionError(a.action, e, budgetMs),
+        data: {
+          action: a.action,
+          ...(target ? { target } : {}),
+          url: urlBefore,
+          budget_exhausted: true,
+          delivered_count: e.delivered,
+          requested_count: e.requested,
+          progress_unit: e.unit,
+          input: e.delivered > 0 ? 'trusted' : 'none',
+          ...localDiagnostics(tabId, startedAt),
+        },
+      }
+    }
     if (e instanceof InputDispatchStalled) {
       // The synchronous twin of the post-dispatch check below: an event
       // reached the page and its handler suspended the renderer BEFORE Chrome
@@ -1609,8 +1806,12 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   )
   const agentTimeoutMs = typeof a.timeout_ms === 'number' && a.timeout_ms > 0 ? a.timeout_ms : null
   let settleResult: SettleResult
+  let settleAskedMs: number
+  let settleWindowMs: number
   if (!hasWaitCondition && agentTimeoutMs !== null && delivered !== 'no') {
-    const racedSettle = await raceStandingDialog(tabId, settle(tabId, { maxMs: agentTimeoutMs }))
+    settleAskedMs = agentTimeoutMs
+    settleWindowMs = clampToBudget(settleAskedMs)
+    const racedSettle = await raceStandingDialog(tabId, settle(tabId, { maxMs: settleWindowMs }))
     if (racedSettle.kind === 'dialog') {
       return pendingDialogResult(
         a.action,
@@ -1624,7 +1825,18 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     }
     settleResult = racedSettle.value
   } else {
-    settleResult = await settle(tabId)
+    // The default window clamps to the budget too (#162): past the deadline
+    // this returns an honest `reason: 'deadline'` in ~0ms rather than
+    // spending time the payload does not have.
+    settleAskedMs = DEFAULT_MAX_MS
+    settleWindowMs = clampToBudget(settleAskedMs)
+    settleResult = await settle(tabId, { maxMs: settleWindowMs })
+  }
+  // A clamped settle that hit its shrunken deadline is the BUDGET's doing:
+  // `settled: false` alone reads as "the page never went quiet", which may
+  // be false. Marked only when the clamp plausibly changed the verdict.
+  if (settleWindowMs < settleAskedMs && !settleResult.settled) {
+    extra.budget_clamped = true
   }
   // A dialog can open DURING settle too (a deferred handler); the check must
   // come before `buildVerification`, whose probes are renderer-bound and
@@ -1645,16 +1857,23 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   // and spend the timeout on a cause known by name the moment it opened.
   if (hasWaitCondition && delivered !== 'no' && !chooserInterceptedSince(tabId, startedAt)) {
     const waitStart = Date.now()
-    const raced = await raceStandingDialog(
-      tabId,
-      performWait(tabId, a.wait_for, agentTimeoutMs ?? DEFAULT_WAIT_MS),
-    )
+    // Clamped like the widened settle: the backend sizes a single act's
+    // budget to fit its declared wait, so the clamp only bites where the
+    // clock is genuinely shared (a batch). A clamped MISS is marked: an
+    // unmet condition gates a batch, and blaming the page for a window the
+    // budget cut is the wrong-claim class this whole pass removes.
+    const fusedAskedMs = agentTimeoutMs ?? DEFAULT_WAIT_MS
+    const fusedWindowMs = clampToBudget(fusedAskedMs)
+    const raced = await raceStandingDialog(tabId, performWait(tabId, a.wait_for, fusedWindowMs))
     if (raced.kind === 'dialog') {
       return pendingDialogResult(a.action, target, tabId, raced.dialog, inputMode, startedAt, extra)
     }
     extra.condition = raced.value.condition
     extra.found = raced.value.found
     extra.waited_ms = Date.now() - waitStart
+    if (!raced.value.found && fusedWindowMs < fusedAskedMs) {
+      extra.budget_clamped = true
+    }
   }
   // A dialog that opened and already resolved during this act is reported as
   // history: the auto-acknowledged alert is the everyday case, a user
@@ -1681,6 +1900,7 @@ export async function execAct(args: unknown): Promise<CommandResult> {
     elementSession,
     inputMode,
     settleResult,
+    budgetDeadline,
     previousValue,
     extra,
   })
@@ -1720,7 +1940,11 @@ export async function execAct(args: unknown): Promise<CommandResult> {
   return { ok: true, status: 'success', data }
 }
 
-async function viewportCentre(tabId: number): Promise<Point> {
+async function viewportCentre(tabId: number, deadline: number | null = null): Promise<Point> {
+  // #162: this read precedes a dispatch and would otherwise ride the full
+  // 15s CDP deadline past a spent budget; the fallback centre is exactly the
+  // degraded answer it already had for a failing read.
+  if (budgetSpent(deadline)) return { x: 400, y: 300 }
   try {
     const resp = await sendCommand<{ result?: { value?: { x: number; y: number } } }>(
       tabId,
@@ -1729,6 +1953,7 @@ async function viewportCentre(tabId: number): Promise<Point> {
         expression: '({ x: window.innerWidth / 2, y: window.innerHeight / 2 })',
         returnByValue: true,
       },
+      deadline === null ? {} : { deadlineMs: clampToDeadline(15_000, deadline) },
     )
     const value = resp.result?.value
     if (value && typeof value.x === 'number') return value

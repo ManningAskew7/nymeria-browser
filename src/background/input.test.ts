@@ -3,11 +3,13 @@ import {
   dispatchKey,
   FOCUS_LANDED_FN,
   HIT_TEST_FN,
+  InputBudgetExhausted,
   InputDispatchStalled,
   insertText,
   modifierMask,
   TEXT_ENTRY_FN,
   trustedClick,
+  trustedDrag,
   trustedHover,
   trustedWheel,
   typeText,
@@ -517,5 +519,137 @@ describe('focus landed (executed in-page fn)', () => {
 
     other.focus()
     expect(focusLanded.call(cm)).toBe(false)
+  })
+})
+
+describe('wall-clock budget (#162)', () => {
+  /** A typed mock: the file-level one is zero-arg, and these tests read args. */
+  function installBudgetCdpMock(onEvent?: (method: string, params?: unknown) => void) {
+    const sendCommand = vi.fn(async (_t: unknown, method: string, params?: unknown) => {
+      onEvent?.(method, params)
+      return {}
+    })
+    ;(chrome.debugger.sendCommand as unknown) = sendCommand
+    return sendCommand
+  }
+  const mouseTypes = (mock: ReturnType<typeof installBudgetCdpMock>) =>
+    mock.mock.calls
+      .filter((c) => c[1] === 'Input.dispatchMouseEvent')
+      .map((c) => (c[2] as { type: string }).type)
+  const keyEventCount = (mock: ReturnType<typeof installBudgetCdpMock>) =>
+    mock.mock.calls.filter((c) => c[1] === 'Input.dispatchKeyEvent').length
+
+  it('typeText stops at a character boundary with exact progress', async () => {
+    // The overrun class this exists for: every individual ack is healthy, the
+    // SUM is what reaches the budget. Two dispatches per character at 1s each
+    // against a 4.5s deadline: characters 0-2 go out (the check before the
+    // third still passes at t=4s), the check before the fourth throws.
+    vi.useFakeTimers()
+    try {
+      const mock = installBudgetCdpMock((method) => {
+        if (method === 'Input.dispatchKeyEvent') vi.setSystemTime(Date.now() + 1_000)
+      })
+      const deadline = Date.now() + 4_500
+
+      let thrown: unknown
+      try {
+        await typeText(TAB, 'abcdef', deadline)
+      } catch (e) {
+        thrown = e
+      }
+
+      expect(thrown).toBeInstanceOf(InputBudgetExhausted)
+      const e = thrown as InputBudgetExhausted
+      expect(e.delivered).toBe(3)
+      expect(e.requested).toBe(6)
+      expect(e.unit).toBe('characters')
+      // The delivered characters really went out: 3 chars, keyDown + keyUp.
+      expect(keyEventCount(mock)).toBe(6)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('trustedClick refuses the second click of a double-click, naming one delivered', async () => {
+    vi.useFakeTimers()
+    try {
+      const mock = installBudgetCdpMock((method, params) => {
+        if (method === 'Input.dispatchMouseEvent' && (params as { type?: string })?.type === 'mouseReleased') {
+          vi.setSystemTime(Date.now() + 5_000)
+        }
+      })
+      const deadline = Date.now() + 4_000
+
+      await expect(
+        trustedClick(TAB, { x: 10, y: 10 }, { clickCount: 2, deadline }),
+      ).rejects.toMatchObject({ name: 'InputBudgetExhausted', delivered: 1, requested: 2, unit: 'clicks' })
+
+      // One complete click went out; the second never started.
+      expect(mouseTypes(mock)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('trustedDrag past its budget skips the glide but ALWAYS releases the button', async () => {
+    // The degrade path: once the button is down, throwing would leave it held
+    // in the page. The intermediate moves are droppable; the release is not.
+    vi.useFakeTimers()
+    try {
+      const mock = installBudgetCdpMock((method, params) => {
+        if (method === 'Input.dispatchMouseEvent' && (params as { type?: string })?.type === 'mousePressed') {
+          vi.setSystemTime(Date.now() + 10_000)
+        }
+      })
+      const deadline = Date.now() + 5_000
+
+      const outcome = await trustedDrag(TAB, { x: 0, y: 0 }, { x: 100, y: 80 }, 0, deadline)
+
+      // The caller needs to KNOW the glide was dropped: a zero-glide drag can
+      // register as a plain click on delta-tracking pages, and only this
+      // return value lets act.ts mark the payload drag_degraded.
+      expect(outcome.degraded).toBe(true)
+      expect(outcome.movesSent).toBe(0)
+      expect(mouseTypes(mock)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+      const release = mock.mock.calls.find(
+        (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mouseReleased',
+      )?.[2] as { x: number; y: number }
+      expect(release.x, 'the release lands at the destination').toBe(100)
+      expect(release.y).toBe(80)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a drag never throws mid-gesture, even started on a spent clock', async () => {
+    // Deliberately NOT a refusal: trustedDrag has no pre-press throw, because
+    // an exception between press and release would abandon a held button in
+    // the page. The refusal to START a drag on a spent budget is the caller's
+    // (act.ts checks before dispatching; covered in act.test.ts). Once called,
+    // the gesture always completes press-to-release, degraded if it must be.
+    vi.useFakeTimers()
+    try {
+      const mock = installBudgetCdpMock()
+      const deadline = Date.now() - 1
+
+      const outcome = await trustedDrag(TAB, { x: 0, y: 0 }, { x: 10, y: 10 }, 0, deadline)
+
+      expect(outcome).toEqual({ degraded: true, movesSent: 0 })
+      expect(mouseTypes(mock)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('an unhurried drag reports itself whole', async () => {
+    // The healthy path must be distinguishable from the degraded one, or
+    // drag_degraded could be stamped onto every drag and nobody would notice.
+    const mock = installBudgetCdpMock()
+
+    const outcome = await trustedDrag(TAB, { x: 0, y: 0 }, { x: 100, y: 80 }, 0, Date.now() + 60_000)
+
+    expect(outcome.degraded).toBe(false)
+    expect(outcome.movesSent).toBeGreaterThan(0)
+    expect(mouseTypes(mock).at(-1)).toBe('mouseReleased')
   })
 })

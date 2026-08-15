@@ -9,7 +9,8 @@
     "tabs",
     "activeTab",
     "debugger",
-    "webNavigation"
+    "webNavigation",
+    "webRequest"
   ],
   "optional_permissions": [],
   "host_permissions": [],

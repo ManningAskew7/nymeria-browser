@@ -5,6 +5,16 @@ import type { BackgroundSnapshot, ConnectionStatus } from '../shared/types'
 
 const DEFAULT_BASE_URL = 'http://localhost:8000'
 
+/**
+ * The optional host permissions behind page-status reporting (#175): the
+ * webRequest listener only receives events for origins the user has granted,
+ * so without this grant chrome_navigate simply omits `http_status`. Read from
+ * the manifest so there is exactly one copy of the origin list; a hand-kept
+ * duplicate here would let the request drift from what the manifest declares
+ * grantable (and `permissions.request` rejects undeclared origins outright).
+ */
+const PAGE_STATUS_ORIGINS: string[] = chrome.runtime.getManifest().optional_host_permissions ?? []
+
 async function send(request: PopupRequest): Promise<PopupResponse> {
   return (await chrome.runtime.sendMessage(request)) as PopupResponse
 }
@@ -80,6 +90,23 @@ export function Popup() {
   const [error, setError] = useState<string | null>(null)
   const [busy, setBusy] = useState(false)
   const [now, setNow] = useState(Date.now())
+  /** null = still asking Chrome; the button renders disabled until it answers. */
+  const [pageStatusGranted, setPageStatusGranted] = useState<boolean | null>(null)
+
+  useEffect(() => {
+    let mounted = true
+    void chrome.permissions
+      .contains({ origins: PAGE_STATUS_ORIGINS })
+      .then((granted) => {
+        if (mounted) setPageStatusGranted(granted)
+      })
+      .catch(() => {
+        if (mounted) setPageStatusGranted(false)
+      })
+    return () => {
+      mounted = false
+    }
+  }, [])
 
   useEffect(() => {
     let mounted = true
@@ -150,6 +177,20 @@ export function Popup() {
     setBusy(false)
   }
 
+  // Its own button rather than a rider on Connect: `permissions.request` must
+  // run on a direct user gesture, and Connect's async health-check chain
+  // breaks that window. Declining costs only the status field.
+  async function onEnablePageStatus() {
+    setError(null)
+    try {
+      const granted = await chrome.permissions.request({ origins: PAGE_STATUS_ORIGINS })
+      setPageStatusGranted(granted)
+    } catch (err) {
+      logger.error(err)
+      setError((err as Error).message)
+    }
+  }
+
   async function onForget() {
     setBusy(true)
     await send({ kind: 'forget' })
@@ -212,6 +253,32 @@ export function Popup() {
                 {snapshot?.commandCount ?? 0}
                 {snapshot?.lastCommandType ? ` (last: ${snapshot.lastCommandType})` : ''}
               </div>
+            </div>
+            <div className="field">
+              <label>Page status reporting</label>
+              {pageStatusGranted ? (
+                <div className="status-value" style={{ textAlign: 'left' }}>
+                  <span className="dot green" /> enabled
+                </div>
+              ) : (
+                <>
+                  <div className="hint">
+                    Lets the assistant see the HTTP status behind each page it loads (a 404,
+                    a 500, a login wall), so error pages stop reading as success. Chrome
+                    will ask to let the extension observe web requests on all sites; only
+                    main-page status codes are read.
+                  </div>
+                  <div className="btn-row">
+                    <button
+                      className="btn btn-secondary"
+                      onClick={onEnablePageStatus}
+                      disabled={busy || pageStatusGranted === null}
+                    >
+                      Enable
+                    </button>
+                  </div>
+                </>
+              )}
             </div>
             {snapshot && snapshot.debuggerTabs.length > 0 && (
               <div className="alert" style={{ background: 'rgba(250, 175, 50, 0.15)', color: '#caa040' }}>

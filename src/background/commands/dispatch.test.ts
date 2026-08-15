@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { dispatchBrowserCommand, EXECUTORS, setDispatchHooks } from './index'
+import { BUDGET_RESERVE_MS } from '../budget'
 import { standingDialog } from '../dialogs'
 import { setConfig } from '../../utils/storage'
 import type { BrowserCommandEvent } from '../../shared/types'
@@ -397,5 +398,68 @@ describe('owned-dialog pre-flight naming (#169)', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('command budget derivation (#162)', () => {
+  const stubFetch = () => {
+    ;(globalThis as unknown as { fetch: typeof fetch }).fetch = (async () =>
+      new Response(JSON.stringify({ received: true, delivered: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      })) as unknown as typeof fetch
+  }
+
+  const runWithTimeout = async (timeoutSeconds: number) => {
+    stubFetch()
+    const ctxSeen: unknown[] = []
+    const original = EXECUTORS.act
+    ;(EXECUTORS as Record<string, (a: unknown, c?: unknown) => Promise<unknown>>).act = vi.fn(
+      async (_a: unknown, ctx?: unknown) => {
+        ctxSeen.push(ctx)
+        return { ok: true, status: 'success', data: {} }
+      },
+    )
+    try {
+      await dispatchBrowserCommand({
+        type: 'browser_command',
+        command_id: 'bcmd_budget',
+        command_type: 'act',
+        args: { tab_id: 1, action: 'key', value: 'End' },
+        timeout_seconds: timeoutSeconds,
+      } as BrowserCommandEvent)
+    } finally {
+      ;(EXECUTORS as Record<string, unknown>).act = original
+    }
+    return ctxSeen[0] as { deadline: number; budgetMs: number } | undefined
+  }
+
+  it('hands the executor a deadline: the wire budget minus the result reserve', async () => {
+    // The reserve is the feature: an executor that ran to the full wire
+    // budget would finish exactly when the backend stops listening, and the
+    // honest payload would arrive as delivered=false.
+    const before = Date.now()
+    const ctx = await runWithTimeout(30)
+
+    expect(ctx).toBeDefined()
+    expect(ctx!.budgetMs).toBe(30_000)
+    expect(ctx!.deadline).toBeGreaterThanOrEqual(before + 30_000 - BUDGET_RESERVE_MS)
+    expect(ctx!.deadline).toBeLessThanOrEqual(Date.now() + 30_000 - BUDGET_RESERVE_MS)
+  })
+
+  it('no wire budget means no context at all: enforcement stays off', async () => {
+    // One encoding (budget.ts): a command either has a budget or has no ctx.
+    // A ctx full of nulls was the second spelling whose dead fallback
+    // branches the first review round flagged.
+    const ctx = await runWithTimeout(0)
+
+    expect(ctx).toBeUndefined()
+  })
+
+  it('a tiny wire budget keeps a working floor instead of arriving spent', async () => {
+    const before = Date.now()
+    const ctx = await runWithTimeout(2)
+
+    expect(ctx!.deadline).toBeGreaterThanOrEqual(before + 1_000)
   })
 })

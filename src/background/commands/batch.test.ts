@@ -310,13 +310,13 @@ describe('execBatch', () => {
   it('passes the batch tab_id down to actions that omit it', async () => {
     const run = vi.fn(async () => okResult())
     await execBatch({ tab_id: TAB, actions: [{ type: 'act', args: { ref: '@e1' } }] }, run)
-    expect(run).toHaveBeenCalledWith('act', { tab_id: TAB, ref: '@e1' })
+    expect(run).toHaveBeenCalledWith('act', { tab_id: TAB, ref: '@e1' }, undefined)
   })
 
   it('lets an action override the batch tab_id', async () => {
     const run = vi.fn(async () => okResult())
     await execBatch({ tab_id: TAB, actions: [{ type: 'act', args: { tab_id: 9 } }] }, run)
-    expect(run).toHaveBeenCalledWith('act', { tab_id: 9 })
+    expect(run).toHaveBeenCalledWith('act', { tab_id: 9 }, undefined)
   })
 
   it('treats a thrown executor as a failed action rather than crashing', async () => {
@@ -376,5 +376,164 @@ describe('execBatch', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/string "type"/)
     expect(run).not.toHaveBeenCalled()
+  })
+})
+
+describe('batch wall-clock budget (#162)', () => {
+  it('threads the batch deadline into every step: one pool, not per-step grants', async () => {
+    // The backend budgets a batch from what the whole sequence contains, so
+    // the extension-side wall clock must be shared: a step that dawdles
+    // spends the tail's time, and the LAST step still sees the same deadline.
+    const run = vi.fn<(type: string, args: unknown, ctx?: unknown) => Promise<CommandResult>>(
+      async () => okResult(),
+    )
+    const ctx = { deadline: Date.now() + 50_000, budgetMs: 60_000 }
+
+    await execBatch({ tab_id: TAB, actions: [{ type: 'act' }, { type: 'snapshot' }] }, run, ctx)
+
+    expect(run).toHaveBeenCalledTimes(2)
+    expect(run.mock.calls[0][2]).toBe(ctx)
+    expect(run.mock.calls[1][2]).toBe(ctx)
+  })
+
+  it('stops spending when the next step cannot afford to run honestly', async () => {
+    // The failure this designs out: step 1 dawdles, the batch charges on, and
+    // step 2 dies on some INTERNAL deadline with copy that blames the page.
+    // Stopping between steps is where the honest answer is still cheap.
+    vi.useFakeTimers()
+    try {
+      const run = vi.fn<(type: string, args: unknown, ctx?: unknown) => Promise<CommandResult>>(
+        async () => {
+          vi.setSystemTime(Date.now() + 55_000)
+          return okResult()
+        },
+      )
+      const ctx = { deadline: Date.now() + 57_000, budgetMs: 60_000 }
+
+      const result = await execBatch(
+        { tab_id: TAB, actions: [{ type: 'act' }, { type: 'snapshot' }, { type: 'extract_text' }] },
+        run,
+        ctx,
+      )
+
+      expect(run, 'the second step must never start').toHaveBeenCalledTimes(1)
+      expect(result.ok).toBe(false)
+      const err = String(result.error)
+      expect(err).toMatch(/60s time budget/)
+      expect(err).toMatch(/NOT attempted/)
+      expect(err, 'names the step that will not run').toMatch(/"snapshot"/)
+      const data = result.data as { completed: number; remaining: number }
+      expect(data.completed).toBe(1)
+      expect(data.remaining).toBe(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a load verb needs the bigger floor: 20s left runs a snapshot but not a navigate', async () => {
+    // navigate/history/tabs-create/reload internally wait up to ~25s for the
+    // load; starting one with 20s on the clock is starting it to fail, while
+    // a snapshot with the same 20s is fine. The floor must discriminate.
+    vi.useFakeTimers()
+    try {
+      const mkRun = () =>
+        vi.fn<(type: string, args: unknown, ctx?: unknown) => Promise<CommandResult>>(async () => {
+          vi.setSystemTime(Date.now() + 40_000)
+          return okResult()
+        })
+      const start = Date.now()
+
+      const runA = mkRun()
+      const snap = await execBatch(
+        { tab_id: TAB, actions: [{ type: 'act' }, { type: 'snapshot' }] },
+        runA,
+        { deadline: start + 60_000, budgetMs: 60_000 },
+      )
+      expect(snap.ok).toBe(true)
+      expect(runA).toHaveBeenCalledTimes(2)
+
+      vi.setSystemTime(start)
+      const runB = mkRun()
+      const nav = await execBatch(
+        { tab_id: TAB, actions: [{ type: 'act' }, { type: 'navigate' }] },
+        runB,
+        { deadline: start + 60_000, budgetMs: 60_000 },
+      )
+      expect(nav.ok).toBe(false)
+      expect(runB, 'the navigate must not start on 20s').toHaveBeenCalledTimes(1)
+
+      vi.setSystemTime(start)
+      const runC = mkRun()
+      const reload = await execBatch(
+        { tab_id: TAB, actions: [{ type: 'act' }, { type: 'tabs', args: { action: 'reload' } }] },
+        runC,
+        { deadline: start + 60_000, budgetMs: 60_000 },
+      )
+      expect(reload.ok, 'tabs reload is a load verb too').toBe(false)
+      expect(runC).toHaveBeenCalledTimes(1)
+
+      vi.setSystemTime(start)
+      const runD = mkRun()
+      const list = await execBatch(
+        { tab_id: TAB, actions: [{ type: 'act' }, { type: 'tabs', args: { action: 'list' } }] },
+        runD,
+        { deadline: start + 60_000, budgetMs: 60_000 },
+      )
+      expect(list.ok, 'tabs list loads nothing and keeps the small floor').toBe(true)
+      expect(runD).toHaveBeenCalledTimes(2)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('without a budget the stop-spending gate never fires', async () => {
+    const run = vi.fn(async () => okResult())
+
+    const result = await execBatch(
+      { tab_id: TAB, actions: [{ type: 'act' }, { type: 'navigate' }] },
+      run,
+    )
+
+    expect(result.ok).toBe(true)
+    expect(run).toHaveBeenCalledTimes(2)
+  })
+
+  it('an unmet condition on a clamped window says the budget cut it, not just the page', async () => {
+    // The gate still stops the batch (the checkpoint was NOT confirmed), but
+    // an agent reading "condition was not met" after a 1s clamped watch of a
+    // 10s ask would wrongly conclude the page never got there.
+    const run = vi.fn<(type: string, args: unknown, ctx?: unknown) => Promise<CommandResult>>(
+      async () =>
+        okResult({ found: false, condition: 'text:Welcome', waited_ms: 900, budget_clamped: true }),
+    )
+    const ctx = { deadline: Date.now() + 50_000, budgetMs: 60_000 }
+
+    const result = await execBatch(
+      { tab_id: TAB, actions: [{ type: 'act' }, { type: 'snapshot' }] },
+      run,
+      ctx,
+    )
+
+    expect(result.ok).toBe(false)
+    const err = String(result.error)
+    expect(err).toMatch(/wait condition \(text:Welcome\)/)
+    expect(err).toMatch(/cut short by the batch time budget/)
+    expect(err).toMatch(/re-check the page/)
+  })
+
+  it('an unmet condition with an unclamped window keeps the plain copy', async () => {
+    const run = vi.fn<(type: string, args: unknown, ctx?: unknown) => Promise<CommandResult>>(
+      async () => okResult({ found: false, condition: 'text:Welcome', waited_ms: 10_000 }),
+    )
+    const ctx = { deadline: Date.now() + 50_000, budgetMs: 60_000 }
+
+    const result = await execBatch(
+      { tab_id: TAB, actions: [{ type: 'act' }, { type: 'snapshot' }] },
+      run,
+      ctx,
+    )
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).not.toMatch(/cut short/)
   })
 })

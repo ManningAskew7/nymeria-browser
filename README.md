@@ -36,6 +36,8 @@ src/
 │   ├── snapshotRefs.ts frame-scoped @eN ref table with staleness reasons
 │   ├── consoleBuffer.ts / networkBuffer.ts   CDP capture, filled from attach
 │   ├── navWatch.ts     per-tab navigation lifecycle from webNavigation events
+│   ├── statusWatch.ts  last main-frame HTTP status per tab via webRequest (#175; needs the runtime host grant)
+│   ├── budget.ts       per-command wall-clock budget vocabulary (#162)
 │   ├── dialogs.ts      Page-domain dialog ownership + answering policy (#169)
 │   ├── delivery.ts     isolated-world input-delivery probe
 │   └── commands/       one executor per wire command type
@@ -95,6 +97,13 @@ give you HTTPS for free; see the backend's remote-access guide.
         -d '{"name":"chrome-extension"}'
    ```
 4. Click the extension icon → paste base URL + token → **Connect**.
+5. Optional: click **Enable** under "Page status reporting" in the popup. This grants
+   the `https://*/*` host permission that lets the `webRequest` listener see
+   main-frame responses, so `chrome_navigate`, tab create, and reload can
+   report the page's real HTTP status (`http_status: 404` instead of a clean
+   "navigated"). It is a separate button, not part of Connect, because Chrome
+   only shows the grant prompt on a direct click. Skipped, everything still
+   works; the status field is simply omitted.
 
 On success the popup shows your identity, "Connected", and a running event counter. Send a chat via the CLI (`cd Nymeria && python3 run.py cli`) or another client — you'll see events tick over in the popup's "Last event" panel.
 
