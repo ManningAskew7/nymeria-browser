@@ -1,5 +1,6 @@
 import { budgetSpent } from './budget'
 import { sendCommand, type Cdp } from './debuggerSession'
+import { resolveNodeInProbeWorld } from './worlds'
 
 /**
  * Trusted input primitives.
@@ -275,6 +276,10 @@ export async function elementGeometry(target: Cdp, objectId: string): Promise<{ 
  * Handles one level of nesting: a frame whose parent is the main document.
  * Deeper nesting would need the chain walked, which no real checkout has
  * needed so far; the offset simply degrades to the outermost frame.
+ *
+ * The owner handle is minted in the PROBE WORLD (#160): this offset is ADDED
+ * to every in-frame click point, so a main-world `getBoundingClientRect` or
+ * `getComputedStyle` lie shifted every click inside the frame.
  */
 export async function frameOffset(tabId: number, frameId: string): Promise<Point> {
   const zero = { x: 0, y: 0 }
@@ -283,12 +288,7 @@ export async function frameOffset(tabId: number, frameId: string): Promise<Point
       frameId,
     })
     if (!owner.backendNodeId) return zero
-    const resolved = await sendCommand<{ object?: { objectId?: string } }>(
-      tabId,
-      'DOM.resolveNode',
-      { backendNodeId: owner.backendNodeId },
-    )
-    const objectId = resolved.object?.objectId
+    const objectId = await resolveNodeInProbeWorld(tabId, owner.backendNodeId)
     if (!objectId) return zero
     const offset = await callOn<Point | null>(
       tabId,

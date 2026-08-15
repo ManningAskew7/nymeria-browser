@@ -33,6 +33,7 @@ import {
   type Point,
 } from '../input'
 import { commitSeq, commitSince, navigationPending, waitForNavSignal } from '../navWatch'
+import { evaluateInProbeWorld, resolveNodeInProbeWorld, withProbeWorld } from '../worlds'
 import { failuresSince as networkFailuresSince } from '../networkBuffer'
 import { resolve as resolveRef, type StaleReason } from '../snapshotRefs'
 import { DEFAULT_MAX_MS, rendererResponsive, settle, type SettleResult } from '../settle'
@@ -389,38 +390,33 @@ interface PointTarget {
  * "Clicked at (65, 146)". Naming what was under the point makes that
  * self-evident (`hit: "body"`) instead of a confident nothing.
  *
- * Reads the main world, so a hostile page could in principle lie about both
- * answers (the standing `elementFromPoint` caveat, backlog #160). For the
- * guard that only returns this path to how it behaved before the guard
- * existed; for the description it is one more page-derived string, which the
- * whole payload already is. Failing to answer counts as NOT a file input: a
- * probe that cannot run must not block an otherwise valid click.
+ * Runs in the PROBE WORLD (#160), so `elementFromPoint` and the getters the
+ * description reads are the pristine built-ins: a page that overrides them in
+ * its own world can no longer delete the coordinate-path file-input refusal
+ * or forge what the point landed on. Failing to answer still counts as NOT a
+ * file input (a probe that cannot run must not block an otherwise valid
+ * click; the page-wide chooser interception is the backstop), and it never
+ * re-runs in the main world.
  */
 async function describePoint(tabId: number, point: Point | null): Promise<PointTarget | null> {
   if (!point) return null
-  try {
-    const resp = await sendCommand<{ result?: { value?: PointTarget | null } }>(
-      tabId,
-      'Runtime.evaluate',
-      {
-        // The verdict is computed FIRST and the description is separately
-        // guarded, so a page whose getters throw loses the label and keeps the
-        // safety answer. The other order let a hostile `textContent` getter
-        // delete the file-input refusal.
-        expression: `(() => {
-          const el = document.elementFromPoint(${Math.round(point.x)}, ${Math.round(point.y)});
-          if (!el) return null;
-          const opens = (function(){ ${OPENS_FILE_CHOOSER} }).call(el) === true;
-          const description = (function(){ ${DESCRIBE_ELEMENT} }).call(el);
-          return { description: String(description || 'unknown'), opensFileChooser: opens };
-        })()`,
-        returnByValue: true,
-      },
-    )
-    return resp.result?.value ?? null
-  } catch {
-    return null
-  }
+  // The verdict is computed FIRST and the description is separately guarded,
+  // so an element whose getters throw loses the label and keeps the safety
+  // answer. The other order let a hostile `textContent` getter delete the
+  // file-input refusal (pre-world history, kept on principle: the world
+  // protects the PRIMITIVES, not a page-defined getter the description walks
+  // into via named access).
+  const value = await evaluateInProbeWorld<PointTarget | null>(
+    tabId,
+    `(() => {
+      const el = document.elementFromPoint(${Math.round(point.x)}, ${Math.round(point.y)});
+      if (!el) return null;
+      const opens = (function(){ ${OPENS_FILE_CHOOSER} }).call(el) === true;
+      const description = (function(){ ${DESCRIBE_ELEMENT} }).call(el);
+      return { description: String(description || 'unknown'), opensFileChooser: opens };
+    })()`,
+  )
+  return value ?? null
 }
 
 /**
@@ -693,15 +689,29 @@ async function currentUrl(tabId: number): Promise<string | null> {
   }
 }
 
+/** The probe world could not be created: fail CLOSED, never fall back to the
+ *  main world (a main-world resolution is exactly the steerable read #160
+ *  exists to remove). Transient by nature: a page cannot cause it. */
+function probeWorldUnavailableError(what: string): string {
+  return (
+    `${what} could not run in this tab's isolated inspection context (the tab is ` +
+    'likely mid-navigation or was just closed). Retry, and if it persists ' +
+    're-read the page or use a fresh tab.'
+  )
+}
+
 /**
- * Resolve a target to a CDP Runtime objectId.
+ * Resolve a target to a CDP Runtime objectId, minted IN the probe world.
  *
  * `@e5`      -> snapshot ref, validated against the URL it was minted on
- * `css=...`  -> document.querySelector
- * `xpath=...`-> document.evaluate
+ * `css=...`  -> document.querySelector, evaluated in the probe world
+ * `xpath=...`-> document.evaluate, evaluated in the probe world
  *
- * A stale ref returns a typed error naming the fix rather than resolving a
- * backendNodeId that now points into a different document.
+ * The world is the point (#160): every later read AND mutation runs through
+ * `Runtime.callFunctionOn` on this one handle, so minting it in the isolated
+ * world gives the whole act pristine primitives a hostile page cannot
+ * override. A stale ref returns a typed error naming the fix rather than
+ * resolving a backendNodeId that now points into a different document.
  */
 async function resolveTarget(
   tabId: number,
@@ -717,12 +727,7 @@ async function resolveTarget(
       ? { tabId, sessionId: resolution.sessionId }
       : tabId
     try {
-      const resp = await sendCommand<{ object?: { objectId?: string } }>(
-        session,
-        'DOM.resolveNode',
-        { backendNodeId: resolution.backendNodeId },
-      )
-      const objectId = resp.object?.objectId
+      const objectId = await resolveNodeInProbeWorld(session, resolution.backendNodeId)
       if (!objectId) {
         return {
           ok: false,
@@ -752,11 +757,16 @@ async function resolveTarget(
     const expression = isCss
       ? `document.querySelector(${JSON.stringify(query)})`
       : `document.evaluate(${JSON.stringify(query)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`
-    const evald = await sendCommand<{ result: { objectId?: string; subtype?: string } }>(
-      tabId,
-      'Runtime.evaluate',
-      { expression, returnByValue: false },
+    const evald = await withProbeWorld(tabId, (contextId) =>
+      sendCommand<{ result: { objectId?: string; subtype?: string } }>(tabId, 'Runtime.evaluate', {
+        expression,
+        returnByValue: false,
+        contextId,
+      }),
     )
+    if (evald === null) {
+      return { ok: false, error: probeWorldUnavailableError(`the ${isCss ? 'css' : 'xpath'} lookup`) }
+    }
     if (!evald.result.objectId || evald.result.subtype === 'null') {
       return { ok: false, error: `${isCss ? 'css selector' : 'xpath'} matched no element: ${query}` }
     }
@@ -964,22 +974,21 @@ async function performWait(
       }
     }
     if (waitFor.text) {
-      try {
-        const resp = await sendCommand<{ result?: { value?: boolean } }>(tabId, 'Runtime.evaluate', {
-          expression: `document.body ? document.body.innerText.includes(${JSON.stringify(waitFor.text)}) : false`,
-          returnByValue: true,
-        })
-        if (resp.result?.value === true) return { found: true, condition: `text:${waitFor.text}` }
-      } catch {
-        // Context churn mid-wait: keep polling until the deadline.
-      }
+      // Probe world (#160): this answer GATES a batch, so a page faking the
+      // condition met would charge a whole batch onward. A failed evaluate
+      // (world churn mid-wait) keeps polling until the deadline.
+      const seen = await evaluateInProbeWorld<boolean>(
+        tabId,
+        `document.body ? document.body.innerText.includes(${JSON.stringify(waitFor.text)}) : false`,
+      )
+      if (seen === true) return { found: true, condition: `text:${waitFor.text}` }
     }
     if (waitFor.ref) {
       try {
         const url = await currentUrl(tabId)
         const target = await resolveTarget(tabId, waitFor.ref, url)
         if (target.ok) {
-          const connected = await stillConnected(tabId, target.objectId)
+          const connected = await stillConnected(target.session, target.objectId)
           if (connected !== false) return { found: true, condition: `ref:${waitFor.ref}` }
         }
       } catch {
@@ -1502,7 +1511,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           const now = await ackWithinDeadline(readValue(elementSession, objectId))
           if (now !== String(want)) {
             await callOn(
-              tabId,
+              elementSession,
               objectId,
               `function(want){
                 if (this.checked !== want) {
@@ -1945,21 +1954,15 @@ async function viewportCentre(tabId: number, deadline: number | null = null): Pr
   // 15s CDP deadline past a spent budget; the fallback centre is exactly the
   // degraded answer it already had for a failing read.
   if (budgetSpent(deadline)) return { x: 400, y: 300 }
-  try {
-    const resp = await sendCommand<{ result?: { value?: { x: number; y: number } } }>(
-      tabId,
-      'Runtime.evaluate',
-      {
-        expression: '({ x: window.innerWidth / 2, y: window.innerHeight / 2 })',
-        returnByValue: true,
-      },
-      deadline === null ? {} : { deadlineMs: clampToDeadline(15_000, deadline) },
-    )
-    const value = resp.result?.value
-    if (value && typeof value.x === 'number') return value
-  } catch {
-    // fall through
-  }
+  // Probe world (#160): the centre is where the scroll's wheel events are
+  // DISPATCHED, so a main-world lie steered trusted input. The fallback
+  // centre is the same degraded answer a failing read always had.
+  const value = await evaluateInProbeWorld<{ x: number; y: number }>(
+    tabId,
+    '({ x: window.innerWidth / 2, y: window.innerHeight / 2 })',
+    deadline === null ? {} : { deadlineMs: clampToDeadline(15_000, deadline) },
+  )
+  if (value && typeof value.x === 'number') return value
   return { x: 400, y: 300 }
 }
 

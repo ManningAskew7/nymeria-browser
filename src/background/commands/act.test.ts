@@ -156,6 +156,12 @@ function installCdpMock(opts: MockOptions = {}) {
       return new Promise<never>(() => {})
     }
     if (method === 'DOM.resolveNode') {
+      // #160 enforcement: element handles must be minted IN the probe world.
+      // A world-less resolve is a main-world handle, the exact regression this
+      // mock exists to catch, so it fails the test loudly rather than passing.
+      if (params.executionContextId !== TRUST_CONTEXT) {
+        throw new Error('DOM.resolveNode without the probe world: main-world handle regression')
+      }
       return resolveNode ? { object: { objectId: 'obj-1' } } : { object: {} }
     }
     if (method === 'Runtime.callFunctionOn') {
@@ -208,6 +214,22 @@ function installCdpMock(opts: MockOptions = {}) {
         }
         if (deliveryReadThrows) throw new Error(deliveryReadThrows)
         return { result: { value: { n: deliveryCount, f: fileChooserOpened } } }
+      }
+      // #160 enforcement, the document-level twin of the resolveNode check:
+      // these expressions are trust probes (they steer input or gate a batch),
+      // so an evaluate without the probe world's context is a regression. The
+      // settle probe (MutationObserver) and describeFocused (activeElement)
+      // stay main-world BY DECISION and are deliberately not listed.
+      const mustBeInWorld =
+        expression.includes('elementFromPoint') ||
+        expression.includes('innerText.includes') ||
+        expression.includes('innerWidth') ||
+        expression.includes('document.querySelector(') ||
+        expression.includes('document.evaluate(')
+      if (mustBeInWorld && params.contextId !== TRUST_CONTEXT) {
+        throw new Error(
+          `trust probe ran outside the probe world: ${expression.slice(0, 60)}`,
+        )
       }
       // The coordinate-target probe, which has no objectId to ask: one call
       // answers both the file-input guard and what the point landed on.
@@ -943,7 +965,10 @@ describe('verification payload', () => {
     const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
     send.mockImplementation(async (...args: unknown[]) => {
       const params = args[2] as { expression?: string; contextId?: number } | undefined
-      if (params?.expression?.includes('querySelector') && params.contextId === undefined) {
+      // The css resolve runs in the probe world now, so the modeled failure
+      // targets the in-world evaluate (and keeps throwing across the
+      // rebuild-once retry, as a real mid-navigation churn does).
+      if (params?.expression?.includes('querySelector') && params.contextId !== undefined) {
         throw new Error('Inspected target navigated or closed')
       }
       return original(...args)
@@ -1126,7 +1151,11 @@ describe('argument handling', () => {
   })
 
   it('reports a css= target that matches nothing', async () => {
-    ;(chrome.debugger.sendCommand as unknown) = vi.fn(async () => ({ result: { subtype: 'null' } }))
+    ;(chrome.debugger.sendCommand as unknown) = vi.fn(async (_t: unknown, method: string) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'f' } } }
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: 88 }
+      return { result: { subtype: 'null' } }
+    })
     const resolution = await __test.resolveTarget(TAB, 'css=#missing', TAB_URL)
     expect(resolution.ok).toBe(false)
     if (!resolution.ok) expect(resolution.error).toMatch(/matched no element/)
@@ -1651,10 +1680,17 @@ describe('input delivery', () => {
 
       expect(result.ok, `${action} must not be failed by the delivery probe`).toBe(true)
       expect((result.data as Record<string, unknown>).input_delivered).toBeUndefined()
+      // The TRUST world is legitimately created for every ref act; what these
+      // verbs must never pay for is the DELIVERY world (the probe itself).
+      const deliveryWorlds = cdp.mock.calls.filter(
+        (c) =>
+          c[1] === 'Page.createIsolatedWorld' &&
+          (c[2] as { worldName?: string }).worldName === 'nymeria_delivery_probe',
+      )
       expect(
-        methodsOf(cdp),
+        deliveryWorlds,
         `${action} must not pay for a probe it does not need`,
-      ).not.toContain('Page.createIsolatedWorld')
+      ).toHaveLength(0)
     }
   })
 
@@ -2636,5 +2672,138 @@ describe('wall-clock budget (#162)', () => {
     const data = result.data as Record<string, unknown>
     expect('budget_exhausted' in data).toBe(false)
     expect(data.focused, 'no deadline, no enrichment skip').toBeDefined()
+  })
+})
+
+/**
+ * #160: every trust probe runs in the isolated probe world, where the page
+ * cannot override the primitives that answer it. The mock layer already
+ * THROWS on any world-less trust call (see installCdpMock), so a main-world
+ * regression fails half this file; these tests pin the positive shape, the
+ * fail-closed rule, and the rebuild-once staleness recovery explicitly.
+ */
+describe('isolated probe world (#160)', () => {
+  it('mints the element handle in the probe world and pays one world per act', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const worldCalls = cdp.mock.calls.filter(
+      (c) =>
+        c[1] === 'Page.createIsolatedWorld' &&
+        (c[2] as { worldName?: string }).worldName === 'nymeria_probe',
+    )
+    expect(worldCalls).toHaveLength(1)
+    const resolve = cdp.mock.calls.find((c) => c[1] === 'DOM.resolveNode')
+    expect((resolve?.[2] as { executionContextId?: number }).executionContextId).toBe(88)
+  })
+
+  it('describes a bare coordinate in the probe world', async () => {
+    const cdp = installCdpMock({ pointDescription: 'button "Pay"' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [10, 20] })
+
+    expect(result.ok).toBe(true)
+    const describe = cdp.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression).includes('elementFromPoint'),
+    )
+    expect((describe?.[2] as { contextId?: number }).contextId).toBe(88)
+  })
+
+  it('reads the scroll dispatch centre in the probe world', async () => {
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    const centre = cdp.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression).includes('innerWidth'),
+    )
+    expect((centre?.[2] as { contextId?: number }).contextId).toBe(88)
+  })
+
+  it('judges a fused text wait condition in the probe world', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ bodyText: 'Welcome back' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'click',
+      ref: '@e1',
+      wait_for: { text: 'Welcome' },
+      timeout_ms: 300,
+    })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { found?: boolean }).found).toBe(true)
+    const textProbe = cdp.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression).includes('innerText.includes'),
+    )
+    expect((textProbe?.[2] as { contextId?: number }).contextId).toBe(88)
+  })
+
+  it('rebuilds a dead probe world once and completes the resolution', async () => {
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    let evals = 0
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1] as string
+      const params = args[2] as { expression?: string } | undefined
+      if (method === 'Runtime.evaluate' && params?.expression?.includes('querySelector')) {
+        evals += 1
+        // The cached world died with its document: the first in-world call
+        // fails with the context-gone shape, the rebuilt world answers.
+        if (evals === 1) throw new Error('Cannot find context with specified id')
+        return { result: { objectId: 'css-obj' } }
+      }
+      return original(...args)
+    })
+
+    const resolution = await __test.resolveTarget(TAB, 'css=.btn', TAB_URL)
+
+    expect(resolution.ok).toBe(true)
+    const worldCalls = (send.mock.calls as unknown[][]).filter(
+      (c) =>
+        c[1] === 'Page.createIsolatedWorld' &&
+        (c[2] as { worldName?: string }).worldName === 'nymeria_probe',
+    )
+    expect(worldCalls, 'create, then one rebuild').toHaveLength(2)
+  })
+
+  it('fails CLOSED when no probe world can be had: no main-world fallback', async () => {
+    const cdp = installCdpMock({ probeWorld: false })
+
+    const resolution = await __test.resolveTarget(TAB, 'css=.btn', TAB_URL)
+
+    expect(resolution.ok).toBe(false)
+    if (!resolution.ok) expect(resolution.error).toMatch(/isolated inspection context/)
+    // The teeth: a fallback would issue a context-less querySelector evaluate.
+    const mainWorldQueries = cdp.mock.calls.filter(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression).includes('querySelector') &&
+        (c[2] as { contextId?: number }).contextId === undefined,
+    )
+    expect(mainWorldQueries).toHaveLength(0)
+  })
+
+  it('a ref act with no obtainable world refuses through the stale shape, undispatched', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ probeWorld: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/re-read the page/)
+    expect(inputEventTypes(cdp)).toHaveLength(0)
   })
 })

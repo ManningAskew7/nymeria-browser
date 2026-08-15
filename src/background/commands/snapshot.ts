@@ -1,5 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
+import { withProbeWorld } from '../worlds'
 import {
   cachedTree,
   resolve as resolveRef,
@@ -208,14 +209,24 @@ async function resolveScopeNode(
     if (!resolution.ok) return { backendNodeId: null, error: resolution.detail }
     return { backendNodeId: resolution.backendNodeId }
   }
-  const evald = await sendCommand<{ result?: { objectId?: string; subtype?: string } }>(
-    tabId,
-    'Runtime.evaluate',
-    {
+  // Probe world (#160): the selector picks the read ROOT, so a main-world
+  // `querySelector` override could steer what the model believes the page
+  // says. Fail-closed: no world, no main-world fallback.
+  const evald = await withProbeWorld(tabId, (contextId) =>
+    sendCommand<{ result?: { objectId?: string; subtype?: string } }>(tabId, 'Runtime.evaluate', {
       expression: `document.querySelector(${JSON.stringify(scopeSelector)})`,
       returnByValue: false,
-    },
+      contextId,
+    }),
   )
+  if (evald === null) {
+    return {
+      backendNodeId: null,
+      error:
+        'the scope selector could not run in this tab\'s isolated inspection context ' +
+        '(the tab is likely mid-navigation); retry, or read without a scope',
+    }
+  }
   if (!evald.result?.objectId || evald.result.subtype === 'null') {
     return { backendNodeId: null, error: `scope selector matched no element: ${scopeSelector}` }
   }

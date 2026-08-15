@@ -8,6 +8,7 @@ import {
 } from '../debuggerSession'
 import { resetForTests as resetConsole } from '../consoleBuffer'
 import { resetForTests as resetRefs, resolve as resolveRef, set as setRefs } from '../snapshotRefs'
+import { resetForTests as resetWorlds } from '../worlds'
 
 /**
  * Cross-origin iframes are the case that decides whether a checkout flow can
@@ -92,6 +93,7 @@ beforeEach(() => {
   resetRefs()
   resetDebugger()
   resetConsole()
+  resetWorlds()
 })
 
 describe('frame session discovery', () => {
@@ -210,5 +212,46 @@ describe('frame input geometry', () => {
     )
     expect(pressed?.[2]).toMatchObject({ x: 30, y: 40 })
     expect(cdp.mock.calls.some((c) => c[1] === 'DOM.getFrameOwner')).toBe(false)
+  })
+})
+
+describe('frame probe worlds (#160)', () => {
+  it("mints a frame ref's handle in that frame session's own world", async () => {
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION }]]), TAB_URL)
+
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    // The world is created ON the frame session (a cross-origin frame's DOM
+    // is only reachable from its own session), and the handle resolve carries
+    // that session's context id, not the root's.
+    const worldCall = cdp.mock.calls.find(
+      (c) =>
+        c[1] === 'Page.createIsolatedWorld' &&
+        (c[0] as { sessionId?: string }).sessionId === FRAME_SESSION,
+    )
+    expect(worldCall).toBeDefined()
+    const resolveCall = cdp.mock.calls.find((c) => c[1] === 'DOM.resolveNode')
+    expect(resolveCall?.[0]).toMatchObject({ tabId: TAB, sessionId: FRAME_SESSION })
+    expect((resolveCall?.[2] as { executionContextId?: number }).executionContextId).toBe(99)
+  })
+
+  it("composes the frame offset from the ROOT session's world", async () => {
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION }]]), TAB_URL)
+
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    // The <iframe> owner element lives in the MAIN document: its handle is
+    // minted in the root session's world (context 88), on the root session.
+    const ownerResolve = cdp.mock.calls.find(
+      (c) =>
+        c[1] === 'DOM.resolveNode' &&
+        (c[0] as { sessionId?: string }).sessionId === undefined,
+    )
+    expect(ownerResolve).toBeDefined()
+    expect((ownerResolve?.[2] as { executionContextId?: number }).executionContextId).toBe(88)
   })
 })
