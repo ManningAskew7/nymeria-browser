@@ -139,8 +139,8 @@ describe('frame-scoped refs', () => {
     setRefs(
       TAB,
       new Map([
-        ['e1', { backendNodeId: 42 }],
-        ['e2', { backendNodeId: 42, sessionId: FRAME_SESSION }],
+        ['e1', { backendNodeId: 42, role: 'button', name: 'Pay' }],
+        ['e2', { backendNodeId: 42, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }],
       ]),
       TAB_URL,
     )
@@ -155,7 +155,7 @@ describe('frame-scoped refs', () => {
   it('resolves a frame ref through that frame session, not the page session', async () => {
     const cdp = installCdpMock()
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -187,7 +187,7 @@ describe('frame input geometry', () => {
       iframeRect: { left: 200, top: 300 },
     })
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -203,7 +203,7 @@ describe('frame input geometry', () => {
   it('does not offset an element in the main document', async () => {
     const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -219,7 +219,7 @@ describe('frame probe worlds (#160)', () => {
   it("mints a frame ref's handle in that frame session's own world", async () => {
     const cdp = installCdpMock()
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -240,7 +240,7 @@ describe('frame probe worlds (#160)', () => {
   it("composes the frame offset from the ROOT session's world", async () => {
     const cdp = installCdpMock()
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -253,5 +253,51 @@ describe('frame probe worlds (#160)', () => {
     )
     expect(ownerResolve).toBeDefined()
     expect((ownerResolve?.[2] as { executionContextId?: number }).executionContextId).toBe(88)
+  })
+
+  it('an unmeasurable frame offset REFUSES the click instead of dispatching un-offset', async () => {
+    // The old shape degraded to {0,0}, which dispatched the click at the
+    // frame-LOCAL coordinates on the ROOT document: a guaranteed wrong-place
+    // click on whatever main-document element sits there (review round).
+    // Here the ROOT world (which measures the <iframe> owner) cannot be
+    // created while the frame's own world still works.
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const sessionId = (args[0] as { sessionId?: string }).sessionId
+      const params = args[2] as { worldName?: string } | undefined
+      if (args[1] === 'Page.createIsolatedWorld' && !sessionId && params?.worldName === 'nymeria_probe') {
+        return {}
+      }
+      return original(...args)
+    })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/NOT sent/)
+    expect(result.error).toMatch(/isolated inspection context/)
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
+  it('a throwing offset measurement refuses the same way (the catch is fail-closed too)', async () => {
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      if (args[1] === 'DOM.getFrameOwner') throw new Error('Frame with the given id was not found.')
+      return original(...args)
+    })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/NOT sent/)
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
   })
 })

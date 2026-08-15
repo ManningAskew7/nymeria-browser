@@ -18,7 +18,10 @@ import { sendCommand, sessionOf, tabOf, type Cdp, type SendCommandOpts } from '.
  * (`nymeria_delivery_probe`): it carries exclusive page-side state
  * (`__nymDelivery`) with a tested created-once-per-document lifecycle, and
  * sharing it would couple every probe's world churn to that invariant. All
- * TRUST PROBES share `nymeria_probe`, per frame session.
+ * TRUST PROBES share `nymeria_probe`, one per SESSION (the root page session
+ * and each flattened OOPIF session get their own; a same-process subframe
+ * has no session of its own and shares the root's, which is moot today
+ * because refs are never minted inside one, see backlog #160).
  *
  * FAIL-CLOSED rule for callers: a trust probe that cannot get a world must
  * surface its existing degraded/failure shape, NEVER re-run in the main
@@ -91,51 +94,59 @@ export function clearSessionWorlds(tabId: number, sessionId: string): void {
 
 /**
  * Create the named world in the target's own root frame and cache its
- * context id. Returns null on failure (logged; callers surface their own
- * degraded shape).
+ * context id. Returns null on failure (logged with its own line, distinct
+ * from probe failures, so a regression is diagnosable; callers surface
+ * their own honest shape and never fall back to the main world).
  *
- * On a FRAME session the eager domain enables never ran (`doAttach` enables
- * on the root only), and some Page commands require the agent enabled, so a
- * failure there earns one `Page.enable` + retry. Root sessions already have
- * Page enabled (#169) and skip that path. Frame targets do not own
- * tab-modal dialogs, so the enable does not re-route dialog events.
+ * Frame sessions need no special casing: `Page.getFrameTree` and
+ * `Page.createIsolatedWorld` both answer on a flattened OOPIF session with
+ * no domain enable (measured on Chrome 148 in the 2026-08-15 review rig;
+ * `grantUniveralAccess` is the protocol's own spelling). Creating the same
+ * name+frame twice returns the SAME context id, so a concurrent create is
+ * benign.
  */
 export async function createWorld(target: Cdp, worldName: string): Promise<number | null> {
-  const attempt = async (): Promise<number | null> => {
+  try {
     const tree = await sendCommand<{ frameTree?: { frame?: { id?: string } } }>(
       target,
       'Page.getFrameTree',
       {},
     )
     const frameId = tree.frameTree?.frame?.id
-    if (!frameId) return null
+    if (!frameId) {
+      logger.warn(`world creation found no frame (${keyFor(target, worldName)})`)
+      return null
+    }
     const created = await sendCommand<{ executionContextId?: number }>(
       target,
       'Page.createIsolatedWorld',
       { frameId, worldName, grantUniveralAccess: false },
     )
     const contextId = created.executionContextId
-    if (typeof contextId !== 'number') return null
+    if (typeof contextId !== 'number') {
+      logger.warn(`world creation returned nothing (${keyFor(target, worldName)})`)
+      return null
+    }
     worlds.set(keyFor(target, worldName), contextId)
     return contextId
-  }
-  try {
-    const contextId = await attempt()
-    if (contextId === null) logger.warn(`world creation returned nothing (${keyFor(target, worldName)})`)
-    return contextId
   } catch (e) {
-    if (sessionOf(target)) {
-      try {
-        await sendCommand(target, 'Page.enable', {})
-        return await attempt()
-      } catch (retryErr) {
-        logger.warn(`world creation failed on frame session (${keyFor(target, worldName)}):`, retryErr)
-        return null
-      }
-    }
     logger.warn(`world creation failed (${keyFor(target, worldName)}):`, e)
     return null
   }
+}
+
+/**
+ * The fail-closed refusal for a trust step that could not get its world.
+ * Lives here, beside the rule it implements. Transient by nature: a page
+ * cannot cause it (world creation is browser-side), so real ones are races
+ * (navigation, worker recycle, tab close).
+ */
+export function probeWorldUnavailableError(what: string): string {
+  return (
+    `${what} could not run in this tab's isolated inspection context (the tab is ` +
+    'likely mid-navigation or was just closed). Retry, and if it persists ' +
+    're-read the page or use a fresh tab.'
+  )
 }
 
 /** Cache-or-create. */
@@ -175,28 +186,42 @@ export async function withProbeWorld<T>(
   }
 }
 
+export type NodeInProbeWorld =
+  | { ok: true; objectId: string }
+  /** The node no longer resolves: the element is genuinely gone or detached
+   *  (the caller's STALE story applies). */
+  | { ok: false; reason: 'no-node' }
+  /** No world could be created: nothing about the ELEMENT is known (the
+   *  caller must not tell a stale story; `probeWorldUnavailableError` is the
+   *  honest copy). */
+  | { ok: false; reason: 'no-world' }
+
 /**
  * Mint an object handle for a DOM node IN the probe world. Everything later
  * called on that handle (`Runtime.callFunctionOn`) executes in the world,
  * which is what makes the one-handle design safe: probes and the mutating
  * helpers alike inherit pristine primitives from the handle itself.
  *
- * Returns null when the node no longer resolves OR no world can be had;
- * callers already treat a missing handle as their stale/degraded case.
+ * The two failures are DISTINCT on purpose: `no-node` means the element is
+ * gone (stale ref, tell the agent to re-read), `no-world` means the probe
+ * infrastructure itself was unavailable and nothing about the element was
+ * learned. Conflating them made a world-creation hiccup read as "your ref
+ * went stale", sending the agent on a pointless re-read loop (review round).
  * Non-context CDP errors propagate (same contract as `withProbeWorld`).
  */
 export async function resolveNodeInProbeWorld(
   target: Cdp,
   backendNodeId: number,
-): Promise<string | null> {
-  const objectId = await withProbeWorld(target, async (contextId) => {
+): Promise<NodeInProbeWorld> {
+  const result = await withProbeWorld(target, async (contextId) => {
     const resp = await sendCommand<{ object?: { objectId?: string } }>(target, 'DOM.resolveNode', {
       backendNodeId,
       executionContextId: contextId,
     })
-    return resp.object?.objectId ?? null
+    const objectId = resp.object?.objectId
+    return objectId ? ({ ok: true, objectId } as NodeInProbeWorld) : ({ ok: false, reason: 'no-node' } as NodeInProbeWorld)
   })
-  return objectId
+  return result ?? { ok: false, reason: 'no-world' }
 }
 
 /**

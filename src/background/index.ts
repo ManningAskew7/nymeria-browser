@@ -3,10 +3,11 @@ import { clearConfig, ensureClientId, getConfig, setConfig } from '../utils/stor
 import { HttpError, ping, whoami } from './api'
 import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
-import { activeTabs as activeDebuggerTabs, onCdpEvent } from './debuggerSession'
+import { activeTabs as activeDebuggerTabs } from './debuggerSession'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
-import { clearSessionWorlds, clearTabWorlds } from './worlds'
-import { clear as clearRefs, clearSession as clearSessionRefs, dropTab as dropTabRefs } from './snapshotRefs'
+import { clearTabWorlds } from './worlds'
+import { clear as clearRefs, dropTab as dropTabRefs } from './snapshotRefs'
+import { installRefInvalidation } from './refInvalidation'
 import { installCdpConsoleCapture } from './consoleBuffer'
 import { clearTabNav, installNavWatch } from './navWatch'
 import { clearTabStatus, installStatusWatch } from './statusWatch'
@@ -55,8 +56,9 @@ installStatusWatch()
 // probes', frame worlds included: subframe documents die with the top one).
 // A SUBFRAME commit deliberately does neither here: the delivery world is
 // top-frame-only so it survives by construction, and per-frame ref
-// invalidation rides Target.detachedFromTarget below (an OOPIF navigating
-// cross-process detaches its old session), with the act-time detached and
+// invalidation rides Target.detachedFromTarget (refInvalidation.ts; an OOPIF
+// navigating cross-process detaches its old session), with the act-time
+// detached and
 // fingerprint checks covering the in-process remainder. Network history is
 // kept deliberately: the requests a navigation itself fired are often the
 // answer to "why did that go wrong".
@@ -80,20 +82,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   clearTabNav(tabId)
 })
 
-// Per-frame invalidation: a frame session detaching means that OOPIF
-// navigated cross-process or left the page, so its refs (and its cached
-// probe world) are dead while the top document lives on. Whole-map clearing
-// here would make ad-heavy pages unusable (their iframes churn constantly);
-// the in-process remainder is covered at act time by the detached and
-// fingerprint checks. debuggerSession's frame tracking consumes the same
-// event for its own session map; the two subscribers are independent.
-onCdpEvent((tabId, method, params) => {
-  if (method !== 'Target.detachedFromTarget') return
-  const p = params as { sessionId?: string }
-  if (!p.sessionId) return
-  clearSessionRefs(tabId, p.sessionId)
-  clearSessionWorlds(tabId, p.sessionId)
-})
+// Per-frame ref and world invalidation (Target.detachedFromTarget); the
+// module docstring carries the rationale.
+installRefInvalidation()
 
 async function bootstrap(): Promise<void> {
   logger.log('bootstrap')

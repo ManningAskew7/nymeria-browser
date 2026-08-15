@@ -26,6 +26,8 @@
  * command is running. A record lost to a recycle degrades to "unknown".
  */
 
+import { sameResource } from './urlMatch'
+
 export interface StatusRecord {
   url: string
   status: number
@@ -72,23 +74,10 @@ export function clearTabStatus(tabId: number): void {
   tabs.delete(tabId)
 }
 
-/**
- * URL equality with the fragment ignored: a navigate to `/page#sec` commits
- * with the fragment while the request that produced it has none, and a
- * mismatch on that difference would throw away a correct record.
- */
-function sameResource(a: string, b: string): boolean {
-  if (a === b) return true
-  try {
-    const ua = new URL(a)
-    const ub = new URL(b)
-    ua.hash = ''
-    ub.hash = ''
-    return ua.href === ub.href
-  } catch {
-    return false
-  }
-}
+// URL equality with the fragment ignored (shared, urlMatch.ts): a navigate
+// to `/page#sec` commits with the fragment while the request that produced
+// it has none, and a mismatch on that difference would throw away a correct
+// record.
 
 /**
  * The status of the response behind a navigation this command attributed to

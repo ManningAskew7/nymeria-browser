@@ -12,9 +12,10 @@
  * browser-side, cleared on browser restart, when tab ids change anyway), so
  * a recycle cannot resurrect collisions.
  *
- * MERGE SEMANTICS: a new read of the SAME document (URL compared without its
- * fragment) adds its refs to the map instead of replacing it, so every ref
- * minted since the last navigation stays valid, including across scoped
+ * MERGE SEMANTICS: a new read of the SAME document (urlMatch.sameDocumentUrl:
+ * anchor fragments ignored, hash-ROUTE fragments count as moving) adds its
+ * refs to the map instead of replacing it, so every ref minted since the
+ * last navigation stays valid, including across scoped
  * (`scope_ref`/`scope_selector`) re-reads, which used to discard the
  * full-page map wholesale. A different URL replaces outright.
  *
@@ -29,7 +30,30 @@
  * ref stopped working. Acting on a stale ref must never silently mis-click.
  */
 
+import { sameDocumentUrl } from './urlMatch'
+
 type Ref = string // "e1", "e2", ...
+
+/**
+ * Normalize an AX name for fingerprint use: whitespace collapsed, bounded.
+ * MINT and CHECK must both go through this (snapshot.ts's formatTree and
+ * act.ts's drift check import it), or normalization drift alone would refuse
+ * every fingerprinted verb.
+ */
+export function normalizeAxName(raw: string): string {
+  return raw.trim().replace(/\s+/g, ' ').slice(0, 200)
+}
+
+/**
+ * The comparison key for a fingerprint name: digit runs collapsed to `#`, so
+ * a label whose NUMBERS tick between mint and act ("Cart (3)" to "Cart (4)",
+ * timers, prices, badge counts) still matches, while any TEXT change
+ * ("Confirm" to "Delete", "Alice" to "Bob") still refuses. The placeholder
+ * keeps "A1B" from colliding with "AB": digits are ignored, not deleted.
+ */
+export function fingerprintNameKey(name: string): string {
+  return normalizeAxName(name).replace(/\d+/g, '#')
+}
 
 /**
  * Where a ref actually lives, plus what it MEANT when it was minted.
@@ -48,10 +72,12 @@ export interface RefTarget {
   backendNodeId: number
   /** Undefined means the root page session. */
   sessionId?: string
-  /** AX role at mint time ("button"). Empty/absent skips the role compare. */
-  role?: string
-  /** Normalized AX name at mint time. Empty/absent skips the name compare. */
-  name?: string
+  /** AX role at mint time ("button"). Empty string skips the role compare. */
+  role: string
+  /** Normalized AX name at mint time (normalizeAxName). Empty string skips
+   *  the name compare. Required so no minting path can quietly opt a ref out
+   *  of the drift check by omission. */
+  name: string
 }
 
 interface TabRefs {
@@ -62,7 +88,7 @@ interface TabRefs {
 export type StaleReason = 'no-snapshot' | 'unknown-ref' | 'navigated' | 'stale-read'
 
 export type RefResolution =
-  | { ok: true; backendNodeId: number; sessionId?: string; role?: string; name?: string }
+  | { ok: true; backendNodeId: number; sessionId?: string; role: string; name: string }
   | { ok: false; reason: StaleReason; detail: string }
 
 const cache = new Map<number, TabRefs>()
@@ -125,23 +151,14 @@ export async function withMintLock<T>(tabId: number, fn: () => Promise<T>): Prom
   return run
 }
 
-/** URL comparison for ref validity ignores the fragment: an in-page anchor
- *  click changes no document and must not bounce every held ref. Path and
- *  query changes (pushState included) still count as moving. */
-function sameDocumentUrl(a: string | null, b: string | null): boolean {
-  if (!a || !b) return false
-  if (a === b) return true
-  const strip = (u: string): string => {
-    const hash = u.indexOf('#')
-    return hash === -1 ? u : u.slice(0, hash)
-  }
-  return strip(a) === strip(b)
-}
+// URL comparison for ref validity is urlMatch.sameDocumentUrl: an in-page
+// anchor click changes no document and must not bounce every held ref, but
+// path, query, pushState, and hash-ROUTE changes all count as moving.
 
 /**
  * Record a read's refs and advance the tab's counter.
  *
- * Same document (fragment-insensitive): MERGE, so refs the caller is still
+ * Same document (sameDocumentUrl): MERGE, so refs the caller is still
  * holding from earlier reads survive. Different document: replace. The
  * recorded URL always updates to the latest read's.
  */
@@ -168,7 +185,7 @@ export function set(
 /**
  * Resolve a `@eN` ref for a tab.
  *
- * `currentUrl` is compared (fragment-insensitively) against the URL the
+ * `currentUrl` is compared (sameDocumentUrl) against the URL the
  * snapshot was taken from when both are known; a mismatch is reported as
  * `navigated` rather than resolving a backendNodeId that now points into a
  * different document. An absent key splits honestly on the counter: a

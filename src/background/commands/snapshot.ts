@@ -3,6 +3,7 @@ import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
 import { withProbeWorld } from '../worlds'
 import {
   nextCounter,
+  normalizeAxName,
   resolve as resolveRef,
   set as setRefs,
   withMintLock,
@@ -168,12 +169,13 @@ function formatTree(
         // Role and name ride along as the mint-time FINGERPRINT: act
         // re-reads the same browser-computed pair before dispatching input,
         // so a live node whose meaning changed since this read refuses
-        // instead of firing.
+        // instead of firing. The shared normalizer keeps mint and check from
+        // drifting apart, which would refuse every fingerprinted verb.
         refs.set(refId, {
           backendNodeId: node.backendDOMNodeId,
           sessionId: opts.sessionId,
           role,
-          name: strVal(node.name).trim().replace(/\s+/g, ' ').slice(0, 200),
+          name: normalizeAxName(strVal(node.name)),
         })
         refMarker = ` [ref=@${refId}]`
       }

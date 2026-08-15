@@ -12,7 +12,7 @@ import {
   type StandingDialog as StandingDialogT,
 } from '../dialogs'
 import { installNavWatch, resetForTests as resetNavWatch } from '../navWatch'
-import { resetForTests as resetRefs, set as setRefs } from '../snapshotRefs'
+import { resetForTests as resetRefs, set as setRefs, type RefTarget } from '../snapshotRefs'
 
 // The dialogs seam is mocked so each test INJECTS a recorded dialog state
 // rather than re-driving the CDP event plumbing (which has its own tests in
@@ -32,6 +32,19 @@ vi.mock('../dialogs', async (importOriginal) => {
 
 const TAB = 1
 const TAB_URL = 'https://example.com'
+
+/**
+ * A ref minted the way snapshot.ts now mints them: fingerprint included and
+ * REQUIRED. Defaults match the mock's AX answers (role button, name Pay), so
+ * the whole suite runs with the fingerprint gate ACTIVE and passing; drift
+ * tests override the mint side to force a mismatch.
+ */
+const fpRef = (backendNodeId: number, extra: Partial<RefTarget> = {}): RefTarget => ({
+  backendNodeId,
+  role: 'button',
+  name: 'Pay',
+  ...extra,
+})
 
 interface MockOptions {
   /** null means the element has no layout box (hidden / zero-size). */
@@ -307,7 +320,7 @@ beforeEach(() => {
 
 describe('trusted input', () => {
   it('clicks through browser-level input events, not page-synthesized ones', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -323,7 +336,7 @@ describe('trusted input', () => {
   })
 
   it('double_click presses twice with an increasing click count', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
 
     await execAct({ tab_id: TAB, action: 'double_click', ref: '@e1' })
@@ -335,7 +348,7 @@ describe('trusted input', () => {
   })
 
   it('falls back to synthetic dispatch when the element has no layout box, and says so', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ geometry: null })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -348,7 +361,7 @@ describe('trusted input', () => {
   })
 
   it('refuses the click when another element covers the point, and names it', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ hit: { hit: false, blocker: 'div#cookie-banner' } })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -364,7 +377,7 @@ describe('trusted input', () => {
     // #174: the guard cannot tell a genuine overlay from the target's own
     // widget fronting for it (a styled checkbox's span), so the refusal must
     // hand over both exits rather than dead-ending on "dismiss the overlay".
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ hit: { hit: false, blocker: 'span.styled-box' } })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -381,7 +394,7 @@ describe('trusted input', () => {
     // is a SIBLING of the hidden textarea the ref resolves to, so containment
     // can never accept it. The editor routes a surface click to its input in
     // its own mousedown handler; refusing was blocking a click that works.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({
       hit: { hit: false, blocker: 'pre.CodeMirror-line' },
       textEntry: true,
@@ -401,7 +414,7 @@ describe('trusted input', () => {
     // A navigation or re-render destroys the execution context mid-read. The
     // click still went out; a raw "Cannot find context" error would hide that
     // and blaming the blocker would be a guess.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({
       hit: { hit: false, blocker: 'pre.CodeMirror-line' },
       textEntry: true,
@@ -422,7 +435,7 @@ describe('trusted input', () => {
     // side effect the agent must know about) but the covering element likely
     // consumed it. Claude for Chrome's unverified version of this path types
     // into the void with a confident success message (measured 2026-08-14).
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({
       hit: { hit: false, blocker: 'div#signup-modal' },
       textEntry: true,
@@ -441,7 +454,7 @@ describe('trusted input', () => {
   })
 
   it('fills by inserting text into the focused element and reports the previous value', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ value: 'before@example.com' })
 
     const result = await execAct({
@@ -463,7 +476,7 @@ describe('trusted input', () => {
 
 describe('ref lifecycle', () => {
   it('refuses to act on a ref minted on a different URL and says to re-read', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), 'https://example.com/checkout')
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), 'https://example.com/checkout')
     const cdp = installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -485,7 +498,7 @@ describe('ref lifecycle', () => {
   })
 
   it('reports unknown-ref for a ref that was never minted', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e99' })
@@ -495,7 +508,7 @@ describe('ref lifecycle', () => {
   })
 
   it('reports a ref that resolves to nothing as stale rather than acting', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ resolveNode: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -508,7 +521,7 @@ describe('ref lifecycle', () => {
 
 describe('verification payload', () => {
   it('surfaces console errors raised since the action started', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     // An error from before the action must not be attributed to it.
     pushConsole(TAB, { level: 'error', text: 'stale earlier error', ts: Date.now() - 60_000 })
@@ -557,7 +570,7 @@ describe('verification payload', () => {
     // (started at or after the act began) accepts it.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock()
       const nav = wireNav()
       const flip = urlFlipsOnCommit('https://example.com/thanks')
@@ -586,7 +599,7 @@ describe('verification payload', () => {
   it('reports a still-uncommitted navigation as pending, asserting nothing', async () => {
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock()
       const nav = wireNav()
 
@@ -618,7 +631,7 @@ describe('verification payload', () => {
     // starts, on an earlier Date.now(), which is exactly the unrelated-load
     // case (meta refresh, someone else's slow navigation) the attribution
     // filter exists for. No commit wait is paid and nothing is reported.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     const nav = wireNav()
 
@@ -637,7 +650,7 @@ describe('verification payload', () => {
     // hang red instead of passing slow.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock()
       wireNav()
 
@@ -695,7 +708,7 @@ describe('verification payload', () => {
   it('a same-url re-navigation reads navigated without url_changed', async () => {
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock()
       const nav = wireNav()
 
@@ -719,7 +732,7 @@ describe('verification payload', () => {
     // dialog checkpoint; a deferred beforeunload can open exactly there. The
     // post-verification checkpoint must name it (the #169 invariant), not
     // return a clean success that never mentions chrome_dialog.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     wireNav()
     const dialog: StandingDialogT = {
@@ -750,7 +763,7 @@ describe('verification payload', () => {
   })
 
   it('an SPA pushState url change reports url_changed with no commit', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
     wireNav()
     // pushState updates the committed tab url synchronously with no
@@ -770,7 +783,7 @@ describe('verification payload', () => {
   })
 
   it('waits for the page to settle and reports the outcome', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ settleValue: 'quiet' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -781,7 +794,7 @@ describe('verification payload', () => {
   })
 
   it('reports a deadline settle without failing the action', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ settleValue: 'deadline' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -829,7 +842,7 @@ describe('verification payload', () => {
     // would leave the act unresolved and this test would hang red.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock()
       let body = 'still loading'
       const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
@@ -868,7 +881,7 @@ describe('verification payload', () => {
   })
 
   it('an unmet condition on a delivered click succeeds with found: false, not an error', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ bodyText: 'still loading' })
 
     const result = await execAct({
@@ -892,7 +905,7 @@ describe('verification payload', () => {
     // window itself is widened (visible in the probe's in-page deadline) and
     // no condition/found is emitted, so mere page quiescence can never gate
     // a batch.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1', timeout_ms: 3_000 })
@@ -912,7 +925,7 @@ describe('verification payload', () => {
   it('timeout_ms: 0 runs no wait at all, matching the backend reading of it as unset', async () => {
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       const cdp = installCdpMock()
 
       const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1', timeout_ms: 0 })
@@ -935,7 +948,7 @@ describe('verification payload', () => {
   })
 
   it('a dialog opening during the widened settle is named, not ridden out', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     const confirm: StandingDialogT = {
       type: 'confirm',
@@ -958,7 +971,7 @@ describe('verification payload', () => {
     // Conditions are OR'd; the payload must name the one that held, not the
     // highest-priority one, because `condition` now feeds the batch gate.
     const url = 'https://example.com/done'
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), url)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), url)
     installCdpMock({ bodyText: 'still loading' })
     const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
     get.mockImplementation(async () => ({ id: TAB, url }))
@@ -982,7 +995,7 @@ describe('verification payload', () => {
     // or a debugger detach. Post-#168 this loop runs AFTER input was
     // dispatched: a throw escaping it would lose the whole verification
     // payload and read as "nothing was sent", the double-submit invitation.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
     const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
@@ -1016,8 +1029,8 @@ describe('verification payload', () => {
     setRefs(
       TAB,
       new Map([
-        ['e1', { backendNodeId: 100 }],
-        ['e2', { backendNodeId: 200 }],
+        ['e1', fpRef(100)],
+        ['e2', fpRef(200)],
       ]),
       TAB_URL,
     )
@@ -1045,7 +1058,7 @@ describe('verification payload', () => {
     // transport slack pays for the honest answer; take it.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ bodyText: 'Saved' })
       const nav = wireNav()
       const flip = urlFlipsOnCommit('https://example.com/thanks')
@@ -1081,7 +1094,7 @@ describe('verification payload', () => {
   })
 
   it('a dialog opening during a fused wait is named, not burned through', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ bodyText: 'still loading' })
     const confirm: StandingDialogT = {
       type: 'confirm',
@@ -1112,7 +1125,7 @@ describe('verification payload', () => {
     // undelivered failure would hang this test red.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ deliveryCount: 0 })
 
       const result = await execAct({
@@ -1142,7 +1155,7 @@ describe('argument handling', () => {
   })
 
   it('requires a value for fill', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1' })
     expect(result.ok).toBe(false)
@@ -1185,7 +1198,7 @@ describe('argument handling', () => {
   })
 
   it('selects by visible label, not just by option value', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ selectMatches: true })
 
     const result = await execAct({ tab_id: TAB, action: 'select', ref: '@e1', value: 'Express shipping' })
@@ -1199,7 +1212,7 @@ describe('argument handling', () => {
   })
 
   it('fails a select whose value matches no option', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ selectMatches: false })
 
     const result = await execAct({ tab_id: TAB, action: 'select', ref: '@e1', value: 'Teleport' })
@@ -1216,7 +1229,7 @@ describe('execAct target resolution', () => {
     // focused (the previous field, the page's search box) and the command
     // still reports ok:true. Nothing downstream can tell the difference.
     const mock = installCdpMock()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 77 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(77)]]), TAB_URL)
 
     const result = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'hi' })
 
@@ -1235,7 +1248,7 @@ describe('execAct target resolution', () => {
     // the state the site actually reads never moved. `click` already refuses
     // here; check must not be the soft path around that refusal.
     const mock = installCdpMock({ hit: { hit: false, blocker: 'div.cookie-banner' }, value: null })
-    setRefs(TAB, new Map([['e1', { backendNodeId: 77 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(77)]]), TAB_URL)
 
     const result = await execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
 
@@ -1257,7 +1270,7 @@ describe('execAct target resolution', () => {
     // The styled-checkbox exit is a plain click on the covering element, then
     // a state read to confirm the toggle.
     installCdpMock({ hit: { hit: false, blocker: 'span.styled-box' }, value: null })
-    setRefs(TAB, new Map([['e1', { backendNodeId: 77 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(77)]]), TAB_URL)
 
     const result = await execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
 
@@ -1279,7 +1292,7 @@ describe('input delivery', () => {
    */
 
   it('fails the command when the page provably received no event', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1299,7 +1312,7 @@ describe('input delivery', () => {
     // tab" throws away the cheap fix and the work already done in that tab. It
     // did NOT recover a tab poisoned by an alert(), so closing has to remain the
     // fallback that always works.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1318,7 +1331,7 @@ describe('input delivery', () => {
     // So there can be NOTHING on screen to find. An agent told only "a dialog
     // may be blocking you" looks, sees a clean page, concludes the tool is
     // wrong, and retries the dead tab.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1333,7 +1346,7 @@ describe('input delivery', () => {
     // agent nothing was sent here would invite a retry that double-submits.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ rendererHangsAfterDispatch: true })
 
       const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1359,7 +1372,7 @@ describe('input delivery', () => {
     // command rides the full 30s transport timeout. Measured live 2026-08-12.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       // From the PRESS, not the opening pointer move: an alert() raised by
       // the click handler is reached only once the button goes down.
       installCdpMock({ inputAckHangsFrom: 2 })
@@ -1384,7 +1397,7 @@ describe('input delivery', () => {
     // input[type=file] opens the NATIVE file chooser, which is not browser UI.
     // No CDP domain sees it, no extension API dismisses it, and it blocks the
     // user's browser window until a human deals with it. We shipped no guard.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ isFileInput: true })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1408,7 +1421,7 @@ describe('input delivery', () => {
     // The hidden file input behind a styled upload button is the common shape,
     // and it has no layout box, so click falls through to a synthetic
     // this.click(). That opens the chooser just the same.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ isFileInput: true, geometry: null })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1422,7 +1435,7 @@ describe('input delivery', () => {
 
   it('still clicks ordinary inputs', async () => {
     // The guard must not become "refuse anything that looks like an input".
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ isFileInput: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1449,7 +1462,7 @@ describe('input delivery', () => {
     // Enter or Space on a focused input[type=file] opens the same OS chooser.
     // Scoping the guard to clicks would leave the justification ("the only
     // element whose activation is unrecoverable") only two-thirds honoured.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ isFileInput: true })
 
     const result = await execAct({ tab_id: TAB, action: 'key', ref: '@e1', value: 'Enter' })
@@ -1463,7 +1476,7 @@ describe('input delivery', () => {
     // The guard is about activation, not about the element being present. A
     // context menu is ordinary browser UI the user can close, so refusing it
     // would be the guard overreaching.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ isFileInput: true })
 
     const result = await execAct({ tab_id: TAB, action: 'right_click', ref: '@e1' })
@@ -1479,7 +1492,7 @@ describe('input delivery', () => {
     // asynchronously acks fine and suspends the renderer during this read.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ rendererHangsAfterDispatch: true })
 
       const pending = execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
@@ -1500,7 +1513,7 @@ describe('input delivery', () => {
     // happened.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ inputAckHangsFrom: 1 })
 
       const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1542,7 +1555,7 @@ describe('input delivery', () => {
     // noticing a dead renderer.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ rendererHangs: true })
 
       const pending = execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
@@ -1569,7 +1582,7 @@ describe('input delivery', () => {
     // to learn the same thing.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       const cdp = installCdpMock({ rendererHangs: true })
 
       const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1590,7 +1603,7 @@ describe('input delivery', () => {
     // had to decode them, so this one lists both and commits to neither.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ rendererHangs: true })
 
       const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1611,7 +1624,7 @@ describe('input delivery', () => {
   it('keeps the whole verification payload on the failure', async () => {
     // A failure that drops the diagnostics is a worse trade than the silent
     // success it replaced.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1627,7 +1640,7 @@ describe('input delivery', () => {
     // `input: "trusted"` says which pipe was used. It must keep saying that on
     // a dropped event, because collapsing the two is how the original bug read
     // as success.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1638,7 +1651,7 @@ describe('input delivery', () => {
   })
 
   it('succeeds and records delivery when the event arrived', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 1 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1650,7 +1663,7 @@ describe('input delivery', () => {
   it('does not fail the command when delivery could not be proven either way', async () => {
     // Unprovable is not the same as failed. Turning "we could not check" into
     // an error would make the tool unusable wherever the probe cannot run.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryWorld: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1662,7 +1675,7 @@ describe('input delivery', () => {
   it('treats an action that navigated the page as delivered', async () => {
     // The probe died with its document, so the count is unreadable, but a
     // navigation is proof the input landed.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryReadThrows: 'Cannot find context with specified id' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1675,7 +1688,7 @@ describe('input delivery', () => {
     for (const action of ['click', 'double_click', 'right_click', 'key', 'type']) {
       resetRefs()
       resetDelivery()
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ deliveryCount: 0 })
 
       const result = await execAct({ tab_id: TAB, action, ref: '@e1', value: 'a' })
@@ -1696,7 +1709,7 @@ describe('input delivery', () => {
     ] as const) {
       resetRefs()
       resetDelivery()
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       const cdp = installCdpMock({ deliveryCount: 0, value: 'false' })
 
       const result = await execAct({ tab_id: TAB, action, ref: '@e1', ...extra })
@@ -1718,7 +1731,7 @@ describe('input delivery', () => {
   })
 
   it('arms the probe after target resolution so setup cannot be counted as delivery', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1750,7 +1763,7 @@ describe('delivery in framed pages', () => {
    */
 
   it('does not fail a click whose target lives inside an iframe', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0, pageHasFrames: true, targetInTopDocument: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1761,7 +1774,7 @@ describe('delivery in framed pages', () => {
 
   it('still fails when the target is in the top document the probe watched', async () => {
     // Frames exist, but this target is not in one, so a zero count is real.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0, pageHasFrames: true, targetInTopDocument: true })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1771,7 +1784,7 @@ describe('delivery in framed pages', () => {
   })
 
   it('trusts a zero count outright when the document has no frames at all', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0, pageHasFrames: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1806,7 +1819,7 @@ describe('delivery is only asked about input we actually dispatched', () => {
     // `this.click()`. That produces no TRUSTED event by definition, so probing
     // it would fail the one path chrome_find's own docstring recommends for
     // upload buttons, on a page with nothing wrong with it.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ geometry: null, deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1817,7 +1830,7 @@ describe('delivery is only asked about input we actually dispatched', () => {
   })
 
   it('does not fail a type of the empty string, which dispatches nothing', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: '' })
@@ -1827,7 +1840,7 @@ describe('delivery is only asked about input we actually dispatched', () => {
   })
 
   it('still checks a click that did go in as trusted input', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1895,7 +1908,7 @@ describe('targeting honesty', () => {
     // Blink's DOMNodeId map is keyed on GC liveness, not attachment, so a node
     // React removed but still caches RESOLVES. Acting fires the page handler
     // against a detached node: success reported, nothing on screen.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ targetConnected: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1914,7 +1927,7 @@ describe('targeting honesty', () => {
   it('still acts on a ref whose connectedness cannot be determined', async () => {
     // A dead execution context answers nothing. Unknowable is not detached,
     // and refusing here would fail an action that was about to work.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ targetConnected: null as unknown as boolean })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -1943,7 +1956,7 @@ describe('targeting honesty', () => {
   })
 
   it('names the drag source as such rather than as what the drag hit', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ pointDescription: 'div.card' })
 
     const result = await execAct({
@@ -1964,7 +1977,7 @@ describe('targeting honesty', () => {
     // pre-dispatch twin must not: if the tab went unusable between resolution
     // and now, "unknown, carry on" sends input into a tab already known to be
     // dead, after burning most of the command's budget on the deadline.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ connectedThrows: 'timeout' })
 
     await expect(execAct({ tab_id: TAB, action: 'click', ref: '@e1' })).rejects.toThrow(
@@ -1976,7 +1989,7 @@ describe('targeting honesty', () => {
     // A detached node has a zero rect, so geometry returns null and the drag
     // used to fail with "needs a resolvable to_ref destination", which is
     // false (it resolved fine) and never tells the agent to re-read.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ targetConnected: false })
 
     const result = await execAct({
@@ -2007,7 +2020,7 @@ describe('targeting honesty', () => {
   })
 
   it('does not claim a hit for a ref act, which already names its target', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -2118,7 +2131,7 @@ describe('file chooser interception', () => {
     // The inverse of the pre-#169 test that pinned these methods' ABSENCE:
     // Page ownership makes interception real instead of a silent no-op, so
     // the attach arms it eagerly and the act itself never has to.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -2131,7 +2144,7 @@ describe('file chooser interception', () => {
   it('fails the act and says the picker did NOT open', async () => {
     // A failure, not a success with a flag: the page is waiting on a file
     // that will never arrive, and the agent must switch to the upload route.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
@@ -2153,7 +2166,7 @@ describe('file chooser interception', () => {
     // The undelivered advice ends in "close the tab", which is the wrong
     // move here: the interception is direct evidence the action ran in the
     // page, and the useful remedy is the upload route.
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0 })
     vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
@@ -2171,7 +2184,7 @@ describe('file chooser interception', () => {
   })
 
   it('names the verb that reached the input, not always "click"', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
@@ -2192,7 +2205,7 @@ describe('file chooser interception', () => {
   })
 
   it('keeps the full verification payload on that failure', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     vi.mocked(chooserInterceptedSince).mockReturnValue({ at: Date.now(), mode: 'selectSingle' })
 
@@ -2205,7 +2218,7 @@ describe('file chooser interception', () => {
   })
 
   it('does not report a chooser for an ordinary click', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -2243,7 +2256,7 @@ describe('owned dialogs during an act', () => {
     // async case, not the two-guesses stall copy.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ inputAckHangsFrom: 2 }) // the press lands, its ack never returns
       vi.mocked(standingDialog)
         .mockReturnValueOnce(null) // pre-dispatch: nothing standing yet
@@ -2271,7 +2284,7 @@ describe('owned dialogs during an act', () => {
     // delivery is unknown and teaches answer, re-read, then decide.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ inputAckHangsFrom: 1 })
       vi.mocked(standingDialog).mockReturnValueOnce(null).mockReturnValue(CONFIRM)
 
@@ -2295,7 +2308,7 @@ describe('owned dialogs during an act', () => {
   })
 
   it('refuses by name when a dialog is standing before the act', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
     vi.mocked(standingDialog).mockReturnValue(CONFIRM)
 
@@ -2315,7 +2328,7 @@ describe('owned dialogs during an act', () => {
   })
 
   it('reports a dialog the act itself raised as a success with the answer route', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     // Standing: not before the act (first call), standing after dispatch.
     vi.mocked(standingDialog).mockReturnValueOnce(null).mockReturnValue(CONFIRM)
@@ -2333,7 +2346,7 @@ describe('owned dialogs during an act', () => {
   })
 
   it('prefers the named dialog over the stall guess when the event lands late', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ rendererHangsAfterDispatch: true })
     // Not standing at either early check; known by the time the liveness
     // probe has failed.
@@ -2352,7 +2365,7 @@ describe('owned dialogs during an act', () => {
   })
 
   it('reports an auto-acknowledged alert as history on a normal success', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     vi.mocked(resolvedDialogSince).mockReturnValue({
       type: 'alert',
@@ -2403,7 +2416,7 @@ describe('wall-clock budget (#162)', () => {
     // payload; this is the payload that replaces it.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       const cdp = installCdpMock()
       const inner = cdp.getMockImplementation()!
       cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
@@ -2430,7 +2443,7 @@ describe('wall-clock budget (#162)', () => {
   })
 
   it('budget exhausted before dispatch says NOTHING was delivered, and nothing was', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
     const ctx = { deadline: Date.now() - 1, budgetMs: 30_000 }
 
@@ -2451,7 +2464,7 @@ describe('wall-clock budget (#162)', () => {
     // (focused, target_exists) are skipped; the local facts still report.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       const cdp = installCdpMock()
       const inner = cdp.getMockImplementation()!
       cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
@@ -2488,7 +2501,7 @@ describe('wall-clock budget (#162)', () => {
     // instead of the test hanging into a murky timeout.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       installCdpMock({ bodyText: 'nothing relevant here' })
       const ctx = { deadline: Date.now() + 1_000, budgetMs: 30_000 }
 
@@ -2553,7 +2566,7 @@ describe('wall-clock budget (#162)', () => {
     // not a poll), so an unclamped 20s ask against ~1.5s of budget would
     // still be sitting in the page when the backend gave up. The in-page
     // deadline is where the clamp must land to matter (#168's pattern).
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ settleValue: 'deadline' })
     const ctx = { deadline: Date.now() + 1_500, budgetMs: 30_000 }
 
@@ -2579,7 +2592,7 @@ describe('wall-clock budget (#162)', () => {
     // input that never happened.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       const cdp = installCdpMock()
       const inner = cdp.getMockImplementation()!
       cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
@@ -2619,7 +2632,7 @@ describe('wall-clock budget (#162)', () => {
     // "NOTHING was delivered" is still true.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       const cdp = installCdpMock()
       const inner = cdp.getMockImplementation()!
       cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
@@ -2653,7 +2666,7 @@ describe('wall-clock budget (#162)', () => {
     // so ok:true alone would be an unverified claim.
     vi.useFakeTimers()
     try {
-      setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
       const cdp = installCdpMock()
       const inner = cdp.getMockImplementation()!
       cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
@@ -2686,7 +2699,7 @@ describe('wall-clock budget (#162)', () => {
   })
 
   it('no context means no budget: the act behaves exactly as before', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -2707,7 +2720,7 @@ describe('wall-clock budget (#162)', () => {
  */
 describe('isolated probe world (#160)', () => {
   it('mints the element handle in the probe world and pays one world per act', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock()
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -2752,7 +2765,7 @@ describe('isolated probe world (#160)', () => {
   })
 
   it('judges a fused text wait condition in the probe world', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ bodyText: 'Welcome back' })
 
     const result = await execAct({
@@ -2819,15 +2832,36 @@ describe('isolated probe world (#160)', () => {
     expect(mainWorldQueries).toHaveLength(0)
   })
 
-  it('a ref act with no obtainable world refuses through the stale shape, undispatched', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+  it('a ref act with no obtainable world refuses as INFRASTRUCTURE, not as a stale ref', async () => {
+    // The split matters (review round): "no world" says nothing about the
+    // element, so a stale_refs flag here would send the agent into a
+    // pointless re-read loop when the honest advice is retry / fresh tab.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     const cdp = installCdpMock({ probeWorld: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect(result.ok).toBe(false)
-    expect(result.error).toMatch(/re-read the page/)
+    expect(result.error).toMatch(/isolated inspection context/)
+    expect((result.data as Record<string, unknown> | undefined)?.stale_refs).toBeUndefined()
     expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('resolves an xpath= target through the probe world', async () => {
+    // The mock throws on any world-less document.evaluate(, so this passing
+    // IS the proof the xpath branch inherited the world (review gap: css was
+    // covered, xpath only ever asserted its no-match error string).
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'xpath=//button[1]' })
+
+    expect(result.ok).toBe(true)
+    const xpathEval = cdp.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression).includes('document.evaluate('),
+    )
+    expect((xpathEval?.[2] as { contextId?: number }).contextId).toBe(88)
   })
 })
 
@@ -2872,11 +2906,14 @@ describe('ref fingerprints', () => {
 
   it('an empty mint name compares role only: label drift elsewhere does not bounce', async () => {
     setRefs(TAB, mintedRef('', 'button'), TAB_URL)
-    installCdpMock({ axRole: 'button', axName: 'anything at all' })
+    const cdp = installCdpMock({ axRole: 'button', axName: 'anything at all' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect(result.ok).toBe(true)
+    // The check RAN (one AX read) and the role matched; with the feature
+    // deleted this call disappears, so ok alone is not the payoff.
+    expect(cdp.mock.calls.filter((c) => c[1] === 'Accessibility.getPartialAXTree')).toHaveLength(1)
   })
 
   it('a node that left the AX tree refuses with the distinct hidden copy', async () => {
@@ -2918,8 +2955,12 @@ describe('ref fingerprints', () => {
     expect(axCalls).toHaveLength(1)
   })
 
-  it('a ref minted without a fingerprint is not checked at all', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+  it('a ref minted with an EMPTY fingerprint is not checked at all', async () => {
+    // Role and name are required fields, but both empty (a node the AX tree
+    // gave nothing for) means there is nothing to compare: the act must not
+    // spend an AX round trip, and must not bounce on the mock's hostile
+    // axIgnored default either.
+    setRefs(TAB, new Map([['e1', fpRef(100, { role: '', name: '' })]]), TAB_URL)
     const cdp = installCdpMock({ axIgnored: true })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
@@ -2941,6 +2982,49 @@ describe('ref fingerprints', () => {
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect(result.ok).toBe(true)
+  })
+
+  it('a session-layer failure in the AX read RETHROWS: the tab story outranks fail-open', async () => {
+    // Fail-open is for probe errors. CdpCallTimeout means the TAB is wedged,
+    // and swallowing it would dispatch input into a tab whose state is
+    // unknowable, with the class's honest copy discarded.
+    setRefs(TAB, mintedRef('Pay'), TAB_URL)
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      if (args[1] === 'Accessibility.getPartialAXTree') {
+        throw new CdpCallTimeout('Accessibility.getPartialAXTree', 15_000)
+      }
+      return original(...args)
+    })
+
+    await expect(execAct({ tab_id: TAB, action: 'click', ref: '@e1' })).rejects.toThrow(
+      /did not answer/,
+    )
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('a purely numeric tick in the name does NOT refuse: counters are the same element', async () => {
+    setRefs(TAB, mintedRef('Cart (3)'), TAB_URL)
+    const cdp = installCdpMock({ axName: 'Cart (4)' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    // The gate ran (one AX read) and passed; it was not skipped.
+    expect(cdp.mock.calls.filter((c) => c[1] === 'Accessibility.getPartialAXTree')).toHaveLength(1)
+  })
+
+  it('a text change around unchanged digits still refuses', async () => {
+    setRefs(TAB, mintedRef('Cart (3)'), TAB_URL)
+    const cdp = installCdpMock({ axName: 'Delete (3)' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/changed since you read the page/)
+    expect(inputEventTypes(cdp)).toHaveLength(0)
   })
 
   it("a drag destination's drift refuses the drag before the press", async () => {
@@ -2998,7 +3082,7 @@ describe('failed_requests classification', () => {
   const future = () => Date.now() + 5_000
 
   it('annotates same_origin and keeps the first-party POST ahead of telemetry noise', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     // The one that matters FIRST, so recency alone would evict it: the
     // page's own API rejecting...
@@ -3035,7 +3119,7 @@ describe('failed_requests classification', () => {
   })
 
   it('a third-party fetch failure outranks a same-origin tracker pixel', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     // The cross-origin API fetch failure FIRST (a first-party api.* domain
     // is cross-ORIGIN and still data-class: type outranks origin)...
@@ -3061,13 +3145,50 @@ describe('failed_requests classification', () => {
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    // The cap held: ranking reorders WITHIN five entries, it does not widen
+    // the report (a removed cap would pass the survives-assert trivially).
+    expect(failed).toHaveLength(5)
     const api = failed?.find((e) => String(e.url).includes('api.example.net'))
     expect(api, 'the data-class failure survives six pixels').toBeDefined()
     expect(api?.same_origin).toBe(false)
   })
 
+  it('judges same_origin against the page the action ran ON, not the page it landed on', async () => {
+    // A submit that both fails its POST and navigates: the failures in the
+    // window were issued by the urlBefore document, so a POST back to that
+    // origin is first-party even though the tab now reads a different origin.
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://checkout.example.org/api/pay',
+      method: 'POST',
+      status: 500,
+      resource_type: 'XHR',
+      ts: future(),
+    })
+    const get = chrome.tabs.get as unknown as ReturnType<typeof vi.fn>
+    get.mockImplementation(async () => ({ id: TAB, url: 'https://example.com/error' }))
+
+    const verification = await __test.buildVerification({
+      tabId: TAB,
+      action: 'click',
+      target: '@e1',
+      startedAt: Date.now() - 1_000,
+      urlBefore: 'https://checkout.example.org/basket',
+      navSeqBefore: 0,
+      objectId: null,
+      elementSession: TAB,
+      inputMode: 'trusted',
+      settleResult: null,
+      budgetDeadline: null,
+    })
+
+    const failed = verification.failed_requests as Record<string, unknown>[]
+    expect(failed).toHaveLength(1)
+    expect(failed[0].same_origin, 'judged against urlBefore').toBe(true)
+  })
+
   it('an unparseable request URL is reported without a same_origin claim', async () => {
-    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     pushNetwork(TAB, {
       url: 'not a url at all',

@@ -16,6 +16,7 @@ import {
   elementGeometry,
   focusElement,
   focusLandedIn,
+  FrameOffsetUnavailable,
   hitTest,
   InputBudgetExhausted,
   InputDispatchStalled,
@@ -33,9 +34,19 @@ import {
   type Point,
 } from '../input'
 import { commitSeq, commitSince, navigationPending, waitForNavSignal } from '../navWatch'
-import { evaluateInProbeWorld, resolveNodeInProbeWorld, withProbeWorld } from '../worlds'
+import {
+  evaluateInProbeWorld,
+  probeWorldUnavailableError,
+  resolveNodeInProbeWorld,
+  withProbeWorld,
+} from '../worlds'
 import { failuresSince as networkFailuresSince } from '../networkBuffer'
-import { resolve as resolveRef, type StaleReason } from '../snapshotRefs'
+import {
+  fingerprintNameKey,
+  normalizeAxName,
+  resolve as resolveRef,
+  type StaleReason,
+} from '../snapshotRefs'
 import { DEFAULT_MAX_MS, rendererResponsive, settle, type SettleResult } from '../settle'
 import {
   chooserInterceptedSince,
@@ -276,6 +287,14 @@ function undeliveredError(action: ActionName): string {
  */
 const TELEMETRY_TYPES = new Set(['Ping', 'Beacon', 'Image', 'Media', 'Font', 'Prefetch', 'CSPViolationReport'])
 
+/**
+ * How many recent failures the ranking considers before the cap is applied.
+ * Wider than the cap so a data-class failure buried under a burst of
+ * telemetry noise is still in the pool to be ranked above it; bounded so a
+ * pathological page cannot make every act result O(all failures ever).
+ */
+const FAILURE_RANK_POOL = 50
+
 function sameOriginAs(url: string, pageUrl: string | null): boolean | undefined {
   if (!pageUrl) return undefined
   try {
@@ -306,7 +325,7 @@ function classifiedFailures(
   since: number,
   pageUrl: string | null,
 ): Record<string, unknown>[] {
-  const raw = networkFailuresSince(tabId, since, 50)
+  const raw = networkFailuresSince(tabId, since, FAILURE_RANK_POOL)
   const annotated = raw.map((e) => {
     const so = sameOriginAs(e.url, pageUrl)
     return {
@@ -711,13 +730,18 @@ function describeAxPair(role: string, name: string): string {
  * LIVE node the page repurposed: a framework re-render reusing the DOM node
  * for a different list row, a "Confirm" relabeled "Delete". The mint-time
  * accessibility role+name is re-read here through the SAME browser-side
- * computation that minted it (`Accessibility.getPartialAXTree`), one CDP
- * call, and a mismatch refuses before any input goes out.
+ * computation that minted it (`Accessibility.getPartialAXTree`), and a
+ * mismatch refuses before any input goes out.
  *
- * Fail-open on ERROR (a probe that cannot run must not block; the detached
- * and delivery checks still stand), fail-closed on MISMATCH. An empty mint
- * name compares role only, so unnamed controls are not bounced on the
- * label they never had.
+ * Fail-open on probe ERROR (a probe that cannot run must not block; the
+ * detached and delivery checks still stand), fail-closed on MISMATCH.
+ * Session-layer failures (`CdpCallTimeout`, `TabUnusable`) RETHROW: they are
+ * about the tab, not the probe, and swallowing them here would let a dying
+ * tab's action proceed to dispatch with the honest copy those classes carry
+ * discarded. An empty mint name compares role only, so unnamed controls are
+ * not bounced on the label they never had. Names compare DIGIT-INSENSITIVELY
+ * (`fingerprintNameKey`): a counter or price ticking between read and act is
+ * the same element, a reworded label is not.
  */
 async function fingerprintDrift(
   session: Cdp,
@@ -740,12 +764,13 @@ async function fingerprintDrift(
     const was = describeAxPair(mintRole, mintName)
     if (node.ignored) return { kind: 'hidden', was, now: 'hidden' }
     const role = axString(node.role)
-    const name = axString(node.name).trim().replace(/\s+/g, ' ').slice(0, 200)
+    const name = normalizeAxName(axString(node.name))
     const roleChanged = Boolean(mintRole) && Boolean(role) && role !== mintRole
-    const nameChanged = Boolean(mintName) && name !== mintName
+    const nameChanged = Boolean(mintName) && fingerprintNameKey(name) !== fingerprintNameKey(mintName)
     if (!roleChanged && !nameChanged) return null
     return { kind: 'changed', was, now: describeAxPair(role, name) }
-  } catch {
+  } catch (e) {
+    if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
     return null
   }
 }
@@ -765,7 +790,9 @@ function refChangedError(
     `${target ?? 'that ref'} still exists, but the element changed since you read the ` +
     `page: it was ${drift.was}, it is now ${drift.now}. The ${action} was NOT sent, ` +
     'because acting on an element whose meaning changed is how the wrong thing gets ' +
-    'clicked. Re-read the page and use the ref for what you now mean to act on.'
+    'clicked. Re-read the page and use the ref for what you now mean to act on. ' +
+    '(Purely numeric ticks are tolerated; if this label legitimately rewords itself ' +
+    'continuously, target the element with css= instead of a ref.)'
   )
 }
 
@@ -775,6 +802,49 @@ function refHiddenError(target: string | null, action: ActionName): string {
     'the accessibility tree (hidden or collapsed since you read the page). The ' +
     `${action} was NOT sent. Re-read the page and use a fresh ref.`
   )
+}
+
+/**
+ * The one fingerprint gate, shared by the main target and the drag
+ * destination so the refusal shape cannot drift between them. Returns the
+ * refusal to send, or null when the target may be acted on (including refs
+ * minted without a fingerprint: css=/xpath= targets have none to compare).
+ * `refName` is the ref the copy blames; `label` prefixes it for secondary
+ * targets ("drag destination: "); `data.target` stays the command's primary
+ * target either way, matching the pre-existing payload shape.
+ */
+async function fingerprintRefusal(
+  resolution: Extract<TargetResolution, { ok: true }>,
+  action: ActionName,
+  primaryTarget: string | null,
+  refName: string,
+  label = '',
+): Promise<CommandResult | null> {
+  if (resolution.backendNodeId === undefined || (!resolution.mintRole && !resolution.mintName)) {
+    return null
+  }
+  const drift = await fingerprintDrift(
+    resolution.session,
+    resolution.backendNodeId,
+    resolution.mintRole ?? '',
+    resolution.mintName ?? '',
+  )
+  if (!drift) return null
+  const base =
+    drift.kind === 'hidden' ? refHiddenError(refName, action) : refChangedError(refName, action, drift)
+  return {
+    ok: false,
+    status: 'error',
+    error: `${label}${base}`,
+    data: {
+      action,
+      target: primaryTarget,
+      stale_refs: true,
+      reason: drift.kind,
+      element_was: drift.was,
+      element_now: drift.now,
+    },
+  }
 }
 
 function stalledError(action: ActionName): string {
@@ -866,16 +936,9 @@ async function currentUrl(tabId: number): Promise<string | null> {
   }
 }
 
-/** The probe world could not be created: fail CLOSED, never fall back to the
- *  main world (a main-world resolution is exactly the steerable read #160
- *  exists to remove). Transient by nature: a page cannot cause it. */
-function probeWorldUnavailableError(what: string): string {
-  return (
-    `${what} could not run in this tab's isolated inspection context (the tab is ` +
-    'likely mid-navigation or was just closed). Retry, and if it persists ' +
-    're-read the page or use a fresh tab.'
-  )
-}
+// The probe world could not be created: fail CLOSED, never fall back to the
+// main world (a main-world resolution is exactly the steerable read #160
+// exists to remove). Copy lives in worlds.ts beside the rule.
 
 /**
  * Resolve a target to a CDP Runtime objectId, minted IN the probe world.
@@ -904,8 +967,15 @@ async function resolveTarget(
       ? { tabId, sessionId: resolution.sessionId }
       : tabId
     try {
-      const objectId = await resolveNodeInProbeWorld(session, resolution.backendNodeId)
-      if (!objectId) {
+      const resolved = await resolveNodeInProbeWorld(session, resolution.backendNodeId)
+      if (!resolved.ok) {
+        // The two failures tell DIFFERENT stories: no-node is about the ref
+        // (the element is gone, re-reading helps), no-world is about the
+        // probe infrastructure (nothing about the element was learned, and a
+        // stale_refs flag here would send the agent re-reading in a loop).
+        if (resolved.reason === 'no-world') {
+          return { ok: false, error: probeWorldUnavailableError('resolving the element') }
+        }
         return {
           ok: false,
           error: `ref ${target} no longer exists in the page (re-read the page)`,
@@ -914,7 +984,7 @@ async function resolveTarget(
       }
       return {
         ok: true,
-        objectId,
+        objectId: resolved.objectId,
         session,
         sessionId: resolution.sessionId,
         backendNodeId: resolution.backendNodeId,
@@ -1080,8 +1150,11 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
   })
   // A request that came back 500 without throwing is the commonest silent
   // failure on a real site, and it never reaches the console. Classified and
-  // ranked against the freshest page URL (#166).
-  const failedRequests = classifiedFailures(v.tabId, v.startedAt, urlAfter ?? v.urlBefore)
+  // ranked against the page the action ran ON (#166): the failures in this
+  // window were issued by the urlBefore document, so when the action
+  // navigated, judging them against urlAfter would misclassify the very POST
+  // whose failure explains the move (review round).
+  const failedRequests = classifiedFailures(v.tabId, v.startedAt, v.urlBefore ?? urlAfter)
   return {
     action: v.action,
     ...(v.target ? { target: v.target } : {}),
@@ -1373,38 +1446,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       }
       // The mint-fingerprint re-check, for the verbs that dispatch input into
       // the element the agent chose by meaning. Only refs minted WITH a
-      // fingerprint are checked (css=/xpath= targets and bare test maps have
-      // none to compare), and only before dispatch, where refusing still
-      // honestly means nothing was sent.
-      if (
-        FINGERPRINT_VERBS.has(a.action) &&
-        resolution.backendNodeId !== undefined &&
-        (resolution.mintRole || resolution.mintName)
-      ) {
-        const drift = await fingerprintDrift(
-          resolution.session,
-          resolution.backendNodeId,
-          resolution.mintRole ?? '',
-          resolution.mintName ?? '',
-        )
-        if (drift) {
-          return {
-            ok: false,
-            status: 'error',
-            error:
-              drift.kind === 'hidden'
-                ? refHiddenError(target, a.action)
-                : refChangedError(target, a.action, drift),
-            data: {
-              action: a.action,
-              target,
-              stale_refs: true,
-              reason: drift.kind,
-              element_was: drift.was,
-              element_now: drift.now,
-            },
-          }
-        }
+      // fingerprint are checked (css=/xpath= targets have none to compare),
+      // and only before dispatch, where refusing still honestly means
+      // nothing was sent.
+      if (FINGERPRINT_VERBS.has(a.action)) {
+        const refusal = await fingerprintRefusal(resolution, a.action, target, target)
+        if (refusal) return refusal
       }
       objectId = resolution.objectId
       elementSession = resolution.session
@@ -1457,11 +1504,14 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
    * Geometry is read in the element's own session (frame-local for an
    * iframe), but Input.* goes in on the ROOT session in root coordinates:
    * Chrome hit-tests the point and routes the event into the right widget.
-   * So a frame element's rect must be composed with the frame's offset.
+   * So a frame element's rect must be composed with the frame's offset, and
+   * an unmeasurable offset REFUSES (`FrameOffsetUnavailable`, handled in the
+   * catch below): un-offset frame coordinates land somewhere else entirely.
    */
   const dispatchPoint = async (local: Point): Promise<Point> => {
     if (!elementFrameId) return local
     const offset = await frameOffset(tabId, elementFrameId)
+    if (!offset) throw new FrameOffsetUnavailable()
     return { x: local.x + offset.x, y: local.y + offset.y }
   }
 
@@ -1835,36 +1885,22 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           }
           // The destination's meaning matters as much as the source's:
           // dropping onto a repurposed "Trash" is the same wrong-click class.
-          if (dest.backendNodeId !== undefined && (dest.mintRole || dest.mintName)) {
-            const destDrift = await fingerprintDrift(
-              dest.session,
-              dest.backendNodeId,
-              dest.mintRole ?? '',
-              dest.mintName ?? '',
-            )
-            if (destDrift) {
-              return {
-                ok: false,
-                status: 'error',
-                error:
-                  destDrift.kind === 'hidden'
-                    ? `drag destination: ${refHiddenError(a.to_ref, 'drag')}`
-                    : `drag destination: ${refChangedError(a.to_ref, 'drag', destDrift)}`,
-                data: {
-                  action: 'drag',
-                  target,
-                  stale_refs: true,
-                  reason: destDrift.kind,
-                  element_was: destDrift.was,
-                  element_now: destDrift.now,
-                },
-              }
-            }
-          }
+          const destRefusal = await fingerprintRefusal(
+            dest,
+            'drag',
+            target,
+            a.to_ref,
+            'drag destination: ',
+          )
+          if (destRefusal) return destRefusal
           const destLocal = (await elementGeometry(dest.session, dest.objectId))?.point ?? null
           if (destLocal && dest.sessionId) {
+            // Same fail-closed rule as dispatchPoint: a destination in a
+            // frame whose offset cannot be measured must not become a drop
+            // at the un-offset coordinates.
             const destFrame = frameSessions(tabId).find((f) => f.sessionId === dest.sessionId)
-            const offset = destFrame ? await frameOffset(tabId, destFrame.targetId) : { x: 0, y: 0 }
+            const offset = destFrame ? await frameOffset(tabId, destFrame.targetId) : null
+            if (!offset) throw new FrameOffsetUnavailable()
             to = { x: destLocal.x + offset.x, y: destLocal.y + offset.y }
           } else {
             to = destLocal
@@ -1910,6 +1946,25 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         return { ok: false, status: 'error', error: `unknown action: ${String(a.action)}` }
     }
   } catch (e) {
+    if (e instanceof FrameOffsetUnavailable) {
+      // Fail-closed twin of the probe-world rule: the offset that places a
+      // cross-frame click could not be measured, and dispatching without it
+      // clicks the wrong place on the root document. Nothing was sent.
+      return {
+        ok: false,
+        status: 'error',
+        error:
+          `the ${a.action} was NOT sent: ` +
+          probeWorldUnavailableError("measuring the target frame's position"),
+        data: {
+          action: a.action,
+          ...(target ? { target } : {}),
+          url: urlBefore,
+          input: 'none',
+          ...localDiagnostics(tabId, startedAt, urlBefore),
+        },
+      }
+    }
     if (e instanceof InputBudgetExhausted) {
       // #162: the sum of healthy dispatches reached the wire budget. This is
       // the failure that replaces the backend's payload-less transport

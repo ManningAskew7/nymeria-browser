@@ -103,6 +103,21 @@ export class InputBudgetExhausted extends Error {
 }
 
 /**
+ * A cross-frame pointer action whose frame offset could not be measured
+ * (`frameOffset` returned null). Its own type because the refusal is
+ * load-bearing: dispatching with a guessed or zero offset clicks the wrong
+ * PLACE on the root document with full confidence, the exact class the
+ * probe-world geometry exists to remove. Nothing has been dispatched when
+ * this is thrown; callers turn it into a nothing-was-sent refusal.
+ */
+export class FrameOffsetUnavailable extends Error {
+  constructor() {
+    super('the frame offset for a cross-frame action could not be measured')
+    this.name = 'FrameOffsetUnavailable'
+  }
+}
+
+/**
  * Deliberately LONGER than settle.ts's RESPONSIVE_DEADLINE_MS, which is the
  * mistake to avoid rather than the pattern to copy.
  *
@@ -280,19 +295,24 @@ export async function elementGeometry(target: Cdp, objectId: string): Promise<{ 
  * The owner handle is minted in the PROBE WORLD (#160): this offset is ADDED
  * to every in-frame click point, so a main-world `getBoundingClientRect` or
  * `getComputedStyle` lie shifted every click inside the frame.
+ *
+ * FAIL-CLOSED: null when the offset cannot be measured (probe world
+ * unavailable, owner not found, geometry call failed). The old shape
+ * returned {0,0}, which dispatched the click at the IN-FRAME coordinates on
+ * the ROOT document, a guaranteed wrong-place click on some unrelated
+ * element (review round). Callers must refuse to dispatch on null.
  */
-export async function frameOffset(tabId: number, frameId: string): Promise<Point> {
-  const zero = { x: 0, y: 0 }
+export async function frameOffset(tabId: number, frameId: string): Promise<Point | null> {
   try {
     const owner = await sendCommand<{ backendNodeId?: number }>(tabId, 'DOM.getFrameOwner', {
       frameId,
     })
-    if (!owner.backendNodeId) return zero
-    const objectId = await resolveNodeInProbeWorld(tabId, owner.backendNodeId)
-    if (!objectId) return zero
+    if (!owner.backendNodeId) return null
+    const resolved = await resolveNodeInProbeWorld(tabId, owner.backendNodeId)
+    if (!resolved.ok) return null
     const offset = await callOn<Point | null>(
       tabId,
-      objectId,
+      resolved.objectId,
       `function(){
         const r = this.getBoundingClientRect();
         const cs = getComputedStyle(this);
@@ -303,9 +323,9 @@ export async function frameOffset(tabId: number, frameId: string): Promise<Point
         };
       }`,
     )
-    return offset ?? zero
+    return offset ?? null
   } catch {
-    return zero
+    return null
   }
 }
 
