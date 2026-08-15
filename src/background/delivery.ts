@@ -1,5 +1,14 @@
 import { sendCommand, type Cdp } from './debuggerSession'
 import { callOn } from './input'
+import {
+  cachedWorld,
+  clearWorldEntry,
+  createWorld,
+  DELIVERY_WORLD,
+  isContextGone,
+  resetForTests as resetWorlds,
+  worldFor,
+} from './worlds'
 
 /**
  * Did the input we dispatched actually reach the page?
@@ -72,8 +81,6 @@ export interface DeliveryProbe {
   read(): Promise<DeliveryReading>
 }
 
-const WORLD_NAME = 'nymeria_delivery_probe'
-
 /**
  * How long an unread probe may sit before the next arm sweeps it.
  *
@@ -94,54 +101,14 @@ const ORPHAN_MS = 60_000
  */
 let nextProbeId = 0
 
-/** tabId -> executionContextId of that tab's probe world. */
-const worlds = new Map<number, number>()
-
 /**
  * Drop a tab's cached world. A committed navigation destroys the isolated
  * world along with the document, so the cached id would resolve to nothing.
+ * The creation/caching machinery itself lives in `worlds.ts` (shared with
+ * the trust probes' world); this module keeps only its own POLICY.
  */
 export function clearWorld(tabId: number): void {
-  worlds.delete(tabId)
-}
-
-function isContextGone(message: string): boolean {
-  const m = message.toLowerCase()
-  return (
-    m.includes('cannot find context') ||
-    m.includes('execution context was destroyed') ||
-    m.includes('inspected target navigated') ||
-    m.includes('target closed')
-  )
-}
-
-async function createWorld(tabId: number): Promise<number | null> {
-  try {
-    const tree = await sendCommand<{ frameTree?: { frame?: { id?: string } } }>(
-      tabId,
-      'Page.getFrameTree',
-      {},
-    )
-    const frameId = tree.frameTree?.frame?.id
-    if (!frameId) return null
-    const created = await sendCommand<{ executionContextId?: number }>(
-      tabId,
-      'Page.createIsolatedWorld',
-      { frameId, worldName: WORLD_NAME, grantUniveralAccess: false },
-    )
-    const contextId = created.executionContextId
-    if (typeof contextId !== 'number') return null
-    worlds.set(tabId, contextId)
-    return contextId
-  } catch {
-    return null
-  }
-}
-
-async function worldFor(tabId: number): Promise<number | null> {
-  const cached = worlds.get(tabId)
-  if (cached !== undefined) return cached
-  return createWorld(tabId)
+  clearWorldEntry(tabId, DELIVERY_WORLD)
 }
 
 /**
@@ -240,7 +207,7 @@ const UNARMED: DeliveryProbe = {
  * page-deferred clicks. See the #169 pass record.
  */
 export async function armDelivery(tabId: number, types: readonly string[]): Promise<DeliveryProbe> {
-  let contextId = await worldFor(tabId)
+  let contextId = await worldFor(tabId, DELIVERY_WORLD)
   if (contextId === null) return UNARMED
 
   nextProbeId += 1
@@ -250,7 +217,7 @@ export async function armDelivery(tabId: number, types: readonly string[]): Prom
   if (!armed.ok && armed.contextGone) {
     // The cached world died with its document. Rebuild once and retry.
     clearWorld(tabId)
-    contextId = await createWorld(tabId)
+    contextId = await createWorld(tabId, DELIVERY_WORLD)
     if (contextId === null) return UNARMED
     armed = await evaluateInWorld<boolean>(tabId, contextId, arm())
   }
@@ -302,7 +269,7 @@ export async function absenceIsConclusive(
   tabId: number,
   target: { session: Cdp; objectId: string } | null,
 ): Promise<boolean> {
-  const contextId = worlds.get(tabId)
+  const contextId = cachedWorld(tabId, DELIVERY_WORLD)
   if (contextId !== undefined) {
     const frameless = await evaluateInWorld<boolean>(tabId, contextId, FRAMELESS_EXPRESSION)
     if (frameless.ok && frameless.value === true) return true
@@ -326,5 +293,5 @@ export async function absenceIsConclusive(
 }
 
 export function resetForTests(): void {
-  worlds.clear()
+  resetWorlds()
 }

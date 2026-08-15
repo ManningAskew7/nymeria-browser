@@ -45,6 +45,14 @@ function installCdpMock(opts: MockOpts = {}) {
       const sessionId = (target as { sessionId?: string }).sessionId
       if (method === 'DOM.resolveNode') return { object: { objectId: `obj-${sessionId ?? 'root'}` } }
       if (method === 'DOM.getFrameOwner') return { backendNodeId: 555 }
+      // Worlds: each session answers with its own frame and context id, so
+      // probes minted for a frame element run in THAT frame's world.
+      if (method === 'Page.getFrameTree') {
+        return { frameTree: { frame: { id: sessionId ? 'frame-child' : 'frame-root' } } }
+      }
+      if (method === 'Page.createIsolatedWorld') {
+        return { executionContextId: sessionId ? 99 : 88 }
+      }
       if (method === 'Runtime.callFunctionOn') {
         const fn = String(params.functionDeclaration ?? '')
         if (fn.includes('getComputedStyle')) {

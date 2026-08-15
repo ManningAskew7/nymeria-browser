@@ -50,7 +50,7 @@ interface MockChrome {
     onInstalled: { addListener: ReturnType<typeof vi.fn> }
     onStartup: { addListener: ReturnType<typeof vi.fn> }
   }
-  storage: { local: StorageArea; sync: StorageArea }
+  storage: { local: StorageArea; sync: StorageArea; session: StorageArea }
   alarms: { create: ReturnType<typeof vi.fn>; onAlarm: { addListener: ReturnType<typeof vi.fn> } }
   permissions: { request: ReturnType<typeof vi.fn>; contains: ReturnType<typeof vi.fn> }
   tabs: {
@@ -98,7 +98,7 @@ function makeMockChrome(): MockChrome {
       onInstalled: { addListener: vi.fn() },
       onStartup: { addListener: vi.fn() },
     },
-    storage: { local: makeStorageArea(), sync: makeStorageArea() },
+    storage: { local: makeStorageArea(), sync: makeStorageArea(), session: makeStorageArea() },
     alarms: { create: vi.fn(), onAlarm: { addListener: vi.fn() } },
     permissions: {
       request: vi.fn().mockResolvedValue(true),

@@ -5,7 +5,7 @@ import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs } from './debuggerSession'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
-import { clearWorld as clearDeliveryWorld } from './delivery'
+import { clearTabWorlds } from './worlds'
 import { clear as clearRefs } from './snapshotRefs'
 import { installCdpConsoleCapture } from './consoleBuffer'
 import { clearTabNav, installNavWatch } from './navWatch'
@@ -50,20 +50,25 @@ installNavWatch()
 // permission from the popup; consumers treat "no record" as unknown.
 installStatusWatch()
 
-// A committed navigation invalidates the tab's refs, and destroys the isolated
-// world the delivery probe caches (it dies with its document, so a cached
-// context id would resolve to nothing). Network history is kept deliberately:
-// the requests a navigation itself fired are often the answer to "why did that
-// go wrong".
+// A committed TOP-FRAME navigation invalidates the tab's refs, and destroys
+// every isolated world cached for the tab (the delivery probe's and the trust
+// probes', frame worlds included: subframe documents die with the top one).
+// A SUBFRAME commit deliberately does neither here: the delivery world is
+// top-frame-only so it survives by construction, and per-frame ref
+// invalidation rides Target.detachedFromTarget below (an OOPIF navigating
+// cross-process detaches its old session), with the act-time detached and
+// fingerprint checks covering the in-process remainder. Network history is
+// kept deliberately: the requests a navigation itself fired are often the
+// answer to "why did that go wrong".
 chrome.webNavigation?.onCommitted.addListener?.((details) => {
   if (details.frameId !== 0) return
   clearRefs(details.tabId)
-  clearDeliveryWorld(details.tabId)
+  clearTabWorlds(details.tabId)
 })
 chrome.tabs.onRemoved.addListener((tabId) => {
   clearRefs(tabId)
   clearNetwork(tabId)
-  clearDeliveryWorld(tabId)
+  clearTabWorlds(tabId)
   clearTabDialogState(tabId)
   clearTabStatus(tabId)
   // Wakes any navigation wait with `removed` before dropping state, so a

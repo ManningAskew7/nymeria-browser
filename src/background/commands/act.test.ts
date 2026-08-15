@@ -41,8 +41,10 @@ interface MockOptions {
   settleValue?: string
   bodyText?: string
   selectMatches?: boolean
-  /** false models a tab where the probe's isolated world cannot be created. */
+  /** false models a tab where the delivery probe's world cannot be created. */
   deliveryWorld?: boolean
+  /** false models a tab where the TRUST probes' world cannot be created. */
+  probeWorld?: boolean
   /** How many events the page saw. 0 is the suppressed-tab case. */
   deliveryCount?: number
   /** Thrown by the probe read, to model a context that died mid-action. */
@@ -105,6 +107,7 @@ function installCdpMock(opts: MockOptions = {}) {
     bodyText = '',
     selectMatches = true,
     deliveryWorld = true,
+    probeWorld = true,
     deliveryCount = 1,
     deliveryReadThrows,
     rendererHangs,
@@ -121,7 +124,12 @@ function installCdpMock(opts: MockOptions = {}) {
     focusLanded = true,
     focusReadThrows,
   } = opts
-  const PROBE_CONTEXT = 77
+  // Two worlds, two context ids: the delivery probe's (its counter state) and
+  // the trust probes' (geometry, hit tests, selectors). Distinct so a test can
+  // fail one without the other, and so routing on contextId cannot conflate
+  // them.
+  const DELIVERY_CONTEXT = 77
+  const TRUST_CONTEXT = 88
   let dispatched = false
   let inputEvents = 0
 
@@ -173,10 +181,19 @@ function installCdpMock(opts: MockOptions = {}) {
       return { result: { value: undefined } }
     }
     if (method === 'Page.getFrameTree') {
-      return deliveryWorld ? { frameTree: { frame: { id: 'frame-1' } } } : {}
+      return { frameTree: { frame: { id: 'frame-1' } } }
     }
     if (method === 'Page.createIsolatedWorld') {
-      return { executionContextId: PROBE_CONTEXT }
+      // Routed by world NAME: each world can fail independently, and a
+      // creation that names neither world is a bug worth failing loudly on.
+      const worldName = String(params.worldName ?? '')
+      if (worldName === 'nymeria_delivery_probe') {
+        return deliveryWorld ? { executionContextId: DELIVERY_CONTEXT } : {}
+      }
+      if (worldName === 'nymeria_probe') {
+        return probeWorld ? { executionContextId: TRUST_CONTEXT } : {}
+      }
+      throw new Error(`unexpected isolated world name: ${worldName}`)
     }
     if (method === 'Runtime.evaluate') {
       const expression = String(params.expression ?? '')
@@ -184,7 +201,7 @@ function installCdpMock(opts: MockOptions = {}) {
       // count rather than by running the page-side code: that logic has its own
       // executed-for-real tests in delivery.test.ts, and here we only care what
       // an action DOES with each outcome.
-      if (params.contextId === PROBE_CONTEXT) {
+      if (params.contextId === DELIVERY_CONTEXT) {
         if (expression.includes('addEventListener')) return { result: { value: true } }
         if (expression.includes('querySelectorAll')) {
           return { result: { value: !pageHasFrames } }
