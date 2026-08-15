@@ -2,9 +2,10 @@ import type { CommandResult } from '../../shared/types'
 import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
 import { withProbeWorld } from '../worlds'
 import {
-  cachedTree,
+  nextCounter,
   resolve as resolveRef,
   set as setRefs,
+  withMintLock,
   type RefTarget,
 } from '../snapshotRefs'
 
@@ -14,10 +15,6 @@ interface SnapshotArgs {
   /** Re-root the tree at a previously minted ref, e.g. "@e12". */
   scope_ref?: string
   scope_selector?: string
-  /** Return the last read for this tab (if still on the same URL) instead of
-   *  re-reading. Reuse does not renumber refs, so refs already handed out
-   *  stay valid. */
-  reuse?: boolean
 }
 
 interface AXValue {
@@ -168,7 +165,16 @@ function formatTree(
         const refId = `e${refCounter}`
         // The session is stored with the id: backendNodeId is process-global,
         // so the same number means different elements in different frames.
-        refs.set(refId, { backendNodeId: node.backendDOMNodeId, sessionId: opts.sessionId })
+        // Role and name ride along as the mint-time FINGERPRINT: act
+        // re-reads the same browser-computed pair before dispatching input,
+        // so a live node whose meaning changed since this read refuses
+        // instead of firing.
+        refs.set(refId, {
+          backendNodeId: node.backendDOMNodeId,
+          sessionId: opts.sessionId,
+          role,
+          name: strVal(node.name).trim().replace(/\s+/g, ' ').slice(0, 200),
+        })
         refMarker = ` [ref=@${refId}]`
       }
       line = `${'  '.repeat(depth)}- ${role}${name}${value}${refMarker}`
@@ -249,18 +255,6 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   }
   const detail = a.detail ?? 'interactive'
 
-  if (a.reuse && !a.scope_ref && !a.scope_selector) {
-    const tab = await chrome.tabs.get(a.tab_id).catch(() => null)
-    const cached = cachedTree(a.tab_id, tab?.url ?? null)
-    if (cached) {
-      return {
-        ok: true,
-        status: 'success',
-        data: { tree: cached, detail, url: tab?.url ?? null, reused: true },
-      }
-    }
-  }
-
   // Scope, when asked for, is resolved to a real backend node and used as the
   // tree root. The previous implementation only probed that a selector
   // matched something and then returned the whole page anyway, which quietly
@@ -287,55 +281,64 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     rootIds = [scopeNode.nodeId]
   }
 
-  const main = formatTree(nodes, rootIds, detail)
-  const allRefs = new Map<string, RefTarget>(main.refs)
-  const sections = [main.text]
-  let counter = main.nextCounter
+  // Minting is serialized per tab and numbers continue from the tab's
+  // monotonic counter: two reads never mint the same number, so a ref held
+  // from an earlier read either still resolves (same document, merged map)
+  // or refuses honestly, never re-points. A scoped read MERGES its refs into
+  // the map for the same reason: it must not invalidate the full-page refs
+  // the caller is still holding.
+  return withMintLock(a.tab_id, async () => {
+    const start = await nextCounter(a.tab_id)
+    const main = formatTree(nodes, rootIds, detail, { startCounter: start })
+    const allRefs = new Map<string, RefTarget>(main.refs)
+    const sections = [main.text]
+    let counter = main.nextCounter
 
-  // Cross-origin iframes run in their own process and are absent from the
-  // page's own tree: the <iframe> node appears with an empty subtree and no
-  // error. Reading each attached frame session is what makes a payment field
-  // or a consent dialog reachable at all. A scoped read stays in its scope.
-  if (scopeNodeId == null) {
-    for (const frame of frameSessions(a.tab_id)) {
-      try {
-        const frameNodes = await treeFor({ tabId: a.tab_id, sessionId: frame.sessionId })
-        if (!frameNodes.length) continue
-        const formatted = formatTree(frameNodes, rootsOf(frameNodes), detail, {
-          sessionId: frame.sessionId,
-          startCounter: counter,
-        })
-        if (!formatted.text.trim()) continue
-        counter = formatted.nextCounter
-        for (const [refId, target] of formatted.refs) allRefs.set(refId, target)
-        const indented = formatted.text
-          .split('\n')
-          .map((line) => `  ${line}`)
-          .join('\n')
-        sections.push(`- iframe "${frame.url}"\n${indented}`)
-      } catch {
-        // One unreadable frame must not cost the whole page read.
-        sections.push(`- iframe "${frame.url}" [unreadable]`)
+    // Cross-origin iframes run in their own process and are absent from the
+    // page's own tree: the <iframe> node appears with an empty subtree and no
+    // error. Reading each attached frame session is what makes a payment field
+    // or a consent dialog reachable at all. A scoped read stays in its scope.
+    if (scopeNodeId == null) {
+      for (const frame of frameSessions(a.tab_id)) {
+        try {
+          const frameNodes = await treeFor({ tabId: a.tab_id, sessionId: frame.sessionId })
+          if (!frameNodes.length) continue
+          const formatted = formatTree(frameNodes, rootsOf(frameNodes), detail, {
+            sessionId: frame.sessionId,
+            startCounter: counter,
+          })
+          if (!formatted.text.trim()) continue
+          counter = formatted.nextCounter
+          for (const [refId, target] of formatted.refs) allRefs.set(refId, target)
+          const indented = formatted.text
+            .split('\n')
+            .map((line) => `  ${line}`)
+            .join('\n')
+          sections.push(`- iframe "${frame.url}"\n${indented}`)
+        } catch {
+          // One unreadable frame must not cost the whole page read.
+          sections.push(`- iframe "${frame.url}" [unreadable]`)
+        }
       }
     }
-  }
 
-  const tab = await chrome.tabs.get(a.tab_id).catch(() => null)
-  const url = tab?.url ?? null
-  const rendered = sections.join('\n')
-  setRefs(a.tab_id, allRefs, url, rendered)
+    const tab = await chrome.tabs.get(a.tab_id).catch(() => null)
+    const url = tab?.url ?? null
+    const rendered = sections.join('\n')
+    setRefs(a.tab_id, allRefs, url, counter)
 
-  return {
-    ok: true,
-    status: 'success',
-    data: {
-      tree: rendered,
-      ref_count: allRefs.size,
-      detail,
-      url,
-      frames: frameSessions(a.tab_id).length,
-    },
-  }
+    return {
+      ok: true,
+      status: 'success',
+      data: {
+        tree: rendered,
+        ref_count: allRefs.size,
+        detail,
+        url,
+        frames: frameSessions(a.tab_id).length,
+      },
+    }
+  })
 }
 
 export const __test = { formatTree, isInteractive, strVal, rootsOf }

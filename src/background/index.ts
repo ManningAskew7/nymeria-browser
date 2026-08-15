@@ -3,10 +3,10 @@ import { clearConfig, ensureClientId, getConfig, setConfig } from '../utils/stor
 import { HttpError, ping, whoami } from './api'
 import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
-import { activeTabs as activeDebuggerTabs } from './debuggerSession'
+import { activeTabs as activeDebuggerTabs, onCdpEvent } from './debuggerSession'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
-import { clearTabWorlds } from './worlds'
-import { clear as clearRefs } from './snapshotRefs'
+import { clearSessionWorlds, clearTabWorlds } from './worlds'
+import { clear as clearRefs, clearSession as clearSessionRefs, dropTab as dropTabRefs } from './snapshotRefs'
 import { installCdpConsoleCapture } from './consoleBuffer'
 import { clearTabNav, installNavWatch } from './navWatch'
 import { clearTabStatus, installStatusWatch } from './statusWatch'
@@ -66,7 +66,10 @@ chrome.webNavigation?.onCommitted.addListener?.((details) => {
   clearTabWorlds(details.tabId)
 })
 chrome.tabs.onRemoved.addListener((tabId) => {
-  clearRefs(tabId)
+  // dropTab, not clear: a closed tab surrenders its ref COUNTER too (tab ids
+  // are not re-hit by held refs within a session), where a navigation must
+  // keep it so numbering stays monotonic.
+  dropTabRefs(tabId)
   clearNetwork(tabId)
   clearTabWorlds(tabId)
   clearTabDialogState(tabId)
@@ -75,6 +78,21 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   // navigate on a tab the user just closed fails fast instead of riding
   // its deadline.
   clearTabNav(tabId)
+})
+
+// Per-frame invalidation: a frame session detaching means that OOPIF
+// navigated cross-process or left the page, so its refs (and its cached
+// probe world) are dead while the top document lives on. Whole-map clearing
+// here would make ad-heavy pages unusable (their iframes churn constantly);
+// the in-process remainder is covered at act time by the detached and
+// fingerprint checks. debuggerSession's frame tracking consumes the same
+// event for its own session map; the two subscribers are independent.
+onCdpEvent((tabId, method, params) => {
+  if (method !== 'Target.detachedFromTarget') return
+  const p = params as { sessionId?: string }
+  if (!p.sessionId) return
+  clearSessionRefs(tabId, p.sessionId)
+  clearSessionWorlds(tabId, p.sessionId)
 })
 
 async function bootstrap(): Promise<void> {

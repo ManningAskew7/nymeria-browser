@@ -74,6 +74,11 @@ interface MockOptions {
   isFileInput?: boolean
   /** false models a ref that still resolves but is detached from the document. */
   targetConnected?: boolean
+  /** What the AX tree reports for the node NOW (the fingerprint re-check). */
+  axRole?: string
+  axName?: string
+  /** true models a node that left the AX tree (hidden since the read). */
+  axIgnored?: boolean
   /** 'timeout' models the session layer failing the connectedness probe. */
   connectedThrows?: 'timeout'
   /** true models the page asking for the OS file chooser during the action. */
@@ -115,6 +120,9 @@ function installCdpMock(opts: MockOptions = {}) {
     inputAckHangsFrom,
     isFileInput = false,
     targetConnected = true,
+    axRole = 'button',
+    axName = 'Pay',
+    axIgnored = false,
     connectedThrows,
     fileChooserOpened = false,
     pointDescription = 'body',
@@ -182,9 +190,22 @@ function installCdpMock(opts: MockOptions = {}) {
       }
       if (fn.includes('ownerDocument')) return { result: { value: targetInTopDocument } }
       if (fn.includes('this.options')) return { result: { value: selectMatches } }
+      if (fn.includes('atob')) return { result: { value: { ok: true, mode: 'file-input' } } }
       if (fn.includes('this.checked') && fn.includes('return')) return { result: { value: value } }
       if (fn.includes('this.value !== undefined')) return { result: { value } }
       return { result: { value: undefined } }
+    }
+    if (method === 'Accessibility.getPartialAXTree') {
+      return {
+        nodes: [
+          {
+            backendDOMNodeId: params.backendNodeId,
+            ignored: axIgnored,
+            role: { value: axRole },
+            name: { value: axName },
+          },
+        ],
+      }
     }
     if (method === 'Page.getFrameTree') {
       return { frameTree: { frame: { id: 'frame-1' } } }
@@ -2805,5 +2826,160 @@ describe('isolated probe world (#160)', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/re-read the page/)
     expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+})
+
+/**
+ * The mint-fingerprint re-check (#160 review round): a ref can stay LIVE
+ * while its meaning changes (a framework re-render reusing the node, a
+ * "Confirm" relabeled "Delete"), which isConnected can never see. The
+ * mint-time AX role+name is re-read through the same browser computation
+ * that minted it, and a mismatch refuses BEFORE any input goes out.
+ */
+describe('ref fingerprints', () => {
+  const mintedRef = (name: string, role = 'button') =>
+    new Map([['e1', { backendNodeId: 100, role, name }]])
+
+  it('refuses a click on an element whose name changed since the read', async () => {
+    setRefs(TAB, mintedRef('Confirm'), TAB_URL)
+    const cdp = installCdpMock({ axName: 'Delete' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/was button "Confirm", it is now button "Delete"/)
+    expect(result.error).toMatch(/NOT sent/)
+    const data = result.data as Record<string, unknown>
+    expect(data.stale_refs).toBe(true)
+    expect(data.reason).toBe('changed')
+    // The teeth: nothing was dispatched.
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('refuses on a role change too', async () => {
+    setRefs(TAB, mintedRef('Pay', 'button'), TAB_URL)
+    const cdp = installCdpMock({ axRole: 'link', axName: 'Pay' })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'x' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/changed since you read the page/)
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchKeyEvent')).toBe(false)
+  })
+
+  it('an empty mint name compares role only: label drift elsewhere does not bounce', async () => {
+    setRefs(TAB, mintedRef('', 'button'), TAB_URL)
+    installCdpMock({ axRole: 'button', axName: 'anything at all' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+  })
+
+  it('a node that left the AX tree refuses with the distinct hidden copy', async () => {
+    setRefs(TAB, mintedRef('Confirm'), TAB_URL)
+    const cdp = installCdpMock({ axIgnored: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/no longer visible to the accessibility tree/)
+    expect((result.data as Record<string, unknown>).reason).toBe('hidden')
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('upload skips the fingerprint check: AX-hidden inputs are its everyday target', async () => {
+    setRefs(TAB, mintedRef('resume upload', 'button'), TAB_URL)
+    const cdp = installCdpMock({ axIgnored: true })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'upload',
+      ref: '@e1',
+      file_name: 'cv.pdf',
+      file_base64: 'aGVsbG8=',
+    })
+
+    expect(result.ok).toBe(true)
+    expect(cdp.mock.calls.some((c) => c[1] === 'Accessibility.getPartialAXTree')).toBe(false)
+  })
+
+  it('an unchanged element pays exactly one AX read and proceeds', async () => {
+    setRefs(TAB, mintedRef('Pay'), TAB_URL)
+    const cdp = installCdpMock({ axRole: 'button', axName: 'Pay' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const axCalls = cdp.mock.calls.filter((c) => c[1] === 'Accessibility.getPartialAXTree')
+    expect(axCalls).toHaveLength(1)
+  })
+
+  it('a ref minted without a fingerprint is not checked at all', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    const cdp = installCdpMock({ axIgnored: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(cdp.mock.calls.some((c) => c[1] === 'Accessibility.getPartialAXTree')).toBe(false)
+  })
+
+  it('an AX read that fails leaves the act alone: fail-open on error, closed on mismatch', async () => {
+    setRefs(TAB, mintedRef('Pay'), TAB_URL)
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      if (args[1] === 'Accessibility.getPartialAXTree') throw new Error('No AX node for id')
+      return original(...args)
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+  })
+
+  it("a drag destination's drift refuses the drag before the press", async () => {
+    setRefs(
+      TAB,
+      new Map([
+        ['e1', { backendNodeId: 100, role: 'listitem', name: 'Draft report' }],
+        ['e2', { backendNodeId: 200, role: 'button', name: 'Archive' }],
+      ]),
+      TAB_URL,
+    )
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const params = args[2] as { backendNodeId?: number } | undefined
+      if (args[1] === 'Accessibility.getPartialAXTree') {
+        // The SOURCE still matches its mint; only the DESTINATION drifted.
+        const unchanged = params?.backendNodeId === 100
+        return {
+          nodes: [
+            {
+              backendDOMNodeId: params?.backendNodeId,
+              ignored: false,
+              role: { value: unchanged ? 'listitem' : 'button' },
+              name: { value: unchanged ? 'Draft report' : 'Delete forever' },
+            },
+          ],
+        }
+      }
+      return original(...args)
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'drag', ref: '@e1', to_ref: '@e2' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/drag destination/)
+    expect(result.error).toMatch(/was button "Archive", it is now button "Delete forever"/)
+    const mouseCalls = (send.mock.calls as unknown[][]).filter(
+      (c) => c[1] === 'Input.dispatchMouseEvent',
+    )
+    expect(mouseCalls).toHaveLength(0)
   })
 })

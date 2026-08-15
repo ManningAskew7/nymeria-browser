@@ -207,6 +207,27 @@ const PROBE_EVENTS: Partial<Record<ActionName, readonly string[]>> = {
 }
 
 /**
+ * Verbs whose ref target gets the mint-fingerprint re-check before input is
+ * dispatched (#160 review round): everything that ENTERS input or activates
+ * the element the agent chose BY MEANING. `hover` and `scroll_to` move
+ * nothing into the page; `upload` deliberately targets AX-hidden inputs, so
+ * an AX re-read would refuse its legitimate everyday case; `wait` never
+ * touches a target.
+ */
+const FINGERPRINT_VERBS: ReadonlySet<ActionName> = new Set<ActionName>([
+  'click',
+  'double_click',
+  'right_click',
+  'fill',
+  'type',
+  'key',
+  'check',
+  'uncheck',
+  'select',
+  'drag',
+])
+
+/**
  * What to tell an agent whose input vanished.
  *
  * It cannot see browser UI: a native dialog is invisible to the accessibility
@@ -611,6 +632,94 @@ function detachedRefError(target: string | null, action: ActionName): string {
   )
 }
 
+interface FingerprintDrift {
+  kind: 'changed' | 'hidden'
+  was: string
+  now: string
+}
+
+function axString(v?: { value?: unknown }): string {
+  if (!v || v.value == null) return ''
+  return typeof v.value === 'string' ? v.value : String(v.value)
+}
+
+function describeAxPair(role: string, name: string): string {
+  if (role && name) return `${role} "${name}"`
+  return role || (name ? `"${name}"` : 'an unnamed element')
+}
+
+/**
+ * Has the element's MEANING changed since the ref was minted (#160 review
+ * round)? `isConnected` catches a node the page removed; it cannot catch a
+ * LIVE node the page repurposed: a framework re-render reusing the DOM node
+ * for a different list row, a "Confirm" relabeled "Delete". The mint-time
+ * accessibility role+name is re-read here through the SAME browser-side
+ * computation that minted it (`Accessibility.getPartialAXTree`), one CDP
+ * call, and a mismatch refuses before any input goes out.
+ *
+ * Fail-open on ERROR (a probe that cannot run must not block; the detached
+ * and delivery checks still stand), fail-closed on MISMATCH. An empty mint
+ * name compares role only, so unnamed controls are not bounced on the
+ * label they never had.
+ */
+async function fingerprintDrift(
+  session: Cdp,
+  backendNodeId: number,
+  mintRole: string,
+  mintName: string,
+): Promise<FingerprintDrift | null> {
+  try {
+    const resp = await sendCommand<{
+      nodes?: {
+        backendDOMNodeId?: number
+        ignored?: boolean
+        role?: { value?: unknown }
+        name?: { value?: unknown }
+      }[]
+    }>(session, 'Accessibility.getPartialAXTree', { backendNodeId, fetchRelatives: false })
+    const nodes = resp.nodes ?? []
+    const node = nodes.find((n) => n.backendDOMNodeId === backendNodeId) ?? nodes[0]
+    if (!node) return null
+    const was = describeAxPair(mintRole, mintName)
+    if (node.ignored) return { kind: 'hidden', was, now: 'hidden' }
+    const role = axString(node.role)
+    const name = axString(node.name).trim().replace(/\s+/g, ' ').slice(0, 200)
+    const roleChanged = Boolean(mintRole) && Boolean(role) && role !== mintRole
+    const nameChanged = Boolean(mintName) && name !== mintName
+    if (!roleChanged && !nameChanged) return null
+    return { kind: 'changed', was, now: describeAxPair(role, name) }
+  } catch {
+    return null
+  }
+}
+
+/**
+ * A ref that resolves to a live element whose accessibility identity no
+ * longer matches its mint. Refusing here is the strict half of the ref
+ * contract: a false bounce costs one re-read, a false pass clicks the wrong
+ * MEANING with full confidence.
+ */
+function refChangedError(
+  target: string | null,
+  action: ActionName,
+  drift: FingerprintDrift,
+): string {
+  return (
+    `${target ?? 'that ref'} still exists, but the element changed since you read the ` +
+    `page: it was ${drift.was}, it is now ${drift.now}. The ${action} was NOT sent, ` +
+    'because acting on an element whose meaning changed is how the wrong thing gets ' +
+    'clicked. Re-read the page and use the ref for what you now mean to act on.'
+  )
+}
+
+function refHiddenError(target: string | null, action: ActionName): string {
+  return (
+    `${target ?? 'that ref'} still exists, but the element is no longer visible to ` +
+    'the accessibility tree (hidden or collapsed since you read the page). The ' +
+    `${action} was NOT sent. Re-read the page and use a fresh ref.`
+  )
+}
+
 function stalledError(action: ActionName): string {
   // Reached only when NO owned dialog is recorded for the tab: an owned one
   // returns `dialogBlockedActError` with the dialog named instead. So if a
@@ -676,8 +785,19 @@ function budgetExhaustedBeforeDispatchError(action: ActionName, budgetMs: number
 
 type TargetResolution =
   /** `session` is the CDP addressee that OWNS the node: a cross-origin frame
-   *  has its own session, and its objectIds are meaningless anywhere else. */
-  | { ok: true; objectId: string; session: Cdp; sessionId?: string }
+   *  has its own session, and its objectIds are meaningless anywhere else.
+   *  `backendNodeId` and the mint fingerprint ride along for `@` refs only,
+   *  so the pre-dispatch drift check can re-ask the AX tree about the SAME
+   *  node the ref was minted from. */
+  | {
+      ok: true
+      objectId: string
+      session: Cdp
+      sessionId?: string
+      backendNodeId?: number
+      mintRole?: string
+      mintName?: string
+    }
   | { ok: false; error: string; stale?: StaleReason }
 
 async function currentUrl(tabId: number): Promise<string | null> {
@@ -735,7 +855,15 @@ async function resolveTarget(
           stale: 'unknown-ref',
         }
       }
-      return { ok: true, objectId, session, sessionId: resolution.sessionId }
+      return {
+        ok: true,
+        objectId,
+        session,
+        sessionId: resolution.sessionId,
+        backendNodeId: resolution.backendNodeId,
+        mintRole: resolution.role,
+        mintName: resolution.name,
+      }
     } catch (e) {
       // A session-layer failure is about the TAB, not the ref: telling the
       // agent to re-read the page would send it into the same wall with worse
@@ -1185,6 +1313,41 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           data: { action: a.action, target, stale_refs: true, reason: 'detached' },
         }
       }
+      // The mint-fingerprint re-check, for the verbs that dispatch input into
+      // the element the agent chose by meaning. Only refs minted WITH a
+      // fingerprint are checked (css=/xpath= targets and bare test maps have
+      // none to compare), and only before dispatch, where refusing still
+      // honestly means nothing was sent.
+      if (
+        FINGERPRINT_VERBS.has(a.action) &&
+        resolution.backendNodeId !== undefined &&
+        (resolution.mintRole || resolution.mintName)
+      ) {
+        const drift = await fingerprintDrift(
+          resolution.session,
+          resolution.backendNodeId,
+          resolution.mintRole ?? '',
+          resolution.mintName ?? '',
+        )
+        if (drift) {
+          return {
+            ok: false,
+            status: 'error',
+            error:
+              drift.kind === 'hidden'
+                ? refHiddenError(target, a.action)
+                : refChangedError(target, a.action, drift),
+            data: {
+              action: a.action,
+              target,
+              stale_refs: true,
+              reason: drift.kind,
+              element_was: drift.was,
+              element_now: drift.now,
+            },
+          }
+        }
+      }
       objectId = resolution.objectId
       elementSession = resolution.session
       if (resolution.sessionId) {
@@ -1610,6 +1773,34 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               status: 'error',
               error: `drag destination: ${detachedRefError(a.to_ref, 'drag')}`,
               data: { action: 'drag', target, stale_refs: true, reason: 'detached' },
+            }
+          }
+          // The destination's meaning matters as much as the source's:
+          // dropping onto a repurposed "Trash" is the same wrong-click class.
+          if (dest.backendNodeId !== undefined && (dest.mintRole || dest.mintName)) {
+            const destDrift = await fingerprintDrift(
+              dest.session,
+              dest.backendNodeId,
+              dest.mintRole ?? '',
+              dest.mintName ?? '',
+            )
+            if (destDrift) {
+              return {
+                ok: false,
+                status: 'error',
+                error:
+                  destDrift.kind === 'hidden'
+                    ? `drag destination: ${refHiddenError(a.to_ref, 'drag')}`
+                    : `drag destination: ${refChangedError(a.to_ref, 'drag', destDrift)}`,
+                data: {
+                  action: 'drag',
+                  target,
+                  stale_refs: true,
+                  reason: destDrift.kind,
+                  element_was: destDrift.was,
+                  element_now: destDrift.now,
+                },
+              }
             }
           }
           const destLocal = (await elementGeometry(dest.session, dest.objectId))?.point ?? null
