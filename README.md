@@ -33,13 +33,14 @@ src/
 │   ├── debuggerSession.ts  ref-counted CDP attach, event router, frame registry
 │   ├── input.ts        trusted input primitives + hit testing
 │   ├── settle.ts       post-action DOM quiescence probe
-│   ├── snapshotRefs.ts frame-scoped @eN ref table with staleness reasons
+│   ├── snapshotRefs.ts frame-scoped @eN ref table: monotonic per-tab numbering (storage.session-backed), merge semantics, mint fingerprints, typed staleness reasons (#160)
+│   ├── worlds.ts       isolated-world creation/cache per (tab, session, name); trust probes and element handles live in nymeria_probe (#160)
 │   ├── consoleBuffer.ts / networkBuffer.ts   CDP capture, filled from attach
 │   ├── navWatch.ts     per-tab navigation lifecycle from webNavigation events
 │   ├── statusWatch.ts  last main-frame HTTP status per tab via webRequest (#175; needs the runtime host grant)
 │   ├── budget.ts       per-command wall-clock budget vocabulary (#162)
 │   ├── dialogs.ts      Page-domain dialog ownership + answering policy (#169)
-│   ├── delivery.ts     isolated-world input-delivery probe
+│   ├── delivery.ts     input-delivery probe in its own isolated world (policy here, world machinery in worlds.ts)
 │   └── commands/       one executor per wire command type
 ├── popup/
 │   ├── Popup.tsx       connection form + live status card

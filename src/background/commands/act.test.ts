@@ -3000,17 +3000,8 @@ describe('failed_requests classification', () => {
   it('annotates same_origin and keeps the first-party POST ahead of telemetry noise', async () => {
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock()
-    // Five third-party beacon failures, the QA-measured drowning shape...
-    for (let i = 0; i < 5; i += 1) {
-      pushNetwork(TAB, {
-        url: `https://telemetry${i}.example.net/collect`,
-        method: 'POST',
-        error: 'net::ERR_NAME_NOT_RESOLVED',
-        resource_type: 'Ping',
-        ts: future(),
-      })
-    }
-    // ...then the one that matters: the page's own API rejecting.
+    // The one that matters FIRST, so recency alone would evict it: the
+    // page's own API rejecting...
     pushNetwork(TAB, {
       url: 'https://example.com/api/submit',
       method: 'POST',
@@ -3018,6 +3009,17 @@ describe('failed_requests classification', () => {
       resource_type: 'XHR',
       ts: future(),
     })
+    // ...then five NEWER third-party beacon failures, the QA-measured
+    // drowning shape. A plain last-5-by-recency cap would report only these.
+    for (let i = 0; i < 5; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://telemetry${i}.example.net/collect`,
+        method: 'POST',
+        error: 'net::ERR_NAME_NOT_RESOLVED',
+        resource_type: 'Ping',
+        ts: future() + 100 + i,
+      })
+    }
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -3035,18 +3037,8 @@ describe('failed_requests classification', () => {
   it('a third-party fetch failure outranks a same-origin tracker pixel', async () => {
     setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
     installCdpMock()
-    // Six same-origin IMAGE failures (telemetry-shaped even at home)...
-    for (let i = 0; i < 6; i += 1) {
-      pushNetwork(TAB, {
-        url: `https://example.com/pixels/${i}.gif`,
-        method: 'GET',
-        status: 404,
-        resource_type: 'Image',
-        ts: future(),
-      })
-    }
-    // ...and one cross-origin API fetch failure (a first-party api.* domain
-    // is cross-ORIGIN and still data-class: type outranks origin).
+    // The cross-origin API fetch failure FIRST (a first-party api.* domain
+    // is cross-ORIGIN and still data-class: type outranks origin)...
     pushNetwork(TAB, {
       url: 'https://api.example.net/v1/checkout',
       method: 'POST',
@@ -3054,6 +3046,17 @@ describe('failed_requests classification', () => {
       resource_type: 'Fetch',
       ts: future(),
     })
+    // ...then six NEWER same-origin tracker pixels, so recency alone would
+    // evict the API failure.
+    for (let i = 0; i < 6; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://example.com/pixels/${i}.gif`,
+        method: 'GET',
+        status: 404,
+        resource_type: 'Image',
+        ts: future() + 100 + i,
+      })
+    }
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
