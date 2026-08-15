@@ -146,6 +146,24 @@ function abortedError(
   requested: string,
   reason: string | null,
 ): string {
+  // The auth class gets its own copy (#166, measured 2026-08-15): the site
+  // demanded an HTTP login and Chrome cancelled the prompt instead of
+  // showing it, which it does when the window is hidden or occluded (a
+  // fullscreen app over the browser was the measured trigger). Two things
+  // the generic triple cannot tell the agent: credentials are the actual
+  // blocker, and a cancelled challenge can leave the TAB's input silently
+  // suppressed afterwards (#173), so retrying here compounds the problem.
+  if (reason?.includes('ERR_INVALID_AUTH_CREDENTIALS')) {
+    return (
+      `the navigation to ${requested} reached the site, but it demanded a login ` +
+      `(HTTP authentication) and Chrome cancelled the prompt (${reason}). Chrome does ` +
+      'this when its window is hidden or covered by another application, so the user ' +
+      'may not have seen anything. The tab is still on ' +
+      `${stayedOn ?? 'its previous page'}, and after a cancelled login challenge ` +
+      'input to this tab may be silently suppressed: prefer a FRESH tab for further ' +
+      'work, and ask the user for credentials or to bring Chrome to the front.'
+    )
+  }
   const named = reason ? ` (Chrome reported ${reason})` : ''
   return (
     `the navigation to ${requested} started but never arrived${named}. ` +

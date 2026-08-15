@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { execAct, __test } from './act'
 import { CdpCallTimeout, resetForTests as resetDebugger } from '../debuggerSession'
 import { push as pushConsole, resetForTests as resetConsole } from '../consoleBuffer'
+import { push as pushNetwork, resetForTests as resetNetwork } from '../networkBuffer'
 import { resetForTests as resetDelivery } from '../delivery'
 import {
   chooserInterceptedSince,
@@ -291,6 +292,7 @@ beforeEach(() => {
   resetRefs()
   resetDebugger()
   resetConsole()
+  resetNetwork()
   resetDelivery()
   resetNavWatch()
   vi.mocked(standingDialog).mockReturnValue(null)
@@ -2981,5 +2983,102 @@ describe('ref fingerprints', () => {
       (c) => c[1] === 'Input.dispatchMouseEvent',
     )
     expect(mouseCalls).toHaveLength(0)
+  })
+})
+
+/**
+ * failed_requests classification and ranking (#166): the QA round measured a
+ * successful upload whose payload carried five failed third-party telemetry
+ * beacons in the exact field where a broken first-party POST would show. The
+ * cap is filled by rank (data-class before telemetry-shaped, same-origin
+ * before cross within the class), and every entry says which side of the
+ * origin line it is on.
+ */
+describe('failed_requests classification', () => {
+  const future = () => Date.now() + 5_000
+
+  it('annotates same_origin and keeps the first-party POST ahead of telemetry noise', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    // Five third-party beacon failures, the QA-measured drowning shape...
+    for (let i = 0; i < 5; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://telemetry${i}.example.net/collect`,
+        method: 'POST',
+        error: 'net::ERR_NAME_NOT_RESOLVED',
+        resource_type: 'Ping',
+        ts: future(),
+      })
+    }
+    // ...then the one that matters: the page's own API rejecting.
+    pushNetwork(TAB, {
+      url: 'https://example.com/api/submit',
+      method: 'POST',
+      status: 500,
+      resource_type: 'XHR',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed).toBeDefined()
+    expect(failed).toHaveLength(5)
+    const firstParty = failed?.find((e) => e.url === 'https://example.com/api/submit')
+    expect(firstParty, 'the broken first-party POST survives the cap').toBeDefined()
+    expect(firstParty?.same_origin).toBe(true)
+    const beacons = failed?.filter((e) => String(e.url).includes('telemetry')) ?? []
+    for (const b of beacons) expect(b.same_origin).toBe(false)
+  })
+
+  it('a third-party fetch failure outranks a same-origin tracker pixel', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    // Six same-origin IMAGE failures (telemetry-shaped even at home)...
+    for (let i = 0; i < 6; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://example.com/pixels/${i}.gif`,
+        method: 'GET',
+        status: 404,
+        resource_type: 'Image',
+        ts: future(),
+      })
+    }
+    // ...and one cross-origin API fetch failure (a first-party api.* domain
+    // is cross-ORIGIN and still data-class: type outranks origin).
+    pushNetwork(TAB, {
+      url: 'https://api.example.net/v1/checkout',
+      method: 'POST',
+      status: 502,
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    const api = failed?.find((e) => String(e.url).includes('api.example.net'))
+    expect(api, 'the data-class failure survives six pixels').toBeDefined()
+    expect(api?.same_origin).toBe(false)
+  })
+
+  it('an unparseable request URL is reported without a same_origin claim', async () => {
+    setRefs(TAB, new Map([['e1', { backendNodeId: 100 }]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'not a url at all',
+      method: 'GET',
+      error: 'net::ERR_FAILED',
+      resource_type: 'XHR',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed).toHaveLength(1)
+    expect(failed?.[0].url).toBe('not a url at all')
+    expect('same_origin' in (failed?.[0] ?? {})).toBe(false)
   })
 })

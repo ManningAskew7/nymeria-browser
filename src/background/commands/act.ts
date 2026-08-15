@@ -270,6 +270,57 @@ function undeliveredError(action: ActionName): string {
  * decode. Say what was observed, list what does it, give both recoveries.
  */
 /**
+ * Resource types that are telemetry-shaped: their failures are routine on
+ * busy sites (beacons show up as Ping, tracker pixels as Image) and must
+ * never crowd a broken first-party POST out of the capped report.
+ */
+const TELEMETRY_TYPES = new Set(['Ping', 'Beacon', 'Image', 'Media', 'Font', 'Prefetch', 'CSPViolationReport'])
+
+function sameOriginAs(url: string, pageUrl: string | null): boolean | undefined {
+  if (!pageUrl) return undefined
+  try {
+    return new URL(url).origin === new URL(pageUrl).origin
+  } catch {
+    // Either side unparseable: say nothing rather than guess (#166).
+    return undefined
+  }
+}
+
+/**
+ * The capped failed-requests report, classified and ranked (#166, from the
+ * 2026-08-15 QA round: a successful upload's payload carried five failed
+ * third-party telemetry beacons in the field where a broken first-party POST
+ * would show, drowning the one signal that matters).
+ *
+ * Each entry is annotated `same_origin` against the page URL (omitted when
+ * either side does not parse), and the cap is filled by RANK, not recency
+ * alone: data-class failures (XHR, Fetch, Document...) before
+ * telemetry-shaped types, same-origin before cross-origin within the class.
+ * Origin alone would demote a first-party API on its own api.* domain; type
+ * alone would keep third-party fetch beacons; the combination plus the
+ * visible annotations covers both. Most-recent wins within a rank, and the
+ * final list reads chronologically.
+ */
+function classifiedFailures(
+  tabId: number,
+  since: number,
+  pageUrl: string | null,
+): Record<string, unknown>[] {
+  const raw = networkFailuresSince(tabId, since, 50)
+  const annotated = raw.map((e) => {
+    const so = sameOriginAs(e.url, pageUrl)
+    return {
+      entry: { ...e, ...(so === undefined ? {} : { same_origin: so }) },
+      rank: (TELEMETRY_TYPES.has(e.resource_type ?? '') ? 2 : 0) + (so === false ? 1 : 0),
+    }
+  })
+  annotated.sort((a, b) => a.rank - b.rank || b.entry.ts - a.entry.ts)
+  const chosen = annotated.slice(0, MAX_CONSOLE_IN_RESULT)
+  chosen.sort((a, b) => a.entry.ts - b.entry.ts)
+  return chosen.map((c) => c.entry as unknown as Record<string, unknown>)
+}
+
+/**
  * The evidence a stalled page cannot stop us collecting.
  *
  * Console lines and failed requests come from local buffers fed by CDP events,
@@ -277,11 +328,16 @@ function undeliveredError(action: ActionName): string {
  * thing that separates the two causes the stall message refuses to choose
  * between: an uncaught page error next to a stall points at a script, silence
  * points at a dialog. A failure that drops them is a worse trade than the
- * silent success this whole mechanism replaced.
+ * silent success this whole mechanism replaced. `pageUrl` feeds the
+ * same-origin classification; null (not yet known) just omits it.
  */
-function localDiagnostics(tabId: number, startedAt: number): Record<string, unknown> {
+function localDiagnostics(
+  tabId: number,
+  startedAt: number,
+  pageUrl: string | null,
+): Record<string, unknown> {
   const errors = consoleSince(tabId, startedAt, { only_errors: true, limit: MAX_CONSOLE_IN_RESULT })
-  const failedRequests = networkFailuresSince(tabId, startedAt, MAX_CONSOLE_IN_RESULT)
+  const failedRequests = classifiedFailures(tabId, startedAt, pageUrl)
   return {
     ...(errors.length ? { console_errors: errors } : {}),
     ...(failedRequests.length ? { failed_requests: failedRequests } : {}),
@@ -587,6 +643,7 @@ function pendingDialogResult(
   d: StandingDialog,
   inputMode: 'trusted' | 'synthetic' | 'none',
   startedAt: number,
+  pageUrl: string | null,
   extra: Record<string, unknown>,
 ): CommandResult {
   return {
@@ -604,7 +661,7 @@ function pendingDialogResult(
           `${action}; it was delivered.`,
       },
       ...extra,
-      ...localDiagnostics(tabId, startedAt),
+      ...localDiagnostics(tabId, startedAt, pageUrl),
     },
   }
 }
@@ -1022,8 +1079,9 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
     limit: MAX_CONSOLE_IN_RESULT,
   })
   // A request that came back 500 without throwing is the commonest silent
-  // failure on a real site, and it never reaches the console.
-  const failedRequests = networkFailuresSince(v.tabId, v.startedAt, MAX_CONSOLE_IN_RESULT)
+  // failure on a real site, and it never reaches the console. Classified and
+  // ranked against the freshest page URL (#166).
+  const failedRequests = classifiedFailures(v.tabId, v.startedAt, urlAfter ?? v.urlBefore)
   return {
     action: v.action,
     ...(v.target ? { target: v.target } : {}),
@@ -1171,7 +1229,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       data: {
         action: a.action,
         dialog: standingDialogPayload(tabId, preDialog),
-        ...localDiagnostics(tabId, startedAt),
+        ...localDiagnostics(tabId, startedAt, null),
       },
     }
   }
@@ -1180,7 +1238,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       ok: false,
       status: 'error',
       error: stalledError(a.action),
-      data: { action: a.action, ...localDiagnostics(tabId, startedAt) },
+      data: { action: a.action, ...localDiagnostics(tabId, startedAt, null) },
     }
   }
 
@@ -1204,7 +1262,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           url: urlBefore,
           budget_exhausted: true,
           input: 'none',
-          ...localDiagnostics(tabId, startedAt),
+          ...localDiagnostics(tabId, startedAt, urlBefore),
         },
       }
     }
@@ -1232,7 +1290,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         data: {
           action: 'wait',
           dialog: standingDialogPayload(tabId, d),
-          ...localDiagnostics(tabId, startedAt),
+          ...localDiagnostics(tabId, startedAt, urlBefore),
         },
       }
     }
@@ -1431,7 +1489,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         url: urlBefore,
         budget_exhausted: true,
         input: 'none',
-        ...localDiagnostics(tabId, startedAt),
+        ...localDiagnostics(tabId, startedAt, urlBefore),
       },
     }
   }
@@ -1834,7 +1892,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               url: urlBefore,
               budget_exhausted: true,
               input: 'none',
-              ...localDiagnostics(tabId, startedAt),
+              ...localDiagnostics(tabId, startedAt, urlBefore),
             },
           }
         }
@@ -1871,7 +1929,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           requested_count: e.requested,
           progress_unit: e.unit,
           input: e.delivered > 0 ? 'trusted' : 'none',
-          ...localDiagnostics(tabId, startedAt),
+          ...localDiagnostics(tabId, startedAt, urlBefore),
         },
       }
     }
@@ -1897,6 +1955,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             stallDialog,
             'trusted',
             startedAt,
+            urlBefore,
             extra,
           )
         }
@@ -1930,7 +1989,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           action: a.action,
           url: urlBefore,
           ...(landed ? { input: 'trusted' } : {}),
-          ...localDiagnostics(tabId, startedAt),
+          ...localDiagnostics(tabId, startedAt, urlBefore),
         },
       }
     }
@@ -1946,7 +2005,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   {
     const raised = standingDialog(tabId)
     if (raised) {
-      return pendingDialogResult(a.action, target, tabId, raised, inputMode, startedAt, extra)
+      return pendingDialogResult(a.action, target, tabId, raised, inputMode, startedAt, urlBefore, extra)
     }
   }
   // The pre-flight cleared the page BEFORE the action, and the check above
@@ -1960,13 +2019,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     // the named cause over the guess when it did.
     const lateDialog = standingDialog(tabId)
     if (lateDialog) {
-      return pendingDialogResult(a.action, target, tabId, lateDialog, inputMode, startedAt, extra)
+      return pendingDialogResult(a.action, target, tabId, lateDialog, inputMode, startedAt, urlBefore, extra)
     }
     return {
       ok: false,
       status: 'error',
       error: dispatchedThenStalledError(a.action),
-      data: { action: a.action, url: urlBefore, input: inputMode, ...localDiagnostics(tabId, startedAt) },
+      data: { action: a.action, url: urlBefore, input: inputMode, ...localDiagnostics(tabId, startedAt, urlBefore) },
     }
   }
 
@@ -2020,6 +2079,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         racedSettle.dialog,
         inputMode,
         startedAt,
+        urlBefore,
         extra,
       )
     }
@@ -2044,7 +2104,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   {
     const late = standingDialog(tabId)
     if (late) {
-      return pendingDialogResult(a.action, target, tabId, late, inputMode, startedAt, extra)
+      return pendingDialogResult(a.action, target, tabId, late, inputMode, startedAt, urlBefore, extra)
     }
   }
   // #168: a NAMED wait condition is honoured here, after settle and with no
@@ -2066,7 +2126,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     const fusedWindowMs = clampToBudget(fusedAskedMs)
     const raced = await raceStandingDialog(tabId, performWait(tabId, a.wait_for, fusedWindowMs))
     if (raced.kind === 'dialog') {
-      return pendingDialogResult(a.action, target, tabId, raced.dialog, inputMode, startedAt, extra)
+      return pendingDialogResult(a.action, target, tabId, raced.dialog, inputMode, startedAt, urlBefore, extra)
     }
     extra.condition = raced.value.condition
     extra.found = raced.value.found
@@ -2111,7 +2171,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   {
     const postVerify = standingDialog(tabId)
     if (postVerify) {
-      return pendingDialogResult(a.action, target, tabId, postVerify, inputMode, startedAt, extra)
+      return pendingDialogResult(a.action, target, tabId, postVerify, inputMode, startedAt, urlBefore, extra)
     }
   }
   // An action that provably did nothing is a FAILED command, not a successful

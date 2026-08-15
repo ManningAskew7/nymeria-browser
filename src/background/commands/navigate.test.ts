@@ -343,6 +343,41 @@ describe('the tab never leaves (no dialog)', () => {
     expect((result.data as { url?: string }).url).toBe(START)
   })
 
+  it('a cancelled login challenge is named as one, with the fresh-tab warning (#166)', async () => {
+    // Measured 2026-08-15: a driven navigate onto a Basic-auth 401 dies as
+    // ERR_INVALID_AUTH_CREDENTIALS when Chrome cannot show the credential
+    // prompt (window hidden or occluded). The generic download/canceled/
+    // blocked triple sent the agent hunting everywhere but at the login, and
+    // a cancelled challenge can leave the tab's input suppressed (#173).
+    vi.useFakeTimers()
+    const nav = wireNav()
+    installTabsMock({
+      landsOn: START,
+      onUpdate: () => {
+        nav.beforeNavigate({ tabId: TAB, url: TARGET, frameId: 0 })
+        nav.errorOccurred({
+          tabId: TAB,
+          url: TARGET,
+          frameId: 0,
+          error: 'net::ERR_INVALID_AUTH_CREDENTIALS',
+        })
+      },
+    })
+
+    const pending = execNavigate({ tab_id: TAB, url: TARGET })
+    await vi.advanceTimersByTimeAsync(2_100)
+    const result = await pending
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toMatch(/demanded a login/)
+    expect(error).toMatch(/net::ERR_INVALID_AUTH_CREDENTIALS/)
+    expect(error, 'the occlusion cause is the measured one').toMatch(/hidden or covered/)
+    expect(error, 'the #173 suppression warning').toMatch(/input to this tab may be silently suppressed/)
+    expect(error, 'the taught recovery').toMatch(/FRESH tab/)
+    expect(error, 'the generic triple must NOT dilute the named cause').not.toMatch(/download/)
+  })
+
   it('a late abort fails at the abort, not at the 25s deadline (finding F2)', async () => {
     // A download URL whose ERR_ABORTED arrives only after headers (slow
     // TTFB): the browser hands us the verdict at t=3s and the old wait
