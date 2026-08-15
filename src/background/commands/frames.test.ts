@@ -283,6 +283,88 @@ describe('frame probe worlds (#160)', () => {
     expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
   })
 
+  it('a frame session that refuses world creation gets one Page.enable and a retry (throw shape)', async () => {
+    // Live-measured 2026-08-15: on the user's Chrome, OOPIF world creation
+    // failed until Page was enabled on that session, so every click inside
+    // a cross-origin iframe refused. The retry is the fix; this pins it.
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    const enabledSessions = new Set<string>()
+    send.mockImplementation(async (...args: unknown[]) => {
+      const sessionId = (args[0] as { sessionId?: string }).sessionId
+      if (args[1] === 'Page.enable' && sessionId) {
+        enabledSessions.add(sessionId)
+        return {}
+      }
+      if (args[1] === 'Page.createIsolatedWorld' && sessionId && !enabledSessions.has(sessionId)) {
+        throw new Error("'Page.createIsolatedWorld' wasn't found")
+      }
+      return original(...args)
+    })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(enabledSessions.has(FRAME_SESSION)).toBe(true)
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(true)
+  })
+
+  it('the enable retry also covers a frame session answering world creation with nothing', async () => {
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    const enabledSessions = new Set<string>()
+    send.mockImplementation(async (...args: unknown[]) => {
+      const sessionId = (args[0] as { sessionId?: string }).sessionId
+      if (args[1] === 'Page.enable' && sessionId) {
+        enabledSessions.add(sessionId)
+        return {}
+      }
+      if (args[1] === 'Page.createIsolatedWorld' && sessionId && !enabledSessions.has(sessionId)) {
+        return {}
+      }
+      return original(...args)
+    })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(enabledSessions.has(FRAME_SESSION)).toBe(true)
+  })
+
+  it('a ROOT session world failure gets no enable retry (Page is already enabled per attach)', async () => {
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const sessionId = (args[0] as { sessionId?: string }).sessionId
+      const params = args[2] as { worldName?: string } | undefined
+      if (args[1] === 'Page.createIsolatedWorld' && !sessionId && params?.worldName === 'nymeria_probe') {
+        return {}
+      }
+      return original(...args)
+    })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, role: 'button', name: 'Pay' }]]), TAB_URL)
+    // The attach itself enables Page on the root (#169); the retry would be
+    // an ADDITIONAL enable, so compare counts across the act.
+    const rootEnables = () =>
+      cdp.mock.calls.filter(
+        (c) => c[1] === 'Page.enable' && (c[0] as { sessionId?: string }).sessionId === undefined,
+      ).length
+    const before = rootEnables()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(rootEnables()).toBe(before)
+  })
+
   it('a throwing offset measurement refuses the same way (the catch is fail-closed too)', async () => {
     const cdp = installCdpMock()
     const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>

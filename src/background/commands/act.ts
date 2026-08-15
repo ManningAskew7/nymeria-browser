@@ -973,8 +973,13 @@ async function resolveTarget(
         // (the element is gone, re-reading helps), no-world is about the
         // probe infrastructure (nothing about the element was learned, and a
         // stale_refs flag here would send the agent re-reading in a loop).
+        // Naming the frame case matters (2026-08-15 QA): a persistent frame
+        // failure read as "mid-navigation" gets dismissed as transient.
         if (resolved.reason === 'no-world') {
-          return { ok: false, error: probeWorldUnavailableError('resolving the element') }
+          const what = resolution.sessionId
+            ? 'resolving the element inside its cross-origin frame'
+            : 'resolving the element'
+          return { ok: false, error: probeWorldUnavailableError(what) }
         }
         return {
           ok: false,

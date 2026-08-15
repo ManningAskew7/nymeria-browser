@@ -98,39 +98,63 @@ export function clearSessionWorlds(tabId: number, sessionId: string): void {
  * from probe failures, so a regression is diagnosable; callers surface
  * their own honest shape and never fall back to the main world).
  *
- * Frame sessions need no special casing: `Page.getFrameTree` and
- * `Page.createIsolatedWorld` both answer on a flattened OOPIF session with
- * no domain enable (measured on Chrome 148 in the 2026-08-15 review rig;
- * `grantUniveralAccess` is the protocol's own spelling). Creating the same
- * name+frame twice returns the SAME context id, so a concurrent create is
- * benign.
+ * FRAME sessions get one `Page.enable` + retry when the first attempt
+ * fails, whichever way it fails (throw or empty answer). This retry was
+ * dropped once as unevidenced and re-added the same day on a LIVE
+ * measurement (2026-08-15 QA): on the user's Chrome, world creation on a
+ * flattened OOPIF session failed until Page was enabled, so every click
+ * inside a cross-origin iframe refused, while a review rig on Chrome 148
+ * had measured the enable unnecessary. Chrome-version-dependent; the retry
+ * covers both. Safe: enabling Page on a frame session does NOT re-route
+ * tab-modal dialog ownership (measured, stays with the root session), and
+ * root sessions already have Page enabled per attach (#169) so they skip
+ * the retry. `grantUniveralAccess` is the protocol's own spelling.
+ * Creating the same name+frame twice returns the SAME context id, so a
+ * concurrent create is benign.
  */
 export async function createWorld(target: Cdp, worldName: string): Promise<number | null> {
-  try {
+  const attempt = async (): Promise<number | null> => {
     const tree = await sendCommand<{ frameTree?: { frame?: { id?: string } } }>(
       target,
       'Page.getFrameTree',
       {},
     )
     const frameId = tree.frameTree?.frame?.id
-    if (!frameId) {
-      logger.warn(`world creation found no frame (${keyFor(target, worldName)})`)
-      return null
-    }
+    if (!frameId) return null
     const created = await sendCommand<{ executionContextId?: number }>(
       target,
       'Page.createIsolatedWorld',
       { frameId, worldName, grantUniveralAccess: false },
     )
     const contextId = created.executionContextId
-    if (typeof contextId !== 'number') {
-      logger.warn(`world creation returned nothing (${keyFor(target, worldName)})`)
-      return null
-    }
+    if (typeof contextId !== 'number') return null
     worlds.set(keyFor(target, worldName), contextId)
     return contextId
+  }
+  let firstError: unknown = null
+  let contextId: number | null = null
+  try {
+    contextId = await attempt()
   } catch (e) {
-    logger.warn(`world creation failed (${keyFor(target, worldName)}):`, e)
+    firstError = e
+  }
+  if (contextId !== null) return contextId
+  if (!sessionOf(target)) {
+    logger.warn(
+      `world creation failed (${keyFor(target, worldName)}):`,
+      firstError ?? 'no context returned',
+    )
+    return null
+  }
+  try {
+    await sendCommand(target, 'Page.enable', {})
+    const second = await attempt()
+    if (second === null) {
+      logger.warn(`frame world creation returned nothing after Page.enable (${keyFor(target, worldName)})`)
+    }
+    return second
+  } catch (retryErr) {
+    logger.warn(`frame world creation failed even after Page.enable (${keyFor(target, worldName)}):`, retryErr)
     return null
   }
 }
