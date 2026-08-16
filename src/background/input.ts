@@ -109,6 +109,11 @@ export class InputBudgetExhausted extends Error {
  * PLACE on the root document with full confidence, the exact class the
  * probe-world geometry exists to remove. Nothing has been dispatched when
  * this is thrown; callers turn it into a nothing-was-sent refusal.
+ *
+ * CURRENTLY UNTHROWN: frame input now dispatches on the frame's own session
+ * with frame-local coordinates (see `frameOffset` below), so no caller
+ * composes an offset. Kept until the live measurement of that dispatch shape
+ * settles whether composition is gone for good.
  */
 export class FrameOffsetUnavailable extends Error {
   constructor() {
@@ -282,25 +287,21 @@ export async function elementGeometry(target: Cdp, objectId: string): Promise<{ 
 /**
  * Origin of a cross-origin frame in ROOT viewport coordinates.
  *
- * An element inside an iframe reports a rect relative to that frame's own
- * viewport, but `Input.*` is dispatched on the root session in root
- * coordinates (Chrome hit-tests and routes the event into the frame's widget
- * for us). The two must be composed or every click inside a frame lands at
- * the wrong place on the page.
+ * CURRENTLY UNREFERENCED, pending the frame-dispatch live measurement. This
+ * composed the root-space point for the old dispatch shape: frame-local rect
+ * plus this offset, dispatched on the ROOT session, trusting Chrome to
+ * hit-test the point and route the event into the frame's widget. That
+ * routing assumption was measured FALSE live (2026-08-15): on the user's
+ * Chrome, root-session `Input.*` never reaches OOPIF content at all, however
+ * the point is composed (a screenshot-aimed coordinate click no-ops the same
+ * way). Input now dispatches on the frame's own session with the frame-local
+ * rect directly, so nothing composes. Kept (with `FrameOffsetUnavailable`
+ * above) until the measurement confirms the frame-session shape, in case the
+ * frame session turns out to want root-space coordinates instead.
  *
- * Handles one level of nesting: a frame whose parent is the main document.
- * Deeper nesting would need the chain walked, which no real checkout has
- * needed so far; the offset simply degrades to the outermost frame.
- *
- * The owner handle is minted in the PROBE WORLD (#160): this offset is ADDED
- * to every in-frame click point, so a main-world `getBoundingClientRect` or
- * `getComputedStyle` lie shifted every click inside the frame.
- *
- * FAIL-CLOSED: null when the offset cannot be measured (probe world
- * unavailable, owner not found, geometry call failed). The old shape
- * returned {0,0}, which dispatched the click at the IN-FRAME coordinates on
- * the ROOT document, a guaranteed wrong-place click on some unrelated
- * element (review round). Callers must refuse to dispatch on null.
+ * Handles one level of nesting only. The owner handle is minted in the PROBE
+ * WORLD (#160). FAIL-CLOSED: null when the offset cannot be measured; the
+ * pre-review shape returned {0,0}, a guaranteed wrong-place click.
  */
 export async function frameOffset(tabId: number, frameId: string): Promise<Point | null> {
   try {

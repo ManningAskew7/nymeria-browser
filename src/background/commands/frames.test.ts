@@ -168,9 +168,6 @@ describe('frame-scoped refs', () => {
     const elementCalls = cdp.mock.calls.filter((c) => {
       if (c[1] !== 'Runtime.callFunctionOn') return false
       const fn = String((c[2] as { functionDeclaration?: string }).functionDeclaration)
-      // The frame-offset probe measures the <iframe> element itself, which
-      // lives in the MAIN document, so it correctly runs on the root session.
-      if (fn.includes('getComputedStyle')) return false
       return /getBoundingClientRect|elementFromPoint|isConnected/.test(fn)
     })
     expect(elementCalls.length).toBeGreaterThan(0)
@@ -180,8 +177,12 @@ describe('frame-scoped refs', () => {
   })
 })
 
-describe('frame input geometry', () => {
-  it('composes the frame offset so a click in an iframe lands on the page', async () => {
+describe('frame input dispatch', () => {
+  it("dispatches a frame ref's click on the FRAME's own session at frame-local coordinates", async () => {
+    // Root-session dispatch at composed root coordinates was measured live
+    // (2026-08-15) never to reach OOPIF content: acked ok, nothing arrived.
+    // The frame's own session is the delivery channel, and the coordinates
+    // stay in the frame's viewport space end to end, so no offset exists.
     const cdp = installCdpMock({
       frameLocalRect: { x: 30, y: 40, w: 100, h: 20 },
       iframeRect: { left: 200, top: 300 },
@@ -194,13 +195,15 @@ describe('frame input geometry', () => {
     const pressed = cdp.mock.calls.find(
       (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
     )
-    // 30 + 200, 40 + 300: frame-local rect plus the iframe's own position.
-    expect(pressed?.[2]).toMatchObject({ x: 230, y: 340 })
-    // Input is dispatched on the ROOT session; Chrome routes it into the frame.
-    expect(pressed?.[0]).toEqual({ tabId: TAB })
+    // The frame-local point, verbatim. The iframe's own position on the
+    // page (200, 300) must appear NOWHERE in the dispatch.
+    expect(pressed?.[2]).toMatchObject({ x: 30, y: 40 })
+    expect(pressed?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    // No offset is measured at all: the owner lookup was the old shape.
+    expect(cdp.mock.calls.some((c) => c[1] === 'DOM.getFrameOwner')).toBe(false)
   })
 
-  it('does not offset an element in the main document', async () => {
+  it('dispatches a main-document click on the root session, un-offset', async () => {
     const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
     await attachFrame()
     setRefs(TAB, new Map([['e1', { backendNodeId: 7, role: 'button', name: 'Pay' }]]), TAB_URL)
@@ -211,7 +214,119 @@ describe('frame input geometry', () => {
       (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
     )
     expect(pressed?.[2]).toMatchObject({ x: 30, y: 40 })
+    expect(pressed?.[0]).toEqual({ tabId: TAB })
     expect(cdp.mock.calls.some((c) => c[1] === 'DOM.getFrameOwner')).toBe(false)
+  })
+
+  it('sends fill (focus, select-all, insertText) entirely on the frame session', async () => {
+    // The pre-fix shape was a cross-session SPLIT: DOM.focus went to the
+    // frame while Input.insertText went to the root, whose IME commits into
+    // the ROOT document's focused element. Text never reached the frame.
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'textbox', name: 'Card number' }]]), TAB_URL)
+
+    await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: '4242' })
+
+    const focus = cdp.mock.calls.find((c) => c[1] === 'DOM.focus')
+    expect(focus?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    const insert = cdp.mock.calls.find((c) => c[1] === 'Input.insertText')
+    expect(insert?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    expect(insert?.[2]).toMatchObject({ text: '4242' })
+  })
+
+  it('sends type and key events on the frame session', async () => {
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'textbox', name: 'Card number' }]]), TAB_URL)
+
+    await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'hi' })
+    await execAct({ tab_id: TAB, action: 'key', ref: '@e1', value: 'Enter' })
+
+    const keyEvents = cdp.mock.calls.filter((c) => c[1] === 'Input.dispatchKeyEvent')
+    expect(keyEvents.length).toBeGreaterThan(0)
+    for (const call of keyEvents) {
+      expect(call[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    }
+  })
+
+  it('a covered frame target refuses without offering the root-coordinate escape', async () => {
+    // The taught click-through is a bare-coordinate act, which dispatches on
+    // the ROOT session: measured never to arrive inside a cross-origin
+    // frame. Offering it for a frame target teaches a guaranteed no-op, and
+    // a frame-local click_point would be a mixed-space trap for the same
+    // move. The frame exit is the covering element's own ref.
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const sessionId = (args[0] as { sessionId?: string }).sessionId
+      const params = args[2] as { functionDeclaration?: string } | undefined
+      const fn = String(params?.functionDeclaration ?? '')
+      if (args[1] === 'Runtime.callFunctionOn' && sessionId && fn.includes('elementFromPoint')) {
+        return { result: { value: { hit: false, blocker: 'div#overlay' } } }
+      }
+      return original(...args)
+    })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/covered by div#overlay/)
+    expect(result.error).toMatch(/own @ref/)
+    expect(result.error).not.toMatch(/coordinate=\[/)
+    expect((result.data as { click_point?: unknown })?.click_point).toBeUndefined()
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+})
+
+describe('cross-frame drag', () => {
+  it('refuses a drag whose source and destination live in different sessions', async () => {
+    // One pointer stream goes to ONE session; the root-dispatch alternative
+    // is the measured OOPIF no-op. Fail closed, nothing dispatched.
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(
+      TAB,
+      new Map([
+        ['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'listitem', name: 'Card' }],
+        ['e2', { backendNodeId: 8, role: 'list', name: 'Saved cards' }],
+      ]),
+      TAB_URL,
+    )
+
+    const result = await execAct({ tab_id: TAB, action: 'drag', ref: '@e1', to_ref: '@e2' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/cannot cross a frame boundary/)
+    expect((result.data as { cross_frame?: boolean })?.cross_frame).toBe(true)
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
+  it('dispatches a same-frame drag entirely on that frame session, frame-local', async () => {
+    const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
+    await attachFrame()
+    setRefs(
+      TAB,
+      new Map([
+        ['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'listitem', name: 'Card' }],
+        ['e2', { backendNodeId: 8, sessionId: FRAME_SESSION, role: 'list', name: 'Saved cards' }],
+      ]),
+      TAB_URL,
+    )
+
+    const result = await execAct({ tab_id: TAB, action: 'drag', ref: '@e1', to_ref: '@e2' })
+
+    expect(result.ok).toBe(true)
+    const mouseEvents = cdp.mock.calls.filter((c) => c[1] === 'Input.dispatchMouseEvent')
+    expect(mouseEvents.length).toBeGreaterThan(0)
+    for (const call of mouseEvents) {
+      expect(call[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    }
+    const pressed = mouseEvents.find((c) => (c[2] as { type: string }).type === 'mousePressed')
+    expect(pressed?.[2]).toMatchObject({ x: 30, y: 40 })
   })
 })
 
@@ -237,30 +352,12 @@ describe('frame probe worlds (#160)', () => {
     expect((resolveCall?.[2] as { executionContextId?: number }).executionContextId).toBe(99)
   })
 
-  it("composes the frame offset from the ROOT session's world", async () => {
-    const cdp = installCdpMock()
-    await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
-
-    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
-
-    // The <iframe> owner element lives in the MAIN document: its handle is
-    // minted in the root session's world (context 88), on the root session.
-    const ownerResolve = cdp.mock.calls.find(
-      (c) =>
-        c[1] === 'DOM.resolveNode' &&
-        (c[0] as { sessionId?: string }).sessionId === undefined,
-    )
-    expect(ownerResolve).toBeDefined()
-    expect((ownerResolve?.[2] as { executionContextId?: number }).executionContextId).toBe(88)
-  })
-
-  it('an unmeasurable frame offset REFUSES the click instead of dispatching un-offset', async () => {
-    // The old shape degraded to {0,0}, which dispatched the click at the
-    // frame-LOCAL coordinates on the ROOT document: a guaranteed wrong-place
-    // click on whatever main-document element sits there (review round).
-    // Here the ROOT world (which measures the <iframe> owner) cannot be
-    // created while the frame's own world still works.
+  it("a frame click no longer depends on the ROOT session's world at all", async () => {
+    // The old shape resolved the <iframe> owner in the root world to compose
+    // the offset, so a root-world hiccup refused a perfectly measurable
+    // frame click. With dispatch on the frame's own session there is nothing
+    // left to ask the root: the click must succeed with root world creation
+    // broken the whole time.
     const cdp = installCdpMock()
     const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
     const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
@@ -277,10 +374,11 @@ describe('frame probe worlds (#160)', () => {
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    expect(result.ok).toBe(false)
-    expect(result.error).toMatch(/NOT sent/)
-    expect(result.error).toMatch(/isolated inspection context/)
-    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+    expect(result.ok).toBe(true)
+    const pressed = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
+    )
+    expect(pressed?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
   })
 
   it('a frame session that refuses world creation gets one Page.enable and a retry (throw shape)', async () => {
@@ -365,21 +463,4 @@ describe('frame probe worlds (#160)', () => {
     expect(rootEnables()).toBe(before)
   })
 
-  it('a throwing offset measurement refuses the same way (the catch is fail-closed too)', async () => {
-    const cdp = installCdpMock()
-    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
-    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
-    send.mockImplementation(async (...args: unknown[]) => {
-      if (args[1] === 'DOM.getFrameOwner') throw new Error('Frame with the given id was not found.')
-      return original(...args)
-    })
-    await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
-
-    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
-
-    expect(result.ok).toBe(false)
-    expect(result.error).toMatch(/NOT sent/)
-    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
-  })
 })

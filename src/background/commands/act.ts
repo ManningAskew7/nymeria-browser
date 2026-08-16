@@ -1,6 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { readSince as consoleSince } from '../consoleBuffer'
-import { CdpCallTimeout, frameSessions, sendCommand, TabUnusable, type Cdp } from '../debuggerSession'
+import { CdpCallTimeout, sendCommand, TabUnusable, type Cdp } from '../debuggerSession'
 import { absenceIsConclusive, armDelivery, type DeliveryOutcome } from '../delivery'
 import {
   budgetLabel,
@@ -16,14 +16,12 @@ import {
   elementGeometry,
   focusElement,
   focusLandedIn,
-  FrameOffsetUnavailable,
   hitTest,
   InputBudgetExhausted,
   InputDispatchStalled,
   textEntryTarget,
   insertText,
   modifierMask,
-  frameOffset,
   scrollIntoView,
   selectAllIn,
   trustedClick,
@@ -567,24 +565,36 @@ function fileChooserInterceptedError(action: ActionName, target: string | null):
  * render surface on a target the classifier missed), and the guard cannot
  * tell those apart, so the copy names both and hands over the exact
  * coordinate for a deliberate click-through instead of dead-ending.
+ *
+ * `point` is null for a target inside a cross-origin frame: a bare-coordinate
+ * act dispatches on the root session, which was measured (2026-08-15, live)
+ * never to reach OOPIF content, so handing over a coordinate there would
+ * teach a guaranteed no-op. The frame exit is the covering element's own ref.
  */
 function coveredPointError(
   action: ActionName,
   target: string | null,
   blocker: string | undefined,
-  point: { x: number; y: number },
+  point: { x: number; y: number } | null,
 ): string {
-  const x = Math.round(point.x)
-  const y = Math.round(point.y)
-  // check/uncheck are ref-only verbs, so "repeat with coordinate" would be
-  // refused on arrival; their exit is a plain click plus a state read.
-  const override =
-    action === 'check' || action === 'uncheck'
-      ? `click it deliberately with action="click" and coordinate=[${x}, ${y}] ` +
-        '(no ref), then re-read the control to confirm its state changed'
-      : `repeat the ${action} with coordinate=[${x}, ${y}] and no ref to ` +
-        'click it deliberately. For text entry, fill or type on the ref ' +
-        'works without any click'
+  let override: string
+  if (!point) {
+    override =
+      're-read the page and target the covering element by its own @ref ' +
+      '(coordinate clicks cannot reach inside a cross-origin frame)'
+  } else {
+    const x = Math.round(point.x)
+    const y = Math.round(point.y)
+    // check/uncheck are ref-only verbs, so "repeat with coordinate" would be
+    // refused on arrival; their exit is a plain click plus a state read.
+    override =
+      action === 'check' || action === 'uncheck'
+        ? `click it deliberately with action="click" and coordinate=[${x}, ${y}] ` +
+          '(no ref), then re-read the control to confirm its state changed'
+        : `repeat the ${action} with coordinate=[${x}, ${y}] and no ref to ` +
+          'click it deliberately. For text entry, fill or type on the ref ' +
+          'works without any click'
+  }
   return (
     `the ${action} point for ${target ?? 'that element'} is covered by ` +
     `${blocker ?? 'another element'}. If that is a real overlay (cookie ` +
@@ -592,6 +602,23 @@ function coveredPointError(
     "and retry. If it looks like part of the target's own widget (a styled " +
     `control, an editor surface), the covering element is what a person ` +
     `would click: ${override}.`
+  )
+}
+
+/**
+ * A drag whose source and destination live in different documents (one in a
+ * cross-origin frame, the other outside it, or in a different frame). One
+ * pointer stream goes to ONE session, and the root-session alternative was
+ * measured never to deliver into an OOPIF, so there is no honest way to
+ * perform this drag. Refused with nothing dispatched.
+ */
+function crossFrameDragError(source: string | null, destRef: string): string {
+  return (
+    `drag cannot cross a frame boundary: ${source ?? 'the source'} and ` +
+    `${destRef} live in different documents (a cross-origin frame receives ` +
+    'its own input, separately from the page around it). Nothing was ' +
+    'dispatched. Drag between two elements inside the same document, or use ' +
+    "the page's own move/reorder controls if it offers them."
   )
 }
 
@@ -1413,7 +1440,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // Default addressee is the root page session; a ref inside a cross-origin
   // frame swaps this for that frame's session.
   let elementSession: Cdp = tabId
-  let elementFrameId: string | undefined
+  let elementSessionId: string | undefined
   /** What a bare coordinate landed on, for the verification payload. */
   let pointTarget: PointTarget | null = null
   if (NEEDS_TARGET.has(a.action) || (OPTIONAL_TARGET.has(a.action) && target)) {
@@ -1460,11 +1487,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       }
       objectId = resolution.objectId
       elementSession = resolution.session
-      if (resolution.sessionId) {
-        elementFrameId = frameSessions(tabId).find(
-          (f) => f.sessionId === resolution.sessionId,
-        )?.targetId
-      }
+      elementSessionId = resolution.sessionId
     }
 
     // Checked HERE rather than inside the click case, so it covers every verb
@@ -1503,22 +1526,16 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     }
   }
 
-  /**
-   * Where to dispatch a pointer event for the resolved element.
-   *
-   * Geometry is read in the element's own session (frame-local for an
-   * iframe), but Input.* goes in on the ROOT session in root coordinates:
-   * Chrome hit-tests the point and routes the event into the right widget.
-   * So a frame element's rect must be composed with the frame's offset, and
-   * an unmeasurable offset REFUSES (`FrameOffsetUnavailable`, handled in the
-   * catch below): un-offset frame coordinates land somewhere else entirely.
-   */
-  const dispatchPoint = async (local: Point): Promise<Point> => {
-    if (!elementFrameId) return local
-    const offset = await frameOffset(tabId, elementFrameId)
-    if (!offset) throw new FrameOffsetUnavailable()
-    return { x: local.x + offset.x, y: local.y + offset.y }
-  }
+  // Input for a ref dispatches on the ELEMENT'S OWN session with the
+  // element's own frame-local coordinates: `elementSession` is the root for
+  // a main-document ref and the frame's flattened session for an OOPIF ref,
+  // and `elementGeometry` reads the rect in that same session, so geometry
+  // and dispatch share one coordinate space end to end and nothing composes.
+  // The old shape (root-session dispatch at root coordinates composed via
+  // `frameOffset`, trusting Chrome to hit-test the point into the frame's
+  // widget) was measured live 2026-08-15 to NEVER deliver into an OOPIF on
+  // the user's Chrome: every event acked ok and nothing arrived, while
+  // main-document input landed concurrently in the same tab.
 
   let inputMode: 'trusted' | 'synthetic' | 'none' = 'none'
   let previousValue: string | null | undefined
@@ -1569,7 +1586,6 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           await scrollIntoView(elementSession, objectId)
           const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
-            const composed = await dispatchPoint(geo.point)
             const ht = await hitTest(elementSession, objectId, geo.point)
             let clickThrough: string | null = null
             if (!ht.hit) {
@@ -1585,16 +1601,26 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                 return {
                   ok: false,
                   status: 'error',
-                  error: coveredPointError(a.action, target, ht.blocker, composed),
+                  error: coveredPointError(
+                    a.action,
+                    target,
+                    ht.blocker,
+                    elementSessionId ? null : geo.point,
+                  ),
                   data: {
                     intercepted_by: ht.blocker ?? null,
-                    click_point: [Math.round(composed.x), Math.round(composed.y)],
+                    // A frame-local coordinate is useless to the agent (bare
+                    // coordinates are root-space), so a frame target gets no
+                    // click_point rather than a mixed-space one.
+                    ...(elementSessionId
+                      ? {}
+                      : { click_point: [Math.round(geo.point.x), Math.round(geo.point.y)] }),
                   },
                 }
               }
               clickThrough = ht.blocker ?? 'a covering element'
             }
-            await trustedClick(tabId, composed, {
+            await trustedClick(elementSession, geo.point, {
               button,
               clickCount,
               modifiers,
@@ -1664,7 +1690,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           await scrollIntoView(elementSession, objectId)
           const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
-            await trustedHover(tabId, await dispatchPoint(geo.point), modifiers)
+            await trustedHover(elementSession, geo.point, modifiers)
             inputMode = 'trusted'
           } else {
             await callOn(
@@ -1687,7 +1713,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         await scrollIntoView(elementSession, objectId)
         await focusElement(elementSession, objectId)
         await selectAllIn(elementSession, objectId)
-        await insertText(tabId, a.value)
+        // `Input.insertText` commits into the SESSION's focused element, so
+        // it must ride the same session the focus call just went to: the
+        // root's IME cannot reach a field inside a cross-origin frame.
+        await insertText(elementSession, a.value)
         inputMode = 'trusted'
         break
       }
@@ -1698,7 +1727,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           previousValue = await readValue(elementSession, objectId)
         }
         if (a.value) {
-          await typeText(tabId, a.value, budgetDeadline)
+          // With a ref this is the element's own session (key events follow
+          // the focus set above); without one `elementSession` is the root,
+          // which is where an unqualified "type at the focused element" goes.
+          await typeText(elementSession, a.value, budgetDeadline)
           inputMode = 'trusted'
         }
         break
@@ -1706,7 +1738,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       case 'key': {
         if (!a.value) return { ok: false, status: 'error', error: 'key requires value (the key name)' }
         if (objectId) await focusElement(elementSession, objectId)
-        await dispatchKey(tabId, a.value, modifiers)
+        await dispatchKey(elementSession, a.value, modifiers)
         inputMode = 'trusted'
         break
       }
@@ -1756,7 +1788,6 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           await scrollIntoView(elementSession, objectId)
           const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
-            const composed = await dispatchPoint(geo.point)
             const ht = await hitTest(elementSession, objectId, geo.point)
             if (!ht.hit) {
               // Checkboxes are not text entry, so no click-through here; the
@@ -1766,14 +1797,21 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               return {
                 ok: false,
                 status: 'error',
-                error: coveredPointError(a.action, target, ht.blocker, composed),
+                error: coveredPointError(
+                  a.action,
+                  target,
+                  ht.blocker,
+                  elementSessionId ? null : geo.point,
+                ),
                 data: {
                   intercepted_by: ht.blocker ?? null,
-                  click_point: [Math.round(composed.x), Math.round(composed.y)],
+                  ...(elementSessionId
+                    ? {}
+                    : { click_point: [Math.round(geo.point.x), Math.round(geo.point.y)] }),
                 },
               }
             }
-            await trustedClick(tabId, composed, { modifiers, deadline: budgetDeadline })
+            await trustedClick(elementSession, geo.point, { modifiers, deadline: budgetDeadline })
             inputMode = 'trusted'
           }
           // Deadlined for the same reason the dispatch itself is, and this is
@@ -1863,10 +1901,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         break
       }
       case 'drag': {
-        const localFrom = objectId
+        const from = objectId
           ? (await elementGeometry(elementSession, objectId))?.point ?? null
           : pointFrom(a.coordinate)
-        const from = localFrom ? await dispatchPoint(localFrom) : null
+        // The session the whole pointer stream rides: the source element's
+        // for a ref, the root for a coordinate source. A drag is ONE stream
+        // (press, glide, release), so both ends must live in this session.
+        const dragSessionId = objectId ? elementSessionId : undefined
         let to: Point | null = null
         if (a.to_ref) {
           const dest = await resolveTarget(tabId, a.to_ref, urlBefore)
@@ -1898,18 +1939,20 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             'drag destination: ',
           )
           if (destRefusal) return destRefusal
-          const destLocal = (await elementGeometry(dest.session, dest.objectId))?.point ?? null
-          if (destLocal && dest.sessionId) {
-            // Same fail-closed rule as dispatchPoint: a destination in a
-            // frame whose offset cannot be measured must not become a drop
-            // at the un-offset coordinates.
-            const destFrame = frameSessions(tabId).find((f) => f.sessionId === dest.sessionId)
-            const offset = destFrame ? await frameOffset(tabId, destFrame.targetId) : null
-            if (!offset) throw new FrameOffsetUnavailable()
-            to = { x: destLocal.x + offset.x, y: destLocal.y + offset.y }
-          } else {
-            to = destLocal
+          if ((dest.sessionId ?? null) !== (dragSessionId ?? null)) {
+            return {
+              ok: false,
+              status: 'error',
+              error: crossFrameDragError(target, a.to_ref),
+              data: {
+                action: 'drag',
+                ...(target ? { target } : {}),
+                cross_frame: true,
+                input: 'none',
+              },
+            }
           }
+          to = (await elementGeometry(dest.session, dest.objectId))?.point ?? null
         }
         if (!from || !to) {
           return {
@@ -1937,7 +1980,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             },
           }
         }
-        const dragOutcome = await trustedDrag(tabId, from, to, modifiers, budgetDeadline)
+        const dragOutcome = await trustedDrag(elementSession, from, to, modifiers, budgetDeadline)
         inputMode = 'trusted'
         if (dragOutcome.degraded) {
           // A zero-glide drag may not have registered as a drag at all; the
@@ -1951,25 +1994,6 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         return { ok: false, status: 'error', error: `unknown action: ${String(a.action)}` }
     }
   } catch (e) {
-    if (e instanceof FrameOffsetUnavailable) {
-      // Fail-closed twin of the probe-world rule: the offset that places a
-      // cross-frame click could not be measured, and dispatching without it
-      // clicks the wrong place on the root document. Nothing was sent.
-      return {
-        ok: false,
-        status: 'error',
-        error:
-          `the ${a.action} was NOT sent: ` +
-          probeWorldUnavailableError("measuring the target frame's position"),
-        data: {
-          action: a.action,
-          ...(target ? { target } : {}),
-          url: urlBefore,
-          input: 'none',
-          ...localDiagnostics(tabId, startedAt, urlBefore),
-        },
-      }
-    }
     if (e instanceof InputBudgetExhausted) {
       // #162: the sum of healthy dispatches reached the wire budget. This is
       // the failure that replaces the backend's payload-less transport
