@@ -49,7 +49,10 @@ const fpRef = (backendNodeId: number, extra: Partial<RefTarget> = {}): RefTarget
 interface MockOptions {
   /** null means the element has no layout box (hidden / zero-size). */
   geometry?: { x: number; y: number; w: number; h: number } | null
-  hit?: { hit: boolean; blocker?: string }
+  /** The hit test's whole answer, `via` included: WHICH containment
+   *  accepted a hit decides whether a pointer-events:none target was
+   *  actually reached. */
+  hit?: { hit: boolean; blocker?: string; via?: 'self' | 'descendant' | 'ancestor' }
   value?: string | null
   resolveNode?: boolean
   settleValue?: string
@@ -94,6 +97,37 @@ interface MockOptions {
   isFileInput?: boolean
   /** false models a ref that still resolves but is detached from the document. */
   targetConnected?: boolean
+  /** true models a control the browser matches `:disabled` (never acts). */
+  disabled?: boolean
+  /** true models `readOnly` on the target; only meaningful with `textEntry`. */
+  readonly?: boolean
+  /**
+   * What `checkVisibility({checkOpacity, checkVisibilityCSS})` answers.
+   * `false` is the opacity-0 case that still WINS the hit test (R-07). A
+   * browser that cannot answer at all is modelled with `actionabilityRaw`,
+   * since the real probe then OMITS the field.
+   */
+  visible?: boolean
+  /** true models a target whose computed `pointer-events` is `none`. */
+  pointerEventsNone?: boolean
+  /**
+   * The anti-autofill / date-picker pattern: `readonly` until the field's
+   * own focus handler removes it, so the post-focus re-ask answers no and
+   * the fill must go through.
+   */
+  readonlyClearsOnFocus?: boolean
+  /** A transition that finished between the probe and the hit test, so the
+   *  pre-refusal re-ask finds the element clickable after all. */
+  pointerEventsClearsBeforeRefusal?: boolean
+  /**
+   * Answer the widened pre-dispatch probe with this VERBATIM, overriding
+   * every field above: for the malformed/partial answers whose whole point
+   * is that they are not the shape the code expects.
+   */
+  actionabilityRaw?: unknown
+  /** Fail the widened probe with an ORDINARY error (a dead context, not a
+   *  session-layer failure), which must not block the act. */
+  actionabilityThrows?: string
   /** What the AX tree reports for the node NOW (the fingerprint re-check). */
   axRole?: string
   axName?: string
@@ -142,6 +176,14 @@ function installCdpMock(opts: MockOptions = {}) {
     inputAckHangsFrom,
     isFileInput = false,
     targetConnected = true,
+    disabled = false,
+    readonly = false,
+    visible = true,
+    pointerEventsNone = false,
+    readonlyClearsOnFocus = false,
+    pointerEventsClearsBeforeRefusal = false,
+    actionabilityRaw,
+    actionabilityThrows,
     axRole = 'button',
     axName = 'Pay',
     axIgnored = false,
@@ -196,6 +238,42 @@ function installCdpMock(opts: MockOptions = {}) {
     }
     if (method === 'Runtime.callFunctionOn') {
       const fn = String(params.functionDeclaration ?? '')
+      // The widened pre-dispatch probe: one call, every actionability fact.
+      // Matched FIRST and on `checkVisibility`, the one substring unique to
+      // it: its body composes TEXT_ENTRY_FN and reads isConnected, so the
+      // narrower branches below would otherwise swallow it. The answer is
+      // shaped like the real one, which OMITS a fact rather than reporting
+      // it false, so "absent means unknown" is what the code under test
+      // actually meets.
+      if (fn.includes('checkVisibility')) {
+        if (connectedThrows === 'timeout') {
+          throw new CdpCallTimeout('Runtime.callFunctionOn', 15_000)
+        }
+        if (actionabilityThrows) throw new Error(actionabilityThrows)
+        if (actionabilityRaw !== undefined) return { result: { value: actionabilityRaw } }
+        return {
+          result: {
+            value: {
+              connected: targetConnected,
+              textEntry,
+              visible,
+              ...(disabled ? { disabled: true } : {}),
+              ...(readonly ? { readonly: true } : {}),
+              ...(pointerEventsNone ? { pointerEventsNone: true } : {}),
+            },
+          },
+        }
+      }
+      // The two single-fact RE-ASKS, each answered on its own so a test can
+      // model the state CHANGING between the widened probe and the moment
+      // the answer is used (a focus handler unlocking a field, a transition
+      // finishing), which is the whole reason they exist.
+      if (fn.includes('this.readOnly === true')) {
+        return { result: { value: readonly && !readonlyClearsOnFocus } }
+      }
+      if (fn.includes("pointerEvents === 'none'")) {
+        return { result: { value: pointerEventsNone && !pointerEventsClearsBeforeRefusal } }
+      }
       if (fn.includes('getBoundingClientRect')) {
         return { result: { value: geometry } }
       }
@@ -2217,6 +2295,506 @@ describe('targeting honesty', () => {
     expect(result.ok).toBe(true)
     expect((result.data as { hit?: string }).hit).toBeUndefined()
     expect((result.data as { target?: string }).target).toBe('@e1')
+  })
+})
+
+/**
+ * The pre-dispatch actionability gates: the four facts the widened
+ * connectedness probe brings back, and what each verb does with them.
+ *
+ * The shape under test is "refuse only on a definite answer, annotate never
+ * refuse for visibility, and cost nothing extra to ask". Each refusal must
+ * also be honest about having sent nothing: no delivery probe armed, no
+ * Input.* call, `input: "none"`.
+ */
+describe('actionability gates', () => {
+  /** The widened probe's own calls, identified the way the code identifies
+   *  them: by the body, not by call order. */
+  const probeCalls = (mock: ReturnType<typeof installCdpMock>) =>
+    mock.mock.calls.filter(
+      (c) =>
+        c[1] === 'Runtime.callFunctionOn' &&
+        String((c[2] as { functionDeclaration?: string }).functionDeclaration).includes(
+          'checkVisibility',
+        ),
+    )
+
+  const armedDelivery = (mock: ReturnType<typeof installCdpMock>) =>
+    mock.mock.calls.some(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression).includes('addEventListener'),
+    )
+
+  const bodies = (mock: ReturnType<typeof installCdpMock>) =>
+    mock.mock.calls
+      .filter((c) => c[1] === 'Runtime.callFunctionOn')
+      .map((c) => String((c[2] as { functionDeclaration?: string }).functionDeclaration))
+
+  it('refuses a click on a disabled control, before anything is dispatched', async () => {
+    // A disabled control receives no events at all, so the pre-existing
+    // outcome was a delivery failure blaming input suppression on a page
+    // with nothing wrong with it.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ disabled: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/disabled/i)
+    const data = result.data as { refused?: string; input?: string; input_delivered?: string }
+    expect(data.refused).toBe('disabled')
+    expect(data.input).toBe('none')
+    expect(inputEventTypes(cdp), 'nothing may be dispatched at a disabled control').toHaveLength(0)
+    // The honesty half: delivery is never consulted for input that was
+    // never sent, so no probe is armed and no verdict is invented.
+    expect(armedDelivery(cdp)).toBe(false)
+    expect(data.input_delivered).toBeUndefined()
+  })
+
+  it('refuses check on a disabled checkbox without reaching the force path', async () => {
+    // check/uncheck read their own outcome back and FORCE the property when
+    // the click did not take. On a disabled control that force would set
+    // `checked` the page never saw changed and report success.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ disabled: true, value: 'false' })
+
+    const result = await execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect((result.data as { refused?: string }).refused).toBe('disabled')
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+    expect(
+      bodies(cdp).some((fn) => fn.includes('this.checked = want')),
+      'the force path must never run for a control the browser will not act on',
+    ).toBe(false)
+  })
+
+  it('refuses fill and ref-targeted type on a readonly field, sending no text', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const filled = installCdpMock({ readonly: true, textEntry: true })
+
+    const fill = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: 'hello' })
+
+    expect(fill.ok).toBe(false)
+    expect(String(fill.error)).toMatch(/read-only/i)
+    expect((fill.data as { refused?: string }).refused).toBe('readonly')
+    expect(
+      methodsOf(filled).filter((m) => m === 'Input.insertText'),
+      'insertText into a readonly field no-ops and then reads as a suppressed tab',
+    ).toHaveLength(0)
+
+    const typed = installCdpMock({ readonly: true, textEntry: true })
+    const type = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'hello' })
+
+    expect(type.ok).toBe(false)
+    expect((type.data as { refused?: string }).refused).toBe('readonly')
+    expect(methodsOf(typed).filter((m) => m === 'Input.dispatchKeyEvent')).toHaveLength(0)
+  })
+
+  it('fills a field whose own focus handler removes readonly, which is the common one', async () => {
+    // `<input readonly onfocus="this.readOnly = false">` is how sites
+    // suppress autofill and force a date picker. It accepts text once
+    // focused, so refusing on the probe's earlier answer would block an act
+    // that works end to end. The verdict is therefore re-asked after the
+    // focus each text verb already performs.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ readonly: true, textEntry: true, readonlyClearsOnFocus: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: 'hello' })
+
+    expect(result.ok).toBe(true)
+    expect(methodsOf(cdp)).toContain('Input.insertText')
+    // And the re-ask happened AFTER the focus, or it would have answered
+    // the same stale readonly the probe did.
+    const order = cdp.mock.calls.map((c) => {
+      if (c[1] !== 'Runtime.callFunctionOn') return String(c[1])
+      const fn = String((c[2] as { functionDeclaration?: string }).functionDeclaration)
+      // The widened probe carries this same question, so the re-ask is the
+      // one that asks it ALONE.
+      return fn.includes('this.readOnly === true') && !fn.includes('checkVisibility')
+        ? 'recheck'
+        : 'other'
+    })
+    expect(order.indexOf('recheck')).toBeGreaterThan(order.indexOf('DOM.focus'))
+  })
+
+  it('leaves a fill on a non-text-entry target exactly as it was', async () => {
+    // `readOnly` is true on a checkbox too, where it means nothing. The
+    // editable classification is what makes the refusal about text entry;
+    // without it this act would start refusing on a fact that does not
+    // apply to it.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ readonly: true, textEntry: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: 'hello' })
+
+    expect(result.ok).toBe(true)
+    expect(methodsOf(cdp)).toContain('Input.insertText')
+  })
+
+  it('leaves the verbs that enter no input alone on a disabled target', async () => {
+    // Regression pins. `hover` moves nothing into the page, and `upload`
+    // deliberately targets inputs the page has hidden or switched off: a
+    // blanket gate would break both.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const hovered = installCdpMock({ disabled: true })
+
+    const hover = await execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
+
+    expect(hover.ok).toBe(true)
+    expect(inputEventTypes(hovered)).toContain('mouseMoved')
+
+    installCdpMock({ disabled: true })
+    const upload = await execAct({
+      tab_id: TAB,
+      action: 'upload',
+      ref: '@e1',
+      file_name: 'a.txt',
+      file_base64: 'YQ==',
+    })
+
+    expect(upload.ok).toBe(true)
+    expect((upload.data as { input?: string }).input).toBe('synthetic')
+  })
+
+  it('clicks an invisible target that wins the hit test, and says it was invisible', async () => {
+    // R-07's opacity half. An opacity-0 element that is still the topmost
+    // hit is very often the deliberate click target (an invisible real
+    // input over styled UI), so the act proceeds TRUSTED and the payload
+    // carries the fact instead of the click being a silent success.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ visible: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { target_invisible?: boolean; input?: string }
+    expect(data.target_invisible).toBe(true)
+    expect(data.input).toBe('trusted')
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+  })
+
+  it('keeps the no-layout-box fallback synthetic, and still says the target was invisible', async () => {
+    // A `display:none` target has no box, so it takes the labelled
+    // synthetic path rather than a trusted click. Both facts are true at
+    // once and the payload must carry both: the annotation never implies
+    // the target won a hit test.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ geometry: null, visible: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { input?: string; synthetic_reason?: string; target_invisible?: boolean }
+    expect(data.input).toBe('synthetic')
+    expect(data.synthetic_reason).toMatch(/no layout box/)
+    expect(data.target_invisible).toBe(true)
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('carries no invisibility key on an ordinary visible target', async () => {
+    // Otherwise the annotation becomes furniture the agent learns to skim.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { target_invisible?: boolean }).target_invisible).toBeUndefined()
+  })
+
+  it('does not annotate invisibility on a verb that is not about clicking what is there', async () => {
+    // A fill into an invisible field is the everyday custom-widget shape,
+    // and its outcome is verified by the value, not by what the eye sees.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ visible: false, textEntry: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: 'x' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { target_invisible?: boolean }).target_invisible).toBeUndefined()
+  })
+
+  it('blames pointer-events, not the element behind, when the target ignores pointers', async () => {
+    // The misdiagnosis this fixes: elementFromPoint answers whatever is
+    // BEHIND a pointer-events:none target, and the old copy named that
+    // element as an intercepting overlay to dismiss.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({
+      hit: { hit: false, blocker: 'div#page-backdrop' },
+      pointerEventsNone: true,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toMatch(/pointer-events/i)
+    expect(error).not.toMatch(/covered by/i)
+    // And it must not send the agent off dismissing the element behind: the
+    // copy says what is true of THIS element, without claiming (which the
+    // probe cannot know) that nothing is in front of it either.
+    expect(error).toMatch(/not take the click/i)
+    expect((result.data as { refused?: string }).refused).toBe('pointer_events_none')
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('refuses when an ANCESTOR is what the click would hit, which the hit test calls a hit', async () => {
+    // The commonest pointer-events:none layout by far: the element is
+    // transparent to hit testing, so elementFromPoint answers the wrapper
+    // sitting in the same pixels, and containment accepts that as a hit.
+    // The event would target the wrapper, and events do not travel DOWN, so
+    // the target never sees it. Without this the refusal almost never fires.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({
+      hit: { hit: true, via: 'ancestor', blocker: 'section#plans' },
+      pointerEventsNone: true,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/pointer-events/i)
+    expect(String(result.error)).toContain('section#plans')
+    expect((result.data as { refused?: string }).refused).toBe('pointer_events_none')
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('still clicks when a DESCENDANT of the target is what the point lands on', async () => {
+    // The legitimate exception, and a real pattern: a pointer-events:none
+    // container whose own controls set pointer-events:auto. The click lands
+    // inside the target's own subtree, so it is not a miss.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({
+      hit: { hit: true, via: 'descendant' },
+      pointerEventsNone: true,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+  })
+
+  it('hands back the coordinate with the pointer-events refusal, because the label case works', async () => {
+    // The element the click WOULD hit is very often the target's own label
+    // or wrapper, where a deliberate click activates the target anyway
+    // (label activation behaviour). Refusing without the coordinate would
+    // delete the one exit that works.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      hit: { hit: true, via: 'ancestor', blocker: 'label#plan' },
+      pointerEventsNone: true,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as { intercepted_by?: string; click_point?: number[] }
+    expect(data.intercepted_by).toBe('label#plan')
+    expect(data.click_point).toEqual([50, 60])
+    expect(String(result.error)).toMatch(/coordinate=\[50, 60\]/)
+    expect(String(result.error)).toMatch(/label or wrapper/i)
+  })
+
+  it('does not refuse on a pointer-events state that cleared before the hit test', async () => {
+    // The probe runs several round trips before the hit test, and one cause
+    // this refusal NAMES is an element mid-transition, which is exactly the
+    // state most likely to have cleared in between. Refusing on the stale
+    // read would be this pass's own misdiagnosis inverted.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({
+      hit: { hit: true, via: 'ancestor', blocker: 'div#fade' },
+      pointerEventsNone: true,
+      pointerEventsClearsBeforeRefusal: true,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+  })
+
+  it('says an ancestor WRAPS the target rather than covering it, when focus misses', async () => {
+    // The click-through copy is written for an element ON TOP of the
+    // target. With a pointer-events:none target the element that took the
+    // click is around it, and "was over it" would be a false claim.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      hit: { hit: true, via: 'ancestor', blocker: 'div#editor' },
+      pointerEventsNone: true,
+      textEntry: true,
+      focusLanded: false,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/div#editor wraps it/)
+    expect(String(result.error)).not.toMatch(/was over it/)
+  })
+
+  it('keeps the covered-by refusal when the target does receive pointer events', async () => {
+    // The other half of the same fork: a real overlay must still be named,
+    // with the click-through the #174 copy teaches.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ hit: { hit: false, blocker: 'div#page-backdrop' } })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/covered by div#page-backdrop/)
+    expect(String(result.error)).not.toMatch(/pointer-events/i)
+  })
+
+  it('names pointer-events for check/uncheck too', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({
+      hit: { hit: false, blocker: 'span.switch' },
+      pointerEventsNone: true,
+      value: 'false',
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toMatch(/pointer-events/i)
+    expect((result.data as { refused?: string }).refused).toBe('pointer_events_none')
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('still clicks a covered TEXT-ENTRY target through, pointer-events or not (#174)', async () => {
+    // The editor case the covered-click exception exists for: the render
+    // surface is a sibling, the real input is what the ref names, and the
+    // click is delivered and verified by focus. The pointer-events copy
+    // must sit behind that exception, not in front of it.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({
+      hit: { hit: false, blocker: 'pre.CodeMirror-line' },
+      pointerEventsNone: true,
+      textEntry: true,
+      focusLanded: true,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { clicked_through?: string }).clicked_through).toBe(
+      'pre.CodeMirror-line',
+    )
+    expect(inputEventTypes(cdp)).toContain('mousePressed')
+    // And the classification came from the widened probe, not from a second
+    // call running the same function body on the same handle.
+    const standaloneClassify = bodies(cdp).filter(
+      (fn) => fn.includes('isContentEditable') && !fn.includes('checkVisibility'),
+    )
+    expect(standaloneClassify).toHaveLength(0)
+  })
+
+  it('proceeds when the probe answers nothing it can use (fail open)', async () => {
+    // The gate contract: refuse on an explicit answer only. A probe that
+    // returned a partial object, or something that is not an object at all,
+    // must never turn into a refusal.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ actionabilityRaw: { connected: true } })
+
+    const partial = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(partial.ok).toBe(true)
+    expect((partial.data as { target_invisible?: boolean }).target_invisible).toBeUndefined()
+
+    installCdpMock({ actionabilityRaw: 'not an object' })
+    const malformed = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: 'x' })
+
+    expect(malformed.ok).toBe(true)
+  })
+
+  it('acts anyway when the probe itself fails, but not when the SESSION did', async () => {
+    // Same split every other pre-dispatch gate makes: a probe that could
+    // not run must not block the act (the delivery verification backstops
+    // it), while a timed-out or unusable tab is about the TAB and keeps its
+    // own honest copy rather than being swallowed into "unknown, carry on".
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ actionabilityThrows: 'Cannot find context with specified id' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+
+    installCdpMock({ connectedThrows: 'timeout' })
+    await expect(execAct({ tab_id: TAB, action: 'click', ref: '@e1' })).rejects.toThrow(
+      /did not answer/i,
+    )
+  })
+
+  it('lets the fingerprint gate answer first when the element also changed meaning', async () => {
+    // Precedence, and it matters: an element whose MEANING changed sends
+    // the agent to re-read, where "it is disabled" would be advice about
+    // the wrong element entirely.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ disabled: true, axName: 'Delete' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    const data = result.data as { stale_refs?: boolean; reason?: string; refused?: string }
+    expect(data.stale_refs).toBe(true)
+    expect(data.reason).toBe('changed')
+    expect(data.refused).toBeUndefined()
+  })
+
+  it('refuses select on a disabled control, where the old path faked a success', async () => {
+    // select is a pure in-page property set, so it SUCCEEDED on a disabled
+    // <select> and always did: an option no person could have chosen, on a
+    // control the form will not submit.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ disabled: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'select', ref: '@e1', value: 'Two' })
+
+    expect(result.ok).toBe(false)
+    expect((result.data as { refused?: string }).refused).toBe('disabled')
+    expect(
+      bodies(cdp).some((fn) => fn.includes('this.options')),
+      'the value must not be set on a control the user cannot use',
+    ).toBe(false)
+  })
+
+  it('leaves css= targets alone: they are not probed, so they behave as before', async () => {
+    // The probe rides the connectedness call, which only `@` refs make. A
+    // css= target would need a NEW round trip, so it keeps its previous
+    // behaviour rather than paying for one, and nothing may quietly start
+    // refusing it on a fact nobody asked for.
+    const cdp = installCdpMock({ disabled: true, readonly: true, textEntry: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=.btn' })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+    expect(probeCalls(cdp), 'no widened probe is spent on a css= target').toHaveLength(0)
+  })
+
+  it('asks all of it in ONE round trip, which is why the checks are affordable', async () => {
+    // The ratchet (five naive checks would have been five more callOns on
+    // the commonest verb). One call, and it is the SAME call that answers
+    // connectedness: the probe body must still carry that question.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const probes = probeCalls(cdp)
+    expect(probes).toHaveLength(1)
+    const body = String((probes[0][2] as { functionDeclaration?: string }).functionDeclaration)
+    expect(body, 'connectedness rides the same call, it is not a second one').toContain(
+      'isConnected',
+    )
+    // And no separate pre-dispatch connectedness call survives beside it:
+    // the only other isConnected body is the POST-action `stillConnected`.
+    const connectednessCalls = bodies(cdp).filter((fn) => fn.includes('isConnected'))
+    expect(connectednessCalls).toHaveLength(2)
   })
 })
 

@@ -2,6 +2,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   acquire,
   activeTabs,
+  installCdpEventRouter,
   installDetachHandler,
   isAttached,
   onSessionEnd,
@@ -307,5 +308,62 @@ describe('capture domains at attach (#169)', () => {
     ).toBeGreaterThan(methods.indexOf('Page.enable'))
     const arm = send.mock.calls.find((c) => c[1] === 'Page.setInterceptFileChooserDialog')
     expect(arm?.[2]).toEqual({ enabled: true })
+  })
+
+  it('bounds what Network.enable makes the browser hold, and only for Network (C-09)', async () => {
+    // The attach lives in the USER'S Chrome for the whole burst plus its
+    // linger, on tabs they are also using: unbounded response-body
+    // buffering there grows their browser's memory for a diagnostic
+    // nobody asked for. The other domains take no params, and passing
+    // Network's to them would be a protocol error.
+    const send = vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({}))
+    ;(chrome.debugger.sendCommand as unknown) = send
+
+    await acquire(7)
+    await vi.advanceTimersByTimeAsync(0)
+
+    const network = send.mock.calls.find((c) => c[1] === 'Network.enable')
+    expect(network?.[2]).toEqual({
+      maxTotalBufferSize: 10_000_000,
+      maxResourceBufferSize: 5_000_000,
+    })
+    for (const domain of ['Runtime.enable', 'Page.enable', 'Log.enable']) {
+      expect(send.mock.calls.find((c) => c[1] === domain)?.[2], `${domain} takes no params`).toEqual(
+        {},
+      )
+    }
+  })
+
+  it('bounds the same buffers on an auto-attached FRAME session', async () => {
+    // A cross-origin frame is its own target with its own Network domain,
+    // so a capped root and an uncapped frame would leave the hole open on
+    // exactly the documents most likely to stream (embedded players, ad
+    // frames).
+    const send = vi.fn<(...args: unknown[]) => Promise<unknown>>(async () => ({}))
+    ;(chrome.debugger.sendCommand as unknown) = send
+    installCdpEventRouter()
+    const addListener = chrome.debugger.onEvent.addListener as unknown as ReturnType<typeof vi.fn>
+    const emit = addListener.mock.calls.at(-1)?.[0] as (
+      source: { tabId: number },
+      method: string,
+      params: unknown,
+    ) => void
+
+    await acquire(7)
+    emit({ tabId: 7 }, 'Target.attachedToTarget', {
+      sessionId: 'FRAME-SESSION-1',
+      targetInfo: { targetId: 'FRAME-1', type: 'iframe', url: 'https://pay.example/card' },
+    })
+    await vi.advanceTimersByTimeAsync(0)
+
+    const frameEnable = send.mock.calls.find(
+      (c) =>
+        c[1] === 'Network.enable' &&
+        (c[0] as { sessionId?: string }).sessionId === 'FRAME-SESSION-1',
+    )
+    expect(frameEnable?.[2]).toEqual({
+      maxTotalBufferSize: 10_000_000,
+      maxResourceBufferSize: 5_000_000,
+    })
   })
 })

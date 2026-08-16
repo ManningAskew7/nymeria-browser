@@ -35,13 +35,10 @@ function cdpEmitter(): CdpListener {
 interface MockOpts {
   /** Rect the element reports inside its own frame. */
   frameLocalRect?: { x: number; y: number; w: number; h: number }
-  /** Rect the <iframe> element reports in the main document. */
-  iframeRect?: { left: number; top: number }
 }
 
 function installCdpMock(opts: MockOpts = {}) {
   const local = opts.frameLocalRect ?? { x: 30, y: 40, w: 100, h: 20 }
-  const iframeRect = opts.iframeRect ?? { left: 200, top: 300 }
 
   const sendCommandMock = vi.fn(
     async (target: unknown, method: string, params: Record<string, unknown> = {}) => {
@@ -58,9 +55,14 @@ function installCdpMock(opts: MockOpts = {}) {
       }
       if (method === 'Runtime.callFunctionOn') {
         const fn = String(params.functionDeclaration ?? '')
-        if (fn.includes('getComputedStyle')) {
-          // The iframe element's own position in the main document.
-          return { result: { value: { x: iframeRect.left, y: iframeRect.top } } }
+        // The widened pre-dispatch probe. Matched FIRST and on
+        // `checkVisibility` (unique to it): its body also reads
+        // `isConnected` and composes TEXT_ENTRY_FN, so the branches below
+        // would swallow it. An in-frame target here is an ordinary live,
+        // visible, enabled control, which is what every test in this file
+        // is about.
+        if (fn.includes('checkVisibility')) {
+          return { result: { value: { connected: true, textEntry: false, visible: true } } }
         }
         if (fn.includes('getBoundingClientRect')) {
           return { result: { value: local } }
@@ -185,10 +187,7 @@ describe('frame input dispatch', () => {
     // (2026-08-15) never to reach OOPIF content: acked ok, nothing arrived.
     // The frame's own session is the delivery channel, and the coordinates
     // stay in the frame's viewport space end to end, so no offset exists.
-    const cdp = installCdpMock({
-      frameLocalRect: { x: 30, y: 40, w: 100, h: 20 },
-      iframeRect: { left: 200, top: 300 },
-    })
+    const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
     await attachFrame()
     setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
@@ -197,8 +196,8 @@ describe('frame input dispatch', () => {
     const pressed = cdp.mock.calls.find(
       (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
     )
-    // The frame-local point, verbatim. The iframe's own position on the
-    // page (200, 300) must appear NOWHERE in the dispatch.
+    // The frame-local point, verbatim: nothing composes the iframe's own
+    // position on the page into it, and nothing reads that position at all.
     expect(pressed?.[2]).toMatchObject({ x: 30, y: 40 })
     expect(pressed?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
     // No offset is measured at all: the owner lookup was the old shape.

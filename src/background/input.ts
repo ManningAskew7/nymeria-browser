@@ -322,7 +322,16 @@ export async function sameProcessDispatchPoint(
 
 export interface HitTest {
   hit: boolean
+  /** What the click would land on instead of the target. Set on a miss, and
+   *  on an ANCESTOR hit, where it names the ancestor: a caller that treats a
+   *  hit as success simply ignores it, and the one caller that cares (a
+   *  target which ignores pointer events) needs to name the thing the event
+   *  would actually target. */
   blocker?: string
+  /** WHICH containment accepted the hit. `ancestor` is the loose one: a
+   *  wrapper at the point is normally the same thing as the target for
+   *  click purposes, but not when the target cannot receive the click. */
+  via?: 'self' | 'descendant' | 'ancestor'
 }
 
 /** In-page body of `hitTest`, exported so its containment logic is testable
@@ -330,12 +339,15 @@ export interface HitTest {
 export const HIT_TEST_FN = `function(x, y){
   const top = document.elementFromPoint(x, y);
   if (!top) return { hit: false, blocker: 'nothing at point (offscreen?)' };
-  if (top === this || this.contains(top) || top.contains(this)) return { hit: true };
   const id = top.id ? '#' + top.id : '';
   const cls = typeof top.className === 'string' && top.className
     ? '.' + top.className.trim().split(/\\s+/).slice(0, 2).join('.')
     : '';
-  return { hit: false, blocker: top.tagName.toLowerCase() + id + cls };
+  const name = top.tagName.toLowerCase() + id + cls;
+  if (top === this) return { hit: true, via: 'self' };
+  if (this.contains(top)) return { hit: true, via: 'descendant' };
+  if (top.contains(this)) return { hit: true, via: 'ancestor', blocker: name };
+  return { hit: false, blocker: name };
 }`
 
 /**
@@ -360,7 +372,10 @@ export async function hitTest(target: Cdp, objectId: string, point: Point): Prom
  *  mint a ref to: tag semantics or an explicit role attribute (a div only
  *  computes to an AX textbox via role=), plus contenteditable, which covers
  *  CodeMirror 6. Only CodeMirror 5 still uses the hidden-textarea pattern;
- *  Monaco's EditContext div rides the role branch. */
+ *  Monaco's EditContext div rides the role branch. The `=== true` on
+ *  `isContentEditable` is the worlds.ts named-property rule, not style: a
+ *  `<form>` holding a control NAMED `isContentEditable` answers that
+ *  element here, which is truthy. */
 export const TEXT_ENTRY_FN = `function(){
   const tag = (this.tagName || '').toLowerCase();
   if (tag === 'textarea') return true;
@@ -369,7 +384,7 @@ export const TEXT_ENTRY_FN = `function(){
     const t = (this.type || 'text').toLowerCase();
     return ['button','submit','reset','checkbox','radio','image','file','range','color'].indexOf(t) === -1;
   }
-  if (this.isContentEditable) return true;
+  if (this.isContentEditable === true) return true;
   const role = ((this.getAttribute && this.getAttribute('role')) || '').toLowerCase();
   return ['textbox','searchbox','combobox'].indexOf(role) !== -1;
 }`
@@ -378,6 +393,78 @@ export const TEXT_ENTRY_FN = `function(){
  *  delivered and verified rather than refused)? */
 export async function textEntryTarget(target: Cdp, objectId: string): Promise<boolean> {
   return callOn<boolean>(target, objectId, TEXT_ENTRY_FN)
+}
+
+/**
+ * What the act layer needs to know about a target BEFORE it dispatches, all
+ * from the one `callFunctionOn` the connectedness check already spends.
+ *
+ * Every field is OPTIONAL and unknown means unknown: a field the probe could
+ * not compute is absent, and callers refuse only on an explicit answer (the
+ * fail-open half of the gate contract). Booleans only, nothing page-derived,
+ * because these ride out to a backend note that renders outside the
+ * untrusted fence.
+ */
+export interface Actionability {
+  /** `isConnected`: the node is still in a document. */
+  connected?: boolean
+  /** Matches `:disabled`, so the browser will not act on it at all. */
+  disabled?: boolean
+  /** `readOnly` on an input/textarea: text goes in nowhere. */
+  readonly?: boolean
+  /** TEXT_ENTRY_FN's verdict, which is what makes `readonly` meaningful. */
+  textEntry?: boolean
+  /** `checkVisibility({checkOpacity, checkVisibilityCSS})`: visible to the eye. */
+  visible?: boolean
+  /** The element's computed `pointer-events` is `none`. */
+  pointerEventsNone?: boolean
+}
+
+/**
+ * In-page body of `actionabilityBeforeActing`, exported so its per-field
+ * logic runs as executed code in the tests rather than sitting unexercised
+ * in a string (the HIT_TEST_FN precedent).
+ *
+ * Six facts, one call. Each is wrapped in its own try so an element whose
+ * one getter throws still answers the rest, and each is written ONLY on a
+ * definite answer, so an absent field always means "not known" and can
+ * never be read as a refusal.
+ *
+ * Probe-body discipline (worlds.ts): prototype-backed access only, and every
+ * comparison is `=== true` rather than truthiness, which is also what makes
+ * named-property shadowing harmless (`<form>` with a control named
+ * `readOnly` answers an ELEMENT here, never `true`).
+ *
+ * `:disabled` rather than `this.disabled`: the pseudo-class is the browser's
+ * own computation, so it covers a control disabled by an ancestor
+ * `<fieldset disabled>`, which the IDL attribute does not. `aria-disabled`
+ * is deliberately NOT consulted: it is page-declared markup that plenty of
+ * live widgets carry while still handling clicks, and refusing on it would
+ * be a false refusal, where `:disabled` names a control the browser itself
+ * will not deliver events to.
+ */
+export const ACTIONABILITY_FN = `function(){
+  const out = { connected: this.isConnected === true };
+  try { if (this.matches(':disabled') === true) out.disabled = true; } catch (e) {}
+  try { if (this.readOnly === true) out.readonly = true; } catch (e) {}
+  try { out.textEntry = (${TEXT_ENTRY_FN}).call(this) === true; } catch (e) {}
+  try {
+    if (typeof this.checkVisibility === 'function') {
+      out.visible = this.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) === true;
+    }
+  } catch (e) {}
+  try {
+    const cs = getComputedStyle(this);
+    if (cs && cs.pointerEvents === 'none') out.pointerEventsNone = true;
+  } catch (e) {}
+  return out;
+}`
+
+/** Ask the widened pre-dispatch probe. Raw: the caller owns the error policy
+ *  (act.ts rethrows session-layer failures and treats everything else as
+ *  "not known"). */
+export async function actionabilityOf(target: Cdp, objectId: string): Promise<Actionability> {
+  return callOn<Actionability>(target, objectId, ACTIONABILITY_FN)
 }
 
 /** In-page body of `focusLandedIn`: did focus end up on, inside, or wrapping

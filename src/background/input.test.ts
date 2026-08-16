@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import {
+  ACTIONABILITY_FN,
   dispatchKey,
   FOCUS_LANDED_FN,
   HIT_TEST_FN,
@@ -419,18 +420,23 @@ describe('hitTest containment (executed in-page fn)', () => {
     document.body.innerHTML = ''
   })
 
-  it('accepts the target itself, a descendant, and an ancestor', () => {
+  it('accepts the target itself, a descendant, and an ancestor, saying which', () => {
+    // WHICH containment accepted it is not decoration: an ancestor hit is
+    // the loose one, and a caller whose target cannot receive the click
+    // (pointer-events: none) has to tell it from a real one.
     document.body.innerHTML = '<div id="wrap"><button id="btn"><span id="icon"></span></button></div>'
     const wrap = document.getElementById('wrap') as Element
     const btn = document.getElementById('btn') as Element
     const icon = document.getElementById('icon') as Element
 
     domWithTopmost(btn)
-    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true })
+    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true, via: 'self' })
     domWithTopmost(icon)
-    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true })
+    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true, via: 'descendant' })
     domWithTopmost(wrap)
-    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true })
+    // The ancestor case also names it: that element is what a click would
+    // actually target when the containment is the only reason this passed.
+    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true, via: 'ancestor', blocker: 'div#wrap' })
   })
 
   it('names a sibling blocker by tag, id, and first two classes', () => {
@@ -519,6 +525,89 @@ describe('focus landed (executed in-page fn)', () => {
 
     other.focus()
     expect(focusLanded.call(cm)).toBe(false)
+  })
+})
+
+describe('actionability probe (executed in-page fn)', () => {
+  const actionability = pageFn<Record<string, unknown>>(ACTIONABILITY_FN)
+
+  function el(html: string): Element {
+    document.body.innerHTML = html
+    return document.body.firstElementChild as Element
+  }
+
+  it('answers connected, and reports a removed node as disconnected', () => {
+    const node = el('<button id="b">Pay</button>')
+    expect(actionability.call(node).connected).toBe(true)
+
+    node.remove()
+    expect(actionability.call(node).connected).toBe(false)
+  })
+
+  it('names a disabled control, and leaves the field ABSENT on an enabled one', () => {
+    // Absent, not `false`: every caller refuses on an explicit `true` only,
+    // so a fact the probe cannot compute must be indistinguishable from a
+    // fact it computed as no.
+    expect(actionability.call(el('<button disabled>Pay</button>')).disabled).toBe(true)
+    expect('disabled' in actionability.call(el('<button>Pay</button>'))).toBe(false)
+  })
+
+  it('names a readonly text field alongside the text-entry verdict that qualifies it', () => {
+    const readonlyInput = actionability.call(el('<input type="text" readonly>'))
+    expect(readonlyInput.readonly).toBe(true)
+    expect(readonlyInput.textEntry, 'the readonly refusal is gated on this').toBe(true)
+
+    // `readOnly` is true here too, and means nothing on a checkbox: the
+    // text-entry verdict is what keeps it from refusing a legitimate act.
+    const readonlyCheckbox = actionability.call(el('<input type="checkbox" readonly>'))
+    expect(readonlyCheckbox.readonly).toBe(true)
+    expect(readonlyCheckbox.textEntry).toBe(false)
+
+    expect('readonly' in actionability.call(el('<input type="text">'))).toBe(false)
+  })
+
+  it('reports opacity-0 as not visible while a plain element is visible', () => {
+    // R-07's actual case: transparent, still hit-testable, still the thing
+    // the click lands on.
+    expect(actionability.call(el('<button style="opacity:0">Pay</button>')).visible).toBe(false)
+    expect(actionability.call(el('<button>Pay</button>')).visible).toBe(true)
+  })
+
+  it('names pointer-events:none, and leaves the field ABSENT otherwise', () => {
+    expect(
+      actionability.call(el('<button style="pointer-events:none">Pay</button>')).pointerEventsNone,
+    ).toBe(true)
+    expect('pointerEventsNone' in actionability.call(el('<button>Pay</button>'))).toBe(false)
+  })
+
+  it('answers the other facts when one of them throws', () => {
+    // Per-fact try/catch, not one around the lot: an element whose
+    // checkVisibility is hostile or missing must not cost the disabled
+    // answer that refuses a dead click.
+    const node = el('<button disabled>Pay</button>')
+    Object.defineProperty(node, 'checkVisibility', {
+      configurable: true,
+      value: () => {
+        throw new Error('no')
+      },
+    })
+
+    const out = actionability.call(node)
+    expect(out.disabled).toBe(true)
+    expect(out.connected).toBe(true)
+    expect('visible' in out, 'the throwing fact is simply absent').toBe(false)
+  })
+
+  it('cannot be tricked by a named form control shadowing a property', () => {
+    // Probe-body discipline (worlds.ts): named DOM properties follow you
+    // across isolated worlds, so `form.readOnly` can resolve to a CONTROL
+    // named "readOnly". Every comparison here is `=== true`, which is what
+    // makes that harmless.
+    const form = el('<form><input name="readOnly"><input name="disabled"></form>')
+    const out = actionability.call(form)
+    expect('readonly' in out).toBe(false)
+    expect('disabled' in out).toBe(false)
+    expect(out.connected).toBe(true)
   })
 })
 

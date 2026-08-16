@@ -55,6 +55,35 @@ const CAPTURE_DOMAINS = ['Runtime', 'Network', 'Page', 'Log'] as const
 const FRAME_CAPTURE_DOMAINS = ['Runtime', 'Network', 'Log'] as const
 
 /**
+ * Bounds on what `Network.enable` makes Chrome HOLD for us (C-09).
+ *
+ * Enabling the domain asks the browser to keep response bodies around so
+ * `Network.getResponseBody` can answer later, and the default budget is
+ * generous. This attach lives in the USER'S OWN Chrome for the whole burst
+ * plus its detach linger, on tabs they are also using, so a video stream or
+ * a big download would otherwise let our capture grow the browser's memory
+ * for a diagnostic nobody asked for.
+ *
+ * Who actually reads those bodies matters for the numbers: nothing in this
+ * extension calls `Network.getResponseBody` (the buffers we do use are our
+ * own console/network event buffers, which hold metadata), so the only
+ * consumer is a hand-written `chrome_cdp` call. 10MB total / 5MB per
+ * resource keeps every ordinary document, script and XHR body readable
+ * there while bounding the pathological case; a body evicted early fails
+ * exactly as a never-buffered one does ("body unavailable"), and nothing
+ * else about capture changes.
+ */
+const NETWORK_BUFFER_CAPS = {
+  maxTotalBufferSize: 10_000_000,
+  maxResourceBufferSize: 5_000_000,
+} as const
+
+/** Params for one capture-domain enable: only Network takes any. */
+function enableParams(domain: string): Record<string, unknown> {
+  return domain === 'Network' ? { ...NETWORK_BUFFER_CAPS } : {}
+}
+
+/**
  * A CDP addressee: a tab (the root page session) or one flattened frame
  * session inside it.
  *
@@ -471,7 +500,7 @@ export function installFrameTracking(): void {
         void boundedCdpCall(
           { tabId, sessionId: p.sessionId },
           `${domain}.enable`,
-          {},
+          enableParams(domain),
           CDP_CALL_DEADLINE_MS,
         ).catch((e: unknown) =>
           logger.warn(`${domain}.enable failed for frame session tab=${tabId}:`, e),
@@ -718,7 +747,7 @@ async function doAttach(tabId: number, s: Session): Promise<void> {
     // wedged tab's never-settling enables cannot hold the service worker
     // toward its 5-minute kill.
     for (const domain of CAPTURE_DOMAINS) {
-      void boundedCdpCall(tabId, `${domain}.enable`, {}, CDP_CALL_DEADLINE_MS)
+      void boundedCdpCall(tabId, `${domain}.enable`, enableParams(domain), CDP_CALL_DEADLINE_MS)
         .then(() => {
           sessions.get(tabId)?.domains.add(domain)
         })

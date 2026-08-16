@@ -22,6 +22,7 @@ import {
 } from '../budget'
 import {
   ackWithinDeadline,
+  actionabilityOf,
   callOn,
   dispatchKey,
   elementGeometry,
@@ -42,6 +43,7 @@ import {
   trustedHover,
   trustedWheel,
   typeText,
+  type Actionability,
   type HitTest,
   type Point,
 } from '../input'
@@ -267,6 +269,74 @@ const FINGERPRINT_VERBS: ReadonlySet<ActionName> = new Set<ActionName>([
 ])
 
 /**
+ * Verbs refused outright on a `:disabled` target.
+ *
+ * A disabled control never acts: the browser delivers it no events at all,
+ * so today's outcome is either a delivery failure blaming input suppression
+ * or, on the paths that read their own outcome back, a silent no-op. Both
+ * are the WRONG diagnosis for a fact the probe already knows. Membership is
+ * "would have entered input or activated the control": `hover` and
+ * `scroll_to` move nothing into the page, `upload` deliberately targets
+ * inputs the page has hidden (and an AX-hidden file input is not
+ * `:disabled` anyway), `key` keeps its focus-then-dispatch shape, and
+ * `drag` has no delivery verdict to misdiagnose.
+ *
+ * `select` is in for a different reason than the rest, and deliberately: it
+ * is a pure in-page property set, so it SUCCEEDS on a disabled `<select>`
+ * and always did. That success is the fake one: the control the user sees
+ * is inert, no person could have chosen that option, and the form will not
+ * submit the value. `upload` is the deliberate counter-example (its whole
+ * job is reaching controls a person cannot), which is why it stays out.
+ */
+const DISABLED_REFUSES: ReadonlySet<ActionName> = new Set<ActionName>([
+  'click',
+  'double_click',
+  'right_click',
+  'check',
+  'uncheck',
+  'fill',
+  'type',
+  'select',
+])
+
+/**
+ * Verbs refused on a `readonly` TEXT-ENTRY target. `Input.insertText` into
+ * one silently no-ops, the delivery probe then counts zero `input` events,
+ * and the act fails blaming input suppression on a tab with nothing wrong
+ * with it. Gated on the probe's TEXT_ENTRY_FN answer, so the `readOnly`
+ * attribute on a control where it does nothing (a checkbox) refuses
+ * nothing.
+ */
+const READONLY_REFUSES: ReadonlySet<ActionName> = new Set<ActionName>(['fill', 'type'])
+
+/**
+ * Verbs whose payload gets `target_invisible` when the target fails
+ * `checkVisibility` (R-07's opacity half).
+ *
+ * ANNOTATION, never refusal, and the asymmetry is the point: an opacity-0
+ * element that still wins the hit test is very often a deliberate click
+ * target (the invisible real input over styled UI that the custom
+ * file-picker and custom-checkbox patterns both use, which is why
+ * Playwright treats opacity-0 as visible). So the act proceeds and the
+ * payload says what was true of what it acted on, which is exactly the
+ * silent case R-07 filed.
+ *
+ * The flag is set BEFORE the switch, so it rides the other invisible
+ * shapes too, and deliberately: a `display:none` target has no layout box
+ * and takes the labelled synthetic path, a `visibility:hidden` one has a
+ * box but is not hit-testable (the point resolves to an ancestor). Both are
+ * cases where "invisible" is worth saying, so nothing downstream may claim
+ * this flag means the target won a hit test.
+ */
+const INVISIBLE_ANNOTATES: ReadonlySet<ActionName> = new Set<ActionName>([
+  'click',
+  'double_click',
+  'right_click',
+  'check',
+  'uncheck',
+])
+
+/**
  * What to tell an agent whose input vanished.
  *
  * It cannot see browser UI: a native dialog is invisible to the accessibility
@@ -275,8 +345,11 @@ const FINGERPRINT_VERBS: ReadonlySet<ActionName> = new Set<ActionName>([
  * being told the recovery it retries the same dead tab indefinitely.
  *
  * The wording hedges on the cause deliberately. Suppression is the likeliest
- * explanation but a disabled control produces the same reading, and asserting a
- * dialog that is not there would send the agent hunting for nothing.
+ * explanation but a swallowed event produces the same reading, and asserting a
+ * dialog that is not there would send the agent hunting for nothing. The
+ * hedge no longer names "disabled" first: a `@` ref on a disabled control is
+ * refused before dispatch now, so the residue this copy still covers is
+ * coordinates, `css=`/`xpath=` targets and the unprobed verbs.
  */
 function undeliveredError(action: ActionName): string {
   return (
@@ -288,8 +361,9 @@ function undeliveredError(action: ActionName): string {
     'which clears it when a browser dialog is the cause, and if input is still not ' +
     'delivered after that, close the tab and redo the work in a fresh one, which ' +
     'always clears it. Reloading does not help, and never dismiss browser security ' +
-    'UI yourself. If the page is fine, the target may instead be disabled or ' +
-    'swallowing the event.'
+    'UI yourself. If the page is fine, the target may instead be swallowing the ' +
+    'event, or be a control that cannot take one (which a @ref act checks and ' +
+    'refuses up front, but a coordinate or css= target does not).'
   )
 }
 
@@ -727,11 +801,16 @@ function clickedThroughButFocusMissedError(
   action: ActionName,
   target: string | null,
   blocker: string | undefined,
+  /** The element that took the click WRAPS the target rather than covering
+   *  it (the target ignores pointer events, so the point resolved to its
+   *  ancestor). Saying "was over it" there would be a false claim. */
+  wrapping = false,
 ): string {
+  const relation = wrapping ? 'wraps it' : 'was over it'
   return (
     `the ${action} was delivered at ${target ?? 'the target'}'s point, but ` +
-    `${blocker ?? 'a covering element'} was over it and focus did not land ` +
-    'in the target, so the covering element likely received the click. ' +
+    `${blocker ?? 'a covering element'} ${relation} and focus did not land ` +
+    'in the target, so that element likely received the click. ' +
     'Re-read the page to see what changed before retrying or typing.'
   )
 }
@@ -914,6 +993,168 @@ function refChangedError(
     'clicked. Re-read the page and use the ref for what you now mean to act on. ' +
     '(Purely numeric ticks are tolerated; if this label legitimately rewords itself ' +
     'continuously, target the element with css= instead of a ref.)'
+  )
+}
+
+/**
+ * A target the browser will not act on at all. Refused BEFORE dispatch, so
+ * "nothing was sent" is literally true, and named, because every downstream
+ * signal for this case is a misdiagnosis: the delivery probe counts zero
+ * events and blames input suppression, and the check/uncheck force path
+ * would "succeed" by setting a property the page never saw changed.
+ */
+function disabledTargetError(action: ActionName, target: string | null): string {
+  return (
+    `${target ?? 'that element'} is DISABLED, so the ${action} was NOT sent. A ` +
+    'disabled control receives no events at all, so dispatching into it would ' +
+    'report either a silent success or an input-suppression failure on a page ' +
+    'with nothing wrong with it. Something usually has to enable it first (a ' +
+    'required field filled, a consent box ticked, an earlier step finished), so ' +
+    'do that and re-read the page; if nothing does, this control is genuinely ' +
+    'not available and the way forward is elsewhere.'
+  )
+}
+
+/**
+ * A text field that cannot receive text. Same shape as the disabled refusal
+ * and for the same reason: `Input.insertText` into a readonly field is
+ * accepted, changes nothing, and produces no `input` event, which reads
+ * downstream as a suppressed tab.
+ */
+function readonlyTargetError(action: ActionName, target: string | null): string {
+  return (
+    `${target ?? 'that field'} is READ-ONLY, so the ${action} was NOT sent. Text ` +
+    'cannot be entered into it, and sending it anyway would come back as ' +
+    'undelivered input on a healthy page. A read-only field is normally filled by ' +
+    'the page itself (a date picker, a computed total, a value chosen by another ' +
+    'control), so use the control that sets it, or whatever unlocks it for editing.'
+  )
+}
+
+/**
+ * Is this text field STILL read-only now that it has focus?
+ *
+ * The pre-dispatch probe's `readonly` is a trigger, not a verdict, because
+ * of one very common pattern: `<input readonly onfocus="this.readOnly =
+ * false">`, used to suppress autofill and to force a date picker. The field
+ * genuinely accepts text once focused, and refusing on the probe's earlier
+ * answer would block an act that used to work end to end.
+ *
+ * So the question is re-asked on the same handle after the verb's own
+ * `focusElement`, and ONLY when the probe already said readonly, which
+ * keeps the extra round trip on the path that is about to refuse. Anything
+ * other than an explicit `true` proceeds (an unanswerable probe must not
+ * block the act), and session-layer failures rethrow as everywhere.
+ */
+async function readonlyAfterFocus(
+  actionability: Actionability | null,
+  action: ActionName,
+  session: Cdp,
+  objectId: string,
+): Promise<boolean> {
+  if (!READONLY_REFUSES.has(action)) return false
+  if (actionability?.readonly !== true || actionability.textEntry !== true) return false
+  try {
+    return (
+      (await callOn<boolean>(session, objectId, 'function(){ return this.readOnly === true; }')) ===
+      true
+    )
+  } catch (e) {
+    if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
+    return false
+  }
+}
+
+/**
+ * Is the target STILL ignoring pointer events, now that we are about to
+ * refuse on it?
+ *
+ * Same shape and the same reason as `readonlyAfterFocus`: the probe ran
+ * before `scrollIntoView`, the geometry read and the hit test, and one of
+ * the causes this refusal NAMES is an element mid-transition, which is
+ * exactly the state most likely to have cleared inside that window.
+ * Refusing on a stale read would be this pass's own misdiagnosis inverted.
+ * Only asked on the refusal path, so a healthy act pays nothing; an
+ * unanswerable re-ask leaves the original evidence standing (the probe did
+ * say `none`, and this is already a failing path).
+ */
+async function stillPointerEventsNone(session: Cdp, objectId: string): Promise<boolean> {
+  try {
+    const value = await callOn<boolean>(
+      session,
+      objectId,
+      `function(){
+        try { return getComputedStyle(this).pointerEvents === 'none'; } catch (e) { return true; }
+      }`,
+    )
+    return value !== false
+  } catch (e) {
+    if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
+    return true
+  }
+}
+
+/**
+ * Would this click miss the target because the target ignores pointer
+ * events, even though the hit test called it a hit?
+ *
+ * The hit test accepts an ANCESTOR at the point (`via: 'ancestor'`), and
+ * normally it is right to: a wrapper occupying the same pixels is the same
+ * thing as far as a click is concerned, because the event that targets the
+ * wrapper is the one the target would have bubbled up to it anyway. That
+ * reasoning inverts for a `pointer-events: none` target: the ancestor is
+ * what `elementFromPoint` answers precisely BECAUSE the target is
+ * transparent to hit testing, the event targets the ancestor, and events do
+ * not travel DOWN, so the target never sees it. Which is the commonest
+ * layout by far, so without this the refusal below would almost never fire.
+ *
+ * A DESCENDANT hit is the legitimate exception, and it is a real pattern (a
+ * `pointer-events: none` overlay container whose own buttons set
+ * `pointer-events: auto`): the click lands inside the target's own subtree,
+ * so it is not a miss.
+ */
+function pointerEventsMiss(actionability: Actionability | null, ht: HitTest): boolean {
+  if (actionability?.pointerEventsNone !== true) return false
+  // Named positively (miss, or the loose ancestor acceptance) rather than as
+  // "not self and not descendant": a future HitTest producer that forgets
+  // `via` must not silently start refusing hits.
+  return !ht.hit || ht.via === 'ancestor'
+}
+
+/**
+ * The target itself ignores pointer events, so the hit test saw whatever the
+ * click would land on instead. Without this the refusal named that element
+ * as an intercepting overlay, which sent the agent off dismissing a thing
+ * that is not in the way: the target is simply unclickable where it stands.
+ */
+function pointerEventsNoneError(
+  action: ActionName,
+  target: string | null,
+  blocker: string | undefined,
+  point: { x: number; y: number } | null,
+): string {
+  // The same hand-over `coveredPointError` makes, and for a sharper reason:
+  // the element the click would hit is frequently the target's own LABEL or
+  // wrapper, where a deliberate click genuinely activates the target (label
+  // activation behaviour, delegated handlers). Refusing without the
+  // coordinate would delete the one exit that works. Null point (an OOPIF
+  // target) keeps the ref-based advice, since bare coordinates never reach
+  // inside one.
+  const override = point
+    ? `click it deliberately with action="click" and coordinate=[${Math.round(point.x)}, ` +
+      `${Math.round(point.y)}] (no ref), then re-read to confirm it took effect`
+    : 're-read the page and target that element by its own @ref (coordinate ' +
+      'clicks cannot reach inside a cross-origin frame)'
+  return (
+    `the ${action} was NOT sent: ${target ?? 'that element'} has CSS ` +
+    '"pointer-events: none", so it cannot receive a click where it stands, and the ' +
+    `click would have landed on ${blocker ?? 'whatever sits behind it'} instead. Do ` +
+    'not read that as an overlay to dismiss: with the way completely clear this ' +
+    'element would still not take the click. It is usually a control the page has ' +
+    'switched off by styling, a decorative layer, or an element mid-transition, in ' +
+    'which case the way forward is elsewhere or is to wait and re-read. But if that ' +
+    "other element is the target's own label or wrapper, clicking it IS what a " +
+    `person does: ${override}.`
   )
 }
 
@@ -1399,8 +1640,8 @@ async function stillConnected(session: Cdp, objectId: string | null): Promise<bo
 }
 
 /**
- * The same question, asked BEFORE acting, where a session-layer failure must
- * not be swallowed.
+ * The same question, asked BEFORE acting, WIDENED to everything else the
+ * dispatch decision needs from the element.
  *
  * `stillConnected` is deliberately tolerant because it also runs after the
  * action, where an unanswerable probe is just a missing field. Here it gates
@@ -1408,10 +1649,28 @@ async function stillConnected(session: Cdp, objectId: string | null): Promise<bo
  * between resolution and now, "unknown, carry on" would send input into a tab
  * we already know is not answering, and burn most of the command's budget
  * first. Same rule `resolveTarget` follows for the same two classes.
+ *
+ * The actionability facts ride the SAME call (`ACTIONABILITY_FN`), which is
+ * the whole reason they are affordable: this probe already runs on the
+ * already-minted probe-world handle before every ref act, so disabled,
+ * readonly, text-entry, visibility and pointer-events cost zero extra round
+ * trips (the text-entry answer even SAVES the covered-click path its own
+ * call). Only `@` refs reach here (see the call site); a `css=`/`xpath=`
+ * target would need a NEW call and keeps its previous behaviour.
+ *
+ * A null return, or an individual field left absent, means NOT KNOWN, and
+ * every caller refuses only on an explicit answer.
  */
-async function connectedBeforeActing(session: Cdp, objectId: string): Promise<boolean | null> {
+async function actionabilityBeforeActing(
+  session: Cdp,
+  objectId: string,
+): Promise<Actionability | null> {
   try {
-    return await callOn<boolean>(session, objectId, 'function(){ return this.isConnected === true; }')
+    const value = await actionabilityOf(session, objectId)
+    // A malformed answer (a page cannot produce one here, but a protocol
+    // change or a returnByValue failure can) is "not known", never a
+    // refusal: same fail-open side the occlusion gate picks.
+    return value && typeof value === 'object' ? value : null
   } catch (e) {
     if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
     return null
@@ -1789,6 +2048,11 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   let elementFrameTargetId: string | undefined
   /** For the same-process dispatch-point read; refs only. */
   let elementBackendNodeId: number | undefined
+  /** The widened pre-dispatch probe's answer for the main `@` ref target
+   *  (null when it could not be asked). Read by the refusals below, by the
+   *  `target_invisible` annotation, and by the pointer-events copy inside
+   *  the click and check branches. */
+  let actionability: Actionability | null = null
   /** What a bare coordinate landed on, for the verification payload. */
   let pointTarget: PointTarget | null = null
   if (NEEDS_TARGET.has(a.action) || (OPTIONAL_TARGET.has(a.action) && target)) {
@@ -1812,11 +2076,14 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       // Only for `@` refs: `css=`/`xpath=` go through `querySelector`, which
       // returns connected nodes by construction, so the check would spend a
       // round trip to say what the resolution already proved, and its
-      // "use a fresh ref" advice names something the caller never used.
-      if (
-        target.startsWith('@') &&
-        (await connectedBeforeActing(resolution.session, resolution.objectId)) === false
-      ) {
+      // "use a fresh ref" advice names something the caller never used. The
+      // actionability facts ride this same call and are therefore scoped the
+      // same way; a css= target keeps its previous behaviour rather than
+      // paying a round trip the ref path gets for free.
+      if (target.startsWith('@')) {
+        actionability = await actionabilityBeforeActing(resolution.session, resolution.objectId)
+      }
+      if (actionability?.connected === false) {
         return {
           ok: false,
           status: 'error',
@@ -1833,6 +2100,23 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         const refusal = await fingerprintRefusal(resolution, a.action, target, target)
         if (refusal) return refusal
       }
+      // The actionability refusals, from the same probe. AFTER the
+      // fingerprint gate on purpose: an element that changed MEANING is the
+      // more fundamental problem and its copy sends the agent to re-read,
+      // where "it is disabled" would be advice about the wrong element.
+      // `input: 'none'` and the pre-dispatch position together are the
+      // honesty other refusals here carry: no probe armed, nothing sent.
+      if (actionability?.disabled === true && DISABLED_REFUSES.has(a.action)) {
+        return {
+          ok: false,
+          status: 'error',
+          error: disabledTargetError(a.action, target),
+          data: { action: a.action, target, refused: 'disabled', input: 'none' },
+        }
+      }
+      // (The readonly refusal is NOT here: `readonly` is routinely removed by
+      // the field's own focus handler, so it is decided after the focus each
+      // text verb performs. See `readonlyAfterFocus`.)
       objectId = resolution.objectId
       elementSession = resolution.session
       elementFrameTargetId = resolution.frameTargetId
@@ -1923,6 +2207,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // drag the point is the SOURCE, so it is named as such rather than left to
   // read as "what the drag hit".
   if (pointTarget) extra[a.action === 'drag' ? 'hit_from' : 'hit'] = pointTarget.description
+  // R-07's opacity half: the act PROCEEDS (see INVISIBLE_ANNOTATES) and says
+  // what was true of the thing it acted on. Set here, before dispatch, so it
+  // rides every exit that carries `extra`, success and dialog alike.
+  if (actionability?.visible === false && INVISIBLE_ANNOTATES.has(a.action)) {
+    extra.target_invisible = true
+  }
 
   // #162: the last pre-dispatch checkpoint. Pre-flight (attach, liveness,
   // resolution, geometry) spends against the same wall clock as everything
@@ -1987,8 +2277,14 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             const dp = await dispatchPointFor(elementSession, elementBackendNodeId, geo.point)
             const teachPoint = frameIdOf(elementSession) ? dp : elementFrameTargetId ? null : geo.point
             const ht = await hitTest(elementSession, objectId, geo.point)
+            // Re-asked before it can refuse anything, never on the healthy
+            // path: the probe ran several round trips ago (see
+            // `stillPointerEventsNone`).
+            const peMiss =
+              pointerEventsMiss(actionability, ht) &&
+              (await stillPointerEventsNone(elementSession, objectId))
             let clickThrough: string | null = null
-            if (!ht.hit) {
+            if (!ht.hit || peMiss) {
               // #174: a hidden-input editor's render surface (CodeMirror 5,
               // Monaco) is a SIBLING of the real input, so containment can
               // never accept it. A click there is exactly what a person
@@ -1996,8 +2292,40 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               // text-entry targets deliver the click and verify by focus.
               // Everything else keeps the refusal, which now teaches the
               // deliberate click-through instead of dead-ending.
-              const textEntry = await textEntryTarget(elementSession, objectId)
+              // The widened pre-dispatch probe already classified the target
+              // with this same function body on this same handle, so the
+              // covered path spends a call only where that probe does not
+              // run (a css=/xpath= target).
+              const textEntry =
+                actionability?.textEntry ?? (await textEntryTarget(elementSession, objectId))
               if (!textEntry) {
+                // The target itself ignores pointer events: what the hit test
+                // found is simply what the click would hit instead, so naming
+                // that element as an interceptor would send the agent after
+                // the wrong thing. The coordinate still rides along, because
+                // the element the click WOULD hit is quite often the
+                // target's own label or wrapper, and clicking that
+                // deliberately activates the target (label activation
+                // behaviour, delegated handlers). Checked here, after the
+                // #174 exception, so a text-entry target's click-through
+                // path is untouched.
+                if (peMiss) {
+                  return {
+                    ok: false,
+                    status: 'error',
+                    error: pointerEventsNoneError(a.action, target, ht.blocker, teachPoint),
+                    data: {
+                      action: a.action,
+                      target,
+                      refused: 'pointer_events_none',
+                      intercepted_by: ht.blocker ?? null,
+                      ...(teachPoint
+                        ? { click_point: [Math.round(teachPoint.x), Math.round(teachPoint.y)] }
+                        : {}),
+                      input: 'none',
+                    },
+                  }
+                }
                 return {
                   ok: false,
                   status: 'error',
@@ -2013,6 +2341,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                   },
                 }
               }
+              // `ht.hit` true here means the ANCESTOR acceptance: the click
+              // lands on something that wraps the target rather than
+              // something over it, and the copy below says which.
               clickThrough = ht.blocker ?? 'a covering element'
             }
             if (!dp) {
@@ -2084,7 +2415,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                 return {
                   ok: false,
                   status: 'error',
-                  error: clickedThroughButFocusMissedError(a.action, target, ht.blocker),
+                  error: clickedThroughButFocusMissedError(
+                    a.action,
+                    target,
+                    ht.blocker,
+                    ht.via === 'ancestor',
+                  ),
                   data: { intercepted_by: ht.blocker ?? null, click_delivered: true },
                 }
               }
@@ -2139,6 +2475,17 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         previousValue = await readValue(elementSession, objectId)
         await scrollIntoView(elementSession, objectId)
         await focusElement(elementSession, objectId)
+        // AFTER the focus, because focus is what unlocks the commonest
+        // readonly field (see `readonlyAfterFocus`). Still before any text
+        // goes out, so "no text was sent" stays literally true.
+        if (await readonlyAfterFocus(actionability, a.action, elementSession, objectId)) {
+          return {
+            ok: false,
+            status: 'error',
+            error: readonlyTargetError(a.action, target),
+            data: { action: a.action, target, refused: 'readonly', input: 'none' },
+          }
+        }
         await selectAllIn(elementSession, objectId)
         // `Input.insertText` commits into the SESSION's focused element, so
         // it must ride the same session the focus call just went to: the
@@ -2151,6 +2498,16 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         if (a.value == null) return { ok: false, status: 'error', error: 'type requires value' }
         if (objectId) {
           await focusElement(elementSession, objectId)
+          // Same gate as fill, same reason, same position: after the focus
+          // that a readonly field's own handler listens for.
+          if (await readonlyAfterFocus(actionability, a.action, elementSession, objectId)) {
+            return {
+              ok: false,
+              status: 'error',
+              error: readonlyTargetError(a.action, target),
+              data: { action: a.action, target, refused: 'readonly', input: 'none' },
+            }
+          }
           previousValue = await readValue(elementSession, objectId)
         }
         if (a.value) {
@@ -2220,7 +2577,32 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             const dp = await dispatchPointFor(elementSession, elementBackendNodeId, geo.point)
             const teachPoint = frameIdOf(elementSession) ? dp : elementFrameTargetId ? null : geo.point
             const ht = await hitTest(elementSession, objectId, geo.point)
-            if (!ht.hit) {
+            const peMiss =
+              pointerEventsMiss(actionability, ht) &&
+              (await stillPointerEventsNone(elementSession, objectId))
+            if (!ht.hit || peMiss) {
+              // Same reading as the click family: a target that ignores
+              // pointer events was never covered, so the copy names that
+              // instead of blaming the element the click would hit instead,
+              // and hands over the same deliberate-click coordinate (a
+              // styled checkbox's own label is the everyday case).
+              if (peMiss) {
+                return {
+                  ok: false,
+                  status: 'error',
+                  error: pointerEventsNoneError(a.action, target, ht.blocker, teachPoint),
+                  data: {
+                    action: a.action,
+                    target,
+                    refused: 'pointer_events_none',
+                    intercepted_by: ht.blocker ?? null,
+                    ...(teachPoint
+                      ? { click_point: [Math.round(teachPoint.x), Math.round(teachPoint.y)] }
+                      : {}),
+                    input: 'none',
+                  },
+                }
+              }
               // Checkboxes are not text entry, so no click-through here; the
               // styled-checkbox pattern (hidden input behind a styled span)
               // exits via the taught coordinate click instead, and the state
@@ -2380,9 +2762,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           // geometry returns null), which is false: it resolved fine, it is
           // just gone, and only one of those two messages tells the agent to
           // re-read the page.
+          // (The same probe answers the actionability facts, which drag does
+          // not consume: it has no delivery verdict to misdiagnose and no
+          // text to enter, so only connectedness is read here.)
           if (
             a.to_ref.startsWith('@') &&
-            (await connectedBeforeActing(dest.session, dest.objectId)) === false
+            (await actionabilityBeforeActing(dest.session, dest.objectId))?.connected === false
           ) {
             return {
               ok: false,
