@@ -1753,22 +1753,25 @@ describe('input delivery', () => {
 
 describe('delivery in framed pages', () => {
   /**
-   * The probe watches one document, the top one, but this tool deliberately
-   * acts inside iframes: cross-origin frames are where payment fields and
-   * consent dialogs live, and the whole `elementSession` / `frameOffset`
-   * machinery exists for them. Events dispatched inside a frame never reach the
-   * top window, so a zero count there means "not seen here", not "not
-   * delivered". Failing on it would tell the agent to abandon a working tab and
-   * retry in a fresh one, where the identical failure repeats.
+   * The probe arms on the session the input rides (a cross-origin frame's own
+   * session for frame refs: frames.test.ts pins that half), so the case left
+   * for a downgrade is narrower than it used to be: a target that sits in a
+   * nested context BELOW the probed document (a same-process iframe, whose
+   * elements appear in the root tree). Events dispatched there never reach
+   * the probed document's window, so a zero count means "not seen here", not
+   * "not delivered", and failing on it would tell the agent to abandon a
+   * working tab. A target directly IN the probed document keeps a zero count
+   * conclusive; `absenceIsConclusive` splits the two by the element's own
+   * document membership, checked in its trust world.
    */
 
-  it('does not fail a click whose target lives inside an iframe', async () => {
+  it('does not fail a click whose target sits below the probed document (same-process iframe)', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 0, pageHasFrames: true, targetInTopDocument: false })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    expect(result.ok, 'an unwatched frame is not evidence of suppression').toBe(true)
+    expect(result.ok, 'an unwatched nested context is not evidence of suppression').toBe(true)
     expect((result.data as { input_delivered: string }).input_delivered).toBe('unknown')
   })
 

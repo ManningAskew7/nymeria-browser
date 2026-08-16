@@ -1,5 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { frameSessionByTargetId, frameSessions, sendCommand, type Cdp } from '../debuggerSession'
+import { sameDocumentUrl } from '../urlMatch'
 import { withProbeWorld } from '../worlds'
 import {
   nextCounter,
@@ -144,7 +145,7 @@ function formatTree(
   nodes: AXNode[],
   rootIds: string[],
   detail: 'interactive' | 'full' | 'minimal',
-  opts: { frameTargetId?: string; startCounter?: number } = {},
+  opts: { frameTargetId?: string; frameUrl?: string; startCounter?: number } = {},
 ): FormattedSnapshot {
   const byId = new Map<string, AXNode>(nodes.map((n) => [n.nodeId, n]))
   const refs = new Map<string, RefTarget>()
@@ -176,6 +177,7 @@ function formatTree(
         refs.set(refId, {
           backendNodeId: node.backendDOMNodeId,
           frameTargetId: opts.frameTargetId,
+          frameUrl: opts.frameUrl,
           role,
           name: normalizeAxName(strVal(node.name)),
         })
@@ -212,7 +214,12 @@ async function resolveScopeNode(
   tabId: number,
   scopeRef?: string,
   scopeSelector?: string,
-): Promise<{ backendNodeId: number | null; frameTargetId?: string; error?: string }> {
+): Promise<{
+  backendNodeId: number | null
+  frameTargetId?: string
+  frameUrl?: string
+  error?: string
+}> {
   if (scopeRef) {
     const tab = await chrome.tabs.get(tabId).catch(() => null)
     const resolution = resolveRef(tabId, scopeRef, tab?.url ?? null)
@@ -222,7 +229,11 @@ async function resolveScopeNode(
     // matched an unrelated main-document node (backend node ids are
     // process-global), so a scoped read of a payment frame returned the top
     // document as if that were the answer (measured live 2026-08-16).
-    return { backendNodeId: resolution.backendNodeId, frameTargetId: resolution.frameTargetId }
+    return {
+      backendNodeId: resolution.backendNodeId,
+      frameTargetId: resolution.frameTargetId,
+      frameUrl: resolution.frameUrl,
+    }
   }
   // Probe world (#160): the selector picks the read ROOT, so a main-world
   // `querySelector` override could steer what the model believes the page
@@ -270,16 +281,20 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   // made every scoped read a full read.
   let scopeNodeId: number | null = null
   let scopeFrameTargetId: string | undefined
+  let scopeFrameUrl: string | undefined
   if (a.scope_ref || a.scope_selector) {
     const scoped = await resolveScopeNode(a.tab_id, a.scope_ref, a.scope_selector)
     if (scoped.error) return { ok: false, status: 'error', error: scoped.error }
     scopeNodeId = scoped.backendNodeId
     scopeFrameTargetId = scoped.frameTargetId
+    scopeFrameUrl = scoped.frameUrl
   }
 
   // A scope ref inside a cross-origin frame re-roots INSIDE that frame: the
   // tree is read from the frame's own live session and the minted refs stay
-  // frame-owned.
+  // frame-owned. The registry is warm here because the command dispatcher
+  // attached to the tab before any exec ran; the bounded wait only covers
+  // the re-announce race after that attach.
   let treeTarget: Cdp = a.tab_id
   if (scopeFrameTargetId) {
     const live = await frameSessionByTargetId(a.tab_id, scopeFrameTargetId)
@@ -292,6 +307,19 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
           'navigated away or was removed). Re-read the page for current refs.',
       }
     }
+    // Same target id, different document: the frame NAVIGATED since the ref
+    // was minted, so its backendNodeId now belongs to a dead document (and
+    // could collide inside the new one). Refuse rather than resolve.
+    if (scopeFrameUrl && live.url && !sameDocumentUrl(scopeFrameUrl, live.url)) {
+      return {
+        ok: false,
+        status: 'error',
+        error:
+          `the frame that scope ref lives in navigated from ${scopeFrameUrl} to ` +
+          `${live.url} since the read. Re-read the page for current refs.`,
+      }
+    }
+    scopeFrameUrl = live.url || scopeFrameUrl
     treeTarget = { tabId: a.tab_id, sessionId: live.sessionId }
   }
 
@@ -321,6 +349,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     const main = formatTree(nodes, rootIds, detail, {
       startCounter: start,
       frameTargetId: scopeFrameTargetId,
+      frameUrl: scopeFrameTargetId ? scopeFrameUrl : undefined,
     })
     const allRefs = new Map<string, RefTarget>(main.refs)
     const sections = [main.text]
@@ -337,6 +366,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
           if (!frameNodes.length) continue
           const formatted = formatTree(frameNodes, rootsOf(frameNodes), detail, {
             frameTargetId: frame.targetId,
+            frameUrl: frame.url,
             startCounter: counter,
           })
           if (!formatted.text.trim()) continue

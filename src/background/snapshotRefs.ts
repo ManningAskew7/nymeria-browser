@@ -29,7 +29,14 @@
  * live QA: three consecutive stale reads to land one click). Frame refs
  * key on the frame's STABLE target id instead and are resolved to the live
  * session at act time; a frame that truly left the page simply never
- * re-announces, which the act layer reports honestly.
+ * re-announces, which the act layer reports honestly. Surviving the session
+ * is not surviving the DOCUMENT: a frame that NAVIGATES keeps its target id,
+ * and a cross-process swap gives the new document a fresh `backendNodeId`
+ * counter that can collide with held numbers, so each frame ref also records
+ * the frame URL it was minted under and the act layer refuses (`navigated`)
+ * when the live frame's URL no longer names the same document. In-process
+ * frame navigations need no URL check: the process counter is monotonic, so
+ * a dead document's ids never resolve there.
  *
  * Callers never get a bare `null` back: `resolve` returns a typed reason so
  * the agent is told to re-read the page instead of being left to guess why a
@@ -90,6 +97,12 @@ export interface RefTarget {
   /** Stable target id of the owning cross-origin frame; undefined means the
    *  root page session. */
   frameTargetId?: string
+  /** URL of the owning frame's document at mint time. The act layer compares
+   *  it (sameDocumentUrl) against the LIVE frame's URL: the target id
+   *  survives the frame navigating, but the ref's backendNodeId belongs to
+   *  the document it was minted in, and a cross-process swap can reuse the
+   *  number for an unrelated element. */
+  frameUrl?: string
   /** AX role at mint time ("button"). Empty string skips the role compare. */
   role: string
   /** Normalized AX name at mint time (normalizeAxName). Empty string skips
@@ -106,7 +119,14 @@ interface TabRefs {
 export type StaleReason = 'no-snapshot' | 'unknown-ref' | 'navigated' | 'stale-read' | 'frame-gone'
 
 export type RefResolution =
-  | { ok: true; backendNodeId: number; frameTargetId?: string; role: string; name: string }
+  | {
+      ok: true
+      backendNodeId: number
+      frameTargetId?: string
+      frameUrl?: string
+      role: string
+      name: string
+    }
   | { ok: false; reason: StaleReason; detail: string }
 
 const cache = new Map<number, TabRefs>()
@@ -250,6 +270,7 @@ export function resolve(tabId: number, target: string, currentUrl?: string | nul
     ok: true,
     backendNodeId: refTarget.backendNodeId,
     frameTargetId: refTarget.frameTargetId,
+    frameUrl: refTarget.frameUrl,
     role: refTarget.role,
     name: refTarget.name,
   }

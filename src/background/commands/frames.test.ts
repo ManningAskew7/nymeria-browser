@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { execAct } from './act'
 import { execSnapshot } from './snapshot'
 import {
+  CdpCallTimeout,
   frameSessions,
   installCdpEventRouter,
   resetForTests as resetDebugger,
@@ -324,6 +325,26 @@ describe('coordinate acts over frames', () => {
     expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
   })
 
+  it('a session-layer failure during the owner check fails the act, never fails OPEN', async () => {
+    // "Chrome did not answer the frame checks" is not "no frame matched":
+    // swallowing the timeout would dispatch root input into an OOPIF the
+    // refusal existed to protect, ok:true over a knowing no-op.
+    installCdpMock()
+    overrideForPoint({ ownerAtPoint: true })
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const prev = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      if (args[1] === 'DOM.getFrameOwner') throw new CdpCallTimeout('DOM.getFrameOwner', 15_000)
+      return prev(...args)
+    })
+    await attachFrame()
+
+    await expect(execAct({ tab_id: TAB, action: 'click', coordinate: [150, 250] })).rejects.toThrow(
+      CdpCallTimeout,
+    )
+    expect(send.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
   it('a coordinate click on a SAME-PROCESS iframe still dispatches (no session claims it)', async () => {
     const cdp = installCdpMock()
     overrideForPoint({ ownerAtPoint: false })
@@ -515,6 +536,24 @@ describe('in-frame delivery verification', () => {
     expect(data.input_delivered).toBe('unknown')
     expect(data.input_delivered_reason).toMatch(/nested frame/)
   })
+
+  it('a zero in a frame that ITSELF contains frames still FAILS when the target sits directly in it', async () => {
+    // The membership branch, not the frameless shortcut: the probed frame has
+    // nested frames (frameless false), but the element belongs to the probed
+    // document itself, so a zero count is real. The old absence check asked
+    // `w === w.top`, which no frame element can satisfy, and this exact case
+    // downgraded to a permanent "unknown".
+    installCdpMock()
+    withFrameDelivery({ count: 0, frameless: false, direct: true })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/received no event/)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('no')
+  })
 })
 
 describe('frame refs across the idle detach', () => {
@@ -526,7 +565,24 @@ describe('frame refs across the idle detach', () => {
     // target-id-keyed refs must ride through and dispatch on the NEW session.
     const cdp = installCdpMock()
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+    // frameUrl rides along as a real mint would carry it: the same-document
+    // re-announce below must PASS the navigation tripwire, not dodge it.
+    setRefs(
+      TAB,
+      new Map([
+        [
+          'e1',
+          {
+            backendNodeId: 7,
+            frameTargetId: FRAME_TARGET,
+            frameUrl: 'https://pay.example/card',
+            role: 'button',
+            name: 'Pay',
+          },
+        ],
+      ]),
+      TAB_URL,
+    )
 
     cdpEmitter()({ tabId: TAB }, 'Target.detachedFromTarget', { sessionId: FRAME_SESSION })
     cdpEmitter()({ tabId: TAB }, 'Target.attachedToTarget', {
@@ -541,6 +597,70 @@ describe('frame refs across the idle detach', () => {
       (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
     )
     expect(pressed?.[0]).toEqual({ tabId: TAB, sessionId: 'SESSION-DEF' })
+  })
+
+  it('an act issued BEFORE the re-announce rides the bounded wait instead of refusing', async () => {
+    // Chrome re-announces existing frames moments AFTER the attach the
+    // command already holds; the live lookup must poll that race out, not
+    // refuse frame-gone on its first empty look.
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+    cdpEmitter()({ tabId: TAB }, 'Target.detachedFromTarget', { sessionId: FRAME_SESSION })
+    setTimeout(() => {
+      cdpEmitter()({ tabId: TAB }, 'Target.attachedToTarget', {
+        sessionId: 'SESSION-LATE',
+        targetInfo: { targetId: FRAME_TARGET, type: 'iframe', url: 'https://pay.example/card' },
+      })
+    }, 250)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const pressed = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
+    )
+    expect(pressed?.[0]).toEqual({ tabId: TAB, sessionId: 'SESSION-LATE' })
+  })
+
+  it('a frame that re-announced under a DIFFERENT document refuses as navigated, nothing dispatched', async () => {
+    // The target id survives the frame navigating; the ref's backendNodeId
+    // does not, and a cross-process swap can hand the same number to an
+    // unrelated element in the new document. The mint-time frame URL is the
+    // tripwire.
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(
+      TAB,
+      new Map([
+        [
+          'e1',
+          {
+            backendNodeId: 7,
+            frameTargetId: FRAME_TARGET,
+            frameUrl: 'https://pay.example/card',
+            role: 'button',
+            name: 'Pay',
+          },
+        ],
+      ]),
+      TAB_URL,
+    )
+    cdpEmitter()({ tabId: TAB }, 'Target.detachedFromTarget', { sessionId: FRAME_SESSION })
+    cdpEmitter()({ tabId: TAB }, 'Target.attachedToTarget', {
+      sessionId: 'SESSION-DEF',
+      targetInfo: { targetId: FRAME_TARGET, type: 'iframe', url: 'https://pay.example/receipt' },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/navigated from/)
+    expect((result.data as { stale_refs?: boolean; reason?: string })).toMatchObject({
+      stale_refs: true,
+      reason: 'navigated',
+    })
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
   })
 
   it('a frame that never re-announces refuses with the frame-gone story, nothing dispatched', async () => {
@@ -810,5 +930,69 @@ describe('scoped read of a frame ref', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/no longer part of the page/)
+  })
+
+  it('a scoped read of a ref whose frame navigated refuses instead of reading the new document', async () => {
+    installCdpMock()
+    await attachFrame()
+    setRefs(
+      TAB,
+      new Map([
+        [
+          'e1',
+          {
+            backendNodeId: 7,
+            frameTargetId: FRAME_TARGET,
+            frameUrl: 'https://pay.example/old-checkout',
+            role: 'button',
+            name: 'Pay',
+          },
+        ],
+      ]),
+      TAB_URL,
+      1,
+    )
+
+    const result = await execSnapshot({ tab_id: TAB, scope_ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/navigated from/)
+  })
+})
+
+describe('full-page read mints frame-owned refs', () => {
+  it("a frame section's refs carry the frame's target id and mint-time URL", async () => {
+    // This mint site is where nearly every real frame ref is born; a ref
+    // minted here without its frame would resolve root-side, the exact
+    // wrong-element class frame scoping exists to prevent.
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      if (args[1] === 'Accessibility.getFullAXTree') {
+        if (target.sessionId !== FRAME_SESSION) return { nodes: [] }
+        return {
+          nodes: [
+            {
+              nodeId: 'n1',
+              backendDOMNodeId: 7,
+              role: { value: 'button' },
+              name: { value: 'Pay' },
+              childIds: [],
+            },
+          ],
+        }
+      }
+      return original(...args)
+    })
+    await attachFrame()
+
+    const result = await execSnapshot({ tab_id: TAB })
+
+    expect(result.ok).toBe(true)
+    const minted = resolveRef(TAB, '@e1', TAB_URL)
+    expect(minted.ok && minted.frameTargetId).toBe(FRAME_TARGET)
+    expect(minted.ok && minted.frameUrl).toBe('https://pay.example/card')
   })
 })

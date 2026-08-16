@@ -248,6 +248,47 @@ describe('driven tab placement (multi-window)', () => {
     expect(createArgs).toMatchObject({ windowId: 7 })
   })
 
+  it('skips minimized and incognito windows when picking the driven one', async () => {
+    // A minimized window stops compositing, the exact screenshot-hang and
+    // auth-cancel state the second window exists to avoid (#165); incognito
+    // is not the user's ordinary logged-in session.
+    installTabsMock({ loadAfterMs: 10 })
+    ;(chrome.windows.getAll as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 1, focused: true, type: 'normal' },
+      { id: 2, focused: false, type: 'normal', state: 'minimized' },
+      { id: 3, focused: false, type: 'normal', incognito: true },
+      { id: 4, focused: false, type: 'normal', state: 'normal' },
+    ])
+    ;(chrome.windows.getLastFocused as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 1,
+      focused: true,
+      type: 'normal',
+    })
+
+    await execTabs({ action: 'create', url: 'https://example.com/' })
+
+    const createArgs = (chrome.tabs.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+    expect(createArgs).toMatchObject({ windowId: 4 })
+  })
+
+  it('falls back to the current window when the only other window is minimized', async () => {
+    installTabsMock({ loadAfterMs: 10 })
+    ;(chrome.windows.getAll as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 1, focused: true, type: 'normal' },
+      { id: 2, focused: false, type: 'normal', state: 'minimized' },
+    ])
+    ;(chrome.windows.getLastFocused as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 1,
+      focused: true,
+      type: 'normal',
+    })
+
+    await execTabs({ action: 'create', url: 'https://example.com/' })
+
+    const createArgs = (chrome.tabs.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+    expect(createArgs).not.toHaveProperty('windowId')
+  })
+
   it('passes no windowId with a single window', async () => {
     installTabsMock({ loadAfterMs: 10 })
 

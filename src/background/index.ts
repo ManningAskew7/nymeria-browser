@@ -57,8 +57,11 @@ installStatusWatch()
 // one). A SUBFRAME commit deliberately does neither here: per-frame WORLD
 // teardown rides Target.detachedFromTarget (frameTeardown.ts), frame refs
 // key on the frame's stable target id and survive session churn by design
-// (snapshotRefs docstring), and the act-time detached and fingerprint
-// checks cover the in-process remainder. Network history is kept
+// (snapshotRefs docstring), and a frame that NAVIGATED is caught at act
+// time instead: the mint-time frame URL no longer matches the live frame's
+// (cross-process swap, where backendNodeIds can collide) or the old ids
+// simply stop resolving (in-process, monotonic counter). Network history is
+// kept
 // deliberately: the requests a navigation itself fired are often the answer
 // to "why did that go wrong".
 chrome.webNavigation?.onCommitted.addListener?.((details) => {

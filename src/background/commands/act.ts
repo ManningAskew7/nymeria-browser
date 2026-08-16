@@ -52,6 +52,7 @@ import {
   resolve as resolveRef,
   type StaleReason,
 } from '../snapshotRefs'
+import { sameDocumentUrl } from '../urlMatch'
 import { DEFAULT_MAX_MS, rendererResponsive, settle, type SettleResult } from '../settle'
 import {
   chooserInterceptedSince,
@@ -549,7 +550,12 @@ async function matchFrameOwner(
       if (!resolved.ok) continue
       const hit = await callOn<boolean>(tabId, resolved.objectId, ownerPredicate, args)
       if (hit === true) return frame
-    } catch {
+    } catch (e) {
+      // Session-layer failures rethrow like everywhere else in this file: a
+      // timed-out or unusable tab answering NO frame checks is not "no frame
+      // matched", and swallowing it here made the coordinate refusal fail
+      // OPEN (dispatching root input into an OOPIF it could not rule out).
+      if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
       // One unanswerable frame must not veto the others.
     }
   }
@@ -1073,6 +1079,21 @@ async function resolveTarget(
           stale: 'frame-gone',
         }
       }
+      // Same target id, different document: the frame NAVIGATED since the
+      // mint. The ref's backendNodeId belongs to the document it was minted
+      // in, and a cross-process swap starts a fresh counter that can hand
+      // the same number to an unrelated element, so resolving it would risk
+      // the wrong-click class this store exists to prevent. (In-process
+      // navigations need no check here: the old ids simply stop resolving.)
+      if (resolution.frameUrl && live.url && !sameDocumentUrl(resolution.frameUrl, live.url)) {
+        return {
+          ok: false,
+          error:
+            `the frame that ${target} lives in navigated from ${resolution.frameUrl} ` +
+            `to ${live.url} since the page was read. Re-read the page for current refs.`,
+          stale: 'navigated',
+        }
+      }
       session = { tabId, sessionId: live.sessionId }
     }
     try {
@@ -1199,6 +1220,23 @@ async function describeFocused(tabId: number): Promise<FocusedDescription | null
  *  never arrive (the measured wall). Following focus keeps the "type
  *  continues at the caret" contract across the frame boundary. */
 async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
+  // Cheap gate before the per-frame scan: only when the ROOT document's own
+  // focus rests on a frame owner can the caret be inside a cross-origin
+  // frame, so anything else answers with one evaluate instead of three CDP
+  // calls per attached frame.
+  try {
+    const resp = await sendCommand<{ result?: { value?: FocusedDescription | null } }>(
+      tabId,
+      'Runtime.evaluate',
+      { expression: DESCRIBE_FOCUSED_EXPRESSION, returnByValue: true },
+    )
+    const top = resp.result?.value ?? null
+    if (!top || (top.tag !== 'iframe' && top.tag !== 'frame')) return tabId
+  } catch (e) {
+    if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
+    // An unanswerable gate keeps the pre-frames behavior: type at the root.
+    return tabId
+  }
   const frame = await matchFrameOwner(tabId, OWNER_HAS_FOCUS_FN)
   return frame ? { tabId, sessionId: frame.sessionId } : tabId
 }
@@ -1621,16 +1659,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     // owner matching no attached session is same-process and proceeds as
     // always; scroll stays exempt (its miss is a visible root-scroll, not a
     // silent nothing).
-    if (
-      !objectId &&
-      explicitPoint &&
-      pointTarget?.frameOwner &&
-      (a.action === 'click' ||
-        a.action === 'double_click' ||
-        a.action === 'right_click' ||
-        a.action === 'hover' ||
-        a.action === 'drag')
-    ) {
+    // pointTarget only exists for ACCEPTS_COORDINATE verbs (the guard above),
+    // which is exactly the refusable set; scroll is not among them, so its
+    // exemption is structural, not a listed-out condition.
+    if (!objectId && explicitPoint && pointTarget?.frameOwner) {
       const frame = await matchFrameOwner(tabId, OWNER_AT_POINT_FN, [
         Math.round(explicitPoint.x),
         Math.round(explicitPoint.y),

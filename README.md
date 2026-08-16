@@ -36,7 +36,7 @@ src/
 │   ├── snapshotRefs.ts frame-scoped @eN ref table: monotonic per-tab numbering (storage.session-backed), merge semantics, mint fingerprints, typed staleness reasons (#160)
 │   ├── worlds.ts       isolated-world creation/cache per (tab, session, name); trust probes and element handles live in nymeria_probe (#160)
 │   ├── urlMatch.ts     shared URL trust comparisons: sameResource (fragment-blind) and sameDocumentUrl (hash-routes count as moving)
-│   ├── refInvalidation.ts  per-frame ref + world invalidation on Target.detachedFromTarget
+│   ├── frameTeardown.ts  per-frame WORLD teardown on Target.detachedFromTarget (refs survive: they key on the frame's stable target id)
 │   ├── consoleBuffer.ts / networkBuffer.ts   CDP capture, filled from attach
 │   ├── navWatch.ts     per-tab navigation lifecycle from webNavigation events
 │   ├── statusWatch.ts  last main-frame HTTP status per tab via webRequest (#175; needs the runtime host grant)

@@ -32,8 +32,12 @@ interface TabsArgs {
  * window and every driven tab landed on top of it). A second window is the
  * natural "agent workspace": the tab is created active WITHIN it, so it
  * keeps rendering and compositing, but the window itself is not focused, so
- * nothing is stolen from the user. With a single window (or the query
- * failing) the old behavior stands: there is nowhere politer to go.
+ * nothing is stolen from the user. Minimized windows are skipped for the
+ * same reason the second window is chosen at all: a tab there stops
+ * compositing, which is the measured screenshot-hang and auth-cancel state
+ * (#165); incognito windows are skipped because the driven session must be
+ * the user's ordinary logged-in one. With a single usable window (or the
+ * query failing) the old behavior stands: there is nowhere politer to go.
  */
 async function drivenWindowId(): Promise<number | undefined> {
   try {
@@ -41,7 +45,13 @@ async function drivenWindowId(): Promise<number | undefined> {
       chrome.windows.getAll({ windowTypes: ['normal'] }),
       chrome.windows.getLastFocused().catch(() => null),
     ])
-    const other = wins.find((w) => typeof w.id === 'number' && w.id !== last?.id)
+    const other = wins.find(
+      (w) =>
+        typeof w.id === 'number' &&
+        w.id !== last?.id &&
+        w.state !== 'minimized' &&
+        w.incognito !== true,
+    )
     return other?.id
   } catch {
     return undefined
