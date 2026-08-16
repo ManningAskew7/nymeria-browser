@@ -61,6 +61,14 @@ List or manage tabs in the user's Chrome. Start here to get a tab_id.
     loaded page when the extension's page-status permission lets it be seen,
     absent meaning unknown, never OK. The other actions return immediately.
 
+    A created tab opens in a browser window the user is NOT looking at when
+    one exists (active within that window, so it keeps rendering), and only
+    falls back to the user's current window when there is nowhere else to
+    go. That is deliberate: the user keeps their view, and the tab still
+    works in the background. Do not read "the tab did not appear in front of
+    the user" as a failure, and there is no need to switch to it to act on
+    it.
+
     Returns JSON: the tab list, or the affected tab. Every other chrome_* tool
     takes a tab_id from here.
 ````
@@ -526,8 +534,20 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     is to navigate the tab elsewhere, and to close it if input is still not
     delivered after that. Note the suppression can OUTLIVE the dialog that
     caused it, so seeing a clean page is not evidence the tab is healthy.
-    "unknown" is not a failure, it means the check could not be made (the target
-    sits inside an iframe, for one), so judge those by the rest of the payload.
+    "unknown" is not a failure, it means the check could not be made, and
+    "input_delivered_reason" names why; judge those by the rest of the payload.
+
+    Frames are full targets, not blind spots. A ref inside a cross-origin
+    iframe gets its input dispatched inside that frame and its delivery
+    verified there, so an in-frame silent no-op FAILS like anything else, and
+    the ref stays valid while the frame lives; if the frame navigated away or
+    was removed, the act refuses and says to re-read. Ref-less type/key follow
+    the focused element into a frame and verify there too. Two deliberate
+    refusals: a coordinate click/hover/drag landing on a cross-origin iframe
+    is refused up front (page coordinates cannot reach into another origin's
+    frame; act on that frame's own refs from the page read instead), and so is
+    a drag whose two ends do not sit in the same frame, root to frame
+    included.
 
     Page dialogs your own action raises are OWNED while you drive
     (alert/confirm/prompt/"Leave site?"). An alert is acknowledged
