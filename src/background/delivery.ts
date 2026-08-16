@@ -78,6 +78,23 @@ export interface DeliveryReading {
   outcome: DeliveryOutcome
   /** For `unknown` only: why nothing could be proven, payload-ready. */
   reason?: string
+  /**
+   * Trusted-event counts by type (#176). "Arrived" alone cannot tell a press
+   * that never composed into a `click` from a click whose default action was
+   * gated; the per-type breakdown can. Present when the counter was read
+   * back intact, absent on the context-gone (navigated) path.
+   */
+  events?: Record<string, number>
+  /**
+   * `defaultPrevented` of the last COMPOSED click-family event (`click`,
+   * `contextmenu`, `dblclick`), sampled a tick after dispatch so page
+   * handlers have had their turn (our capture listener runs FIRST, before
+   * any of them can call preventDefault). Absent when none composed.
+   */
+  clickDefaultPrevented?: boolean
+  /** The probed frame's user-activation state at read time (#176: the gate
+   * navigation-class default actions key on). */
+  userActivation?: { active: boolean; hasBeenActive: boolean }
 }
 
 export interface DeliveryProbe {
@@ -133,17 +150,28 @@ function armExpression(types: readonly string[], id: string): string {
         }
       }
       var n = 0;
+      var counts = {};
+      var prevented = null;
       var offs = [];
       for (var i = 0; i < types.length; i++) {
         (function(type){
-          var h = function(e){ if (e && e.isTrusted) { n += 1; } };
+          var composed = type === 'click' || type === 'contextmenu' || type === 'dblclick';
+          var h = function(e){
+            if (e && e.isTrusted) {
+              n += 1;
+              counts[type] = (counts[type] || 0) + 1;
+              if (composed) {
+                setTimeout(function(){ try { prevented = e.defaultPrevented === true; } catch (err) {} }, 0);
+              }
+            }
+          };
           window.addEventListener(type, h, true);
           offs.push(function(){ window.removeEventListener(type, h, true); });
         })(types[i]);
       }
       reg[id] = {
         t: now,
-        count: function(){ return n; },
+        snap: function(){ return { n: n, types: counts, prevented: prevented }; },
         off: function(){ for (var j = 0; j < offs.length; j++) { try { offs[j](); } catch (e) {} } }
       };
       return true;
@@ -160,7 +188,11 @@ function readExpression(id: string): string {
     if (!reg) return null;
     var p = reg[id];
     if (!p) return null;
-    var out = { n: p.count() };
+    var out = p.snap ? p.snap() : { n: 0 };
+    try {
+      var ua = navigator.userActivation;
+      out.ua = ua ? { a: ua.isActive === true, h: ua.hasBeenActive === true } : null;
+    } catch (e) { out.ua = null; }
     try { p.off(); } catch (e) {}
     delete reg[id];
     return out;
@@ -236,7 +268,12 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
     async read(): Promise<DeliveryReading> {
       if (spent) return { outcome: 'unknown', reason: 'the delivery probe was already read' }
       spent = true
-      const result = await evaluateInWorld<{ n: number } | null>(target, world, readExpression(id))
+      const result = await evaluateInWorld<{
+        n: number
+        types?: Record<string, number>
+        prevented?: boolean | null
+        ua?: { a?: boolean; h?: boolean } | null
+      } | null>(target, world, readExpression(id))
       if (!result.ok) {
         // The context was destroyed between arming and reading, which means
         // the document went away: the action navigated it. A navigation is
@@ -251,7 +288,13 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
       if (!value || typeof value.n !== 'number') {
         return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
-      return { outcome: value.n > 0 ? 'yes' : 'no' }
+      const reading: DeliveryReading = { outcome: value.n > 0 ? 'yes' : 'no' }
+      if (value.types && typeof value.types === 'object') reading.events = value.types
+      if (typeof value.prevented === 'boolean') reading.clickDefaultPrevented = value.prevented
+      if (value.ua && typeof value.ua.a === 'boolean') {
+        reading.userActivation = { active: value.ua.a, hasBeenActive: value.ua.h === true }
+      }
+      return reading
     },
   }
 }

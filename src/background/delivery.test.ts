@@ -108,6 +108,91 @@ describe('delivery probe', () => {
     expect((await probe.read()).outcome).toBe('no')
   })
 
+  it('reports trusted-event counts by type, and only for trusted events', async () => {
+    // #176: "arrived" alone cannot tell a press that never composed into a
+    // click from a click whose default action was gated. The per-type
+    // breakdown is what splits them, so it must count exactly what the page
+    // received and nothing the page faked.
+    installCdpMock()
+
+    const probe = await armDelivery(TAB, ['mousedown', 'mouseup', 'click'])
+    firePageEvent('mousedown')
+    firePageEvent('mouseup')
+    firePageEvent('click')
+    firePageEvent('click', { trusted: false })
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toEqual({ mousedown: 1, mouseup: 1, click: 1 })
+  })
+
+  it('omits default_prevented when no composed click-family event fired', async () => {
+    // The frame-1 diagnosis shape: the press arrived, the click never
+    // composed. A null must stay absent, not read as "not prevented".
+    installCdpMock()
+
+    const probe = await armDelivery(TAB, ['mousedown', 'mouseup', 'click'])
+    firePageEvent('mousedown')
+    firePageEvent('mouseup')
+
+    const reading = await probe.read()
+    expect(reading.events).toEqual({ mousedown: 1, mouseup: 1 })
+    expect(reading.clickDefaultPrevented).toBeUndefined()
+  })
+
+  it('samples defaultPrevented after the page handlers have run', async () => {
+    // Our capture listener on window is the FIRST hop, before any page
+    // handler can call preventDefault, so reading the flag inline would
+    // always say false. The sample rides a later tick instead.
+    installCdpMock()
+
+    const probe = await armDelivery(TAB, ['click'])
+    const cancel = (e: Event) => e.preventDefault()
+    document.body.addEventListener('click', cancel)
+    try {
+      firePageEvent('click')
+      await new Promise((r) => setTimeout(r, 0))
+    } finally {
+      document.body.removeEventListener('click', cancel)
+    }
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.clickDefaultPrevented).toBe(true)
+  })
+
+  it("reads the frame's user-activation state at read time", async () => {
+    // The probe world shares the frame's navigator, and activation is what
+    // navigation-class default actions key on (#176), so the read carries it.
+    installCdpMock()
+    Object.defineProperty(navigator, 'userActivation', {
+      value: { isActive: true, hasBeenActive: true },
+      configurable: true,
+    })
+    try {
+      const probe = await armDelivery(TAB, ['mousedown'])
+      firePageEvent('mousedown')
+
+      const reading = await probe.read()
+      expect(reading.userActivation).toEqual({ active: true, hasBeenActive: true })
+    } finally {
+      delete (navigator as unknown as Record<string, unknown>).userActivation
+    }
+  })
+
+  it('tolerates a navigator without userActivation', async () => {
+    // happy-dom has none, and neither may an older engine: the reading must
+    // simply omit the field rather than fail the probe.
+    installCdpMock()
+
+    const probe = await armDelivery(TAB, ['mousedown'])
+    firePageEvent('mousedown')
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.userActivation).toBeUndefined()
+  })
+
   it('reports unknown, never yes, when the isolated world cannot be created', async () => {
     // An unprovable delivery must not be dressed up as a proven one: that is
     // the exact dishonesty this module was built to remove.

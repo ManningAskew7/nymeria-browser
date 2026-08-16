@@ -194,18 +194,27 @@ const ACTIVATES_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
 /**
  * The events each verb must produce in the page, for the delivery probe.
  *
- * Only the verbs that go in through `Input.dispatch*` appear here, because only
- * those traverse the browser-process input gate that a tab-modal dialog closes.
- * `fill` uses `Input.insertText`, an IME commit on a path that does not consult
- * that gate (it demonstrably kept working while every other verb was
- * suppressed), and `select` / `upload` / `scroll_to` run in-page through
- * `Runtime.callFunctionOn` and never touch it. `check` and `uncheck` do dispatch
- * a real click first, but they already verify their own outcome by re-reading
- * the control, which is the precedent this whole mechanism generalises.
+ * The verbs that go in through `Input.dispatch*` appear here because they
+ * traverse the browser-process input gate that a tab-modal dialog closes.
+ * `fill` uses `Input.insertText`, an IME commit on a path that does not
+ * consult that gate (it demonstrably kept working while every other verb was
+ * suppressed), but it is probed anyway (#176 rider): its trusted `input`
+ * event is discrete and fires at commit, so the probe generalises to the
+ * causes the gate story never covered (a dead frame document, a swallowed
+ * commit), and an in-frame fill gets a real verdict instead of none.
+ * `select` / `upload` / `scroll_to` run in-page through
+ * `Runtime.callFunctionOn` and never touch the gate. `check` and `uncheck` do
+ * dispatch a real click first, but they already verify their own outcome by
+ * re-reading the control, which is the precedent this whole mechanism
+ * generalises.
  *
- * `mousedown` rather than `click` for the click family: it is the one event
- * every button variant produces, including `right_click`, which yields
- * `contextmenu` instead of `click`.
+ * `mousedown` stays the delivery anchor for the click family: it is the one
+ * event every button variant produces. The composed event (`click`,
+ * `contextmenu`, `dblclick`) and `mouseup` ride along as DIAGNOSIS (#176):
+ * per-type counts split "the press arrived but never composed into a click"
+ * from "the click composed and its default action was gated", which a bare
+ * yes/no collapses. The composed types never widen the yes-verdict
+ * (mousedown alone already counts); they only sharpen the payload.
  *
  * `hover` and `scroll` are deliberately ABSENT. Their events (`mousemove`,
  * `wheel`) are coalesced and frame-aligned rather than discrete, so Blink can
@@ -215,12 +224,13 @@ const ACTIVATES_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
  * off checked than unchecked.
  */
 const PROBE_EVENTS: Partial<Record<ActionName, readonly string[]>> = {
-  click: ['mousedown'],
-  double_click: ['mousedown'],
-  right_click: ['mousedown'],
-  drag: ['mousedown'],
+  click: ['mousedown', 'mouseup', 'click'],
+  double_click: ['mousedown', 'mouseup', 'click', 'dblclick'],
+  right_click: ['mousedown', 'mouseup', 'contextmenu'],
+  drag: ['mousedown', 'mouseup'],
   key: ['keydown'],
   type: ['keydown'],
+  fill: ['input'],
 }
 
 /**
@@ -2338,6 +2348,26 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       extra.input_delivered = delivered
       if (delivered === 'unknown' && unknownReason) {
         extra.input_delivered_reason = unknownReason
+      }
+      // #176 diagnosis fields. The per-type counts split "press arrived,
+      // click never composed" from "click composed, default action gated";
+      // `default_prevented` names the one page-side gate we can see; the
+      // activation state is what navigation-class default actions key on,
+      // read from the probed frame itself.
+      if (reading.events && Object.keys(reading.events).length > 0) {
+        extra.input_events = reading.events
+      }
+      if (reading.clickDefaultPrevented !== undefined) {
+        extra.default_prevented = reading.clickDefaultPrevented
+      }
+      if (
+        reading.userActivation &&
+        (a.action === 'click' || a.action === 'double_click' || a.action === 'right_click')
+      ) {
+        extra.user_activation = {
+          active: reading.userActivation.active,
+          has_been_active: reading.userActivation.hasBeenActive,
+        }
       }
     }
   }

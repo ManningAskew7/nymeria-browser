@@ -467,7 +467,13 @@ describe('in-frame delivery verification', () => {
   /** Extend the base mock with delivery-probe answers for the FRAME session:
    *  the probe arms in the frame's own world, so in-frame acts get a real
    *  verdict instead of a permanent "unknown". */
-  function withFrameDelivery(opts: { count: number; frameless: boolean; direct: boolean }) {
+  function withFrameDelivery(opts: {
+    count: number
+    frameless: boolean
+    direct: boolean
+    /** Full probe-read value overriding `count`: the enriched #176 shape. */
+    read?: Record<string, unknown>
+  }) {
     const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
     const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
     send.mockImplementation(async (...args: unknown[]) => {
@@ -478,7 +484,9 @@ describe('in-frame delivery verification', () => {
         if (params.expression.includes("querySelectorAll('iframe,frame')")) {
           return { result: { value: opts.frameless } }
         }
-        if (params.expression.includes('__nymDelivery')) return { result: { value: { n: opts.count } } }
+        if (params.expression.includes('__nymDelivery')) {
+          return { result: { value: opts.read ?? { n: opts.count } } }
+        }
       }
       if (method === 'Runtime.callFunctionOn' && params.functionDeclaration?.includes('ownerDocument === document')) {
         return { result: { value: opts.direct } }
@@ -505,6 +513,59 @@ describe('in-frame delivery verification', () => {
         String((c[2] as { expression?: string }).expression ?? '').includes('addEventListener'),
     )
     expect(arm?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+  })
+
+  it("the frame's own probe carries the #176 diagnosis fields on a click", async () => {
+    // The QA shape this pass exists for: press and release arrive in the
+    // frame, no click composes, activation never granted. The payload must
+    // say all of that from the frame's own probe, in one read.
+    installCdpMock()
+    withFrameDelivery({
+      count: 2,
+      frameless: true,
+      direct: true,
+      read: { n: 2, types: { mousedown: 1, mouseup: 1 }, prevented: null, ua: { a: false, h: false } },
+    })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect(data.input_delivered).toBe('yes')
+    expect(data.input_events).toEqual({ mousedown: 1, mouseup: 1 })
+    expect(data.default_prevented).toBeUndefined()
+    expect(data.user_activation).toEqual({ active: false, has_been_active: false })
+  })
+
+  it("a frame fill is verified through its trusted input event (#176 rider)", async () => {
+    // Before this pass a frame fill carried no delivery verdict at all: the
+    // only verification was a follow-up read. The probe arms in the frame's
+    // session for the `input` event insertText commits.
+    installCdpMock()
+    const send = withFrameDelivery({
+      count: 1,
+      frameless: true,
+      direct: true,
+      read: { n: 1, types: { input: 1 } },
+    })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'textbox', name: 'Card' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: '4242' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect(data.input_delivered).toBe('yes')
+    expect(data.input_events).toEqual({ input: 1 })
+    const arm = send.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression ?? '').includes('addEventListener'),
+    )
+    expect(arm?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    expect(String((arm?.[2] as { expression?: string }).expression)).toContain('"input"')
   })
 
   it('a frame click counted zero with a conclusive absence FAILS instead of shrugging', async () => {

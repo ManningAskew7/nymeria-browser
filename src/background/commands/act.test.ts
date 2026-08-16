@@ -61,6 +61,9 @@ interface MockOptions {
   probeWorld?: boolean
   /** How many events the page saw. 0 is the suppressed-tab case. */
   deliveryCount?: number
+  /** Full probe-read value, overriding `deliveryCount`: models the enriched
+   * #176 shape (`types` per-event counts, `prevented`, `ua`). */
+  deliveryRead?: Record<string, unknown>
   /** Thrown by the probe read, to model a context that died mid-action. */
   deliveryReadThrows?: string
   /**
@@ -128,6 +131,7 @@ function installCdpMock(opts: MockOptions = {}) {
     deliveryWorld = true,
     probeWorld = true,
     deliveryCount = 1,
+    deliveryRead,
     deliveryReadThrows,
     rendererHangs,
     rendererHangsAfterDispatch,
@@ -248,6 +252,7 @@ function installCdpMock(opts: MockOptions = {}) {
           return { result: { value: !pageHasFrames } }
         }
         if (deliveryReadThrows) throw new Error(deliveryReadThrows)
+        if (deliveryRead) return { result: { value: deliveryRead } }
         return { result: { value: { n: deliveryCount, f: fileChooserOpened } } }
       }
       // #160 enforcement, the document-level twin of the resolveNode check:
@@ -1684,8 +1689,104 @@ describe('input delivery', () => {
     expect((result.data as { input_delivered: string }).input_delivered).toBe('yes')
   })
 
+  it('carries the per-event-type counts and activation state on a click (#176)', async () => {
+    // The enriched shape: press, release and the composed click all counted,
+    // nothing prevented, activation granted. One read answers what previously
+    // took a four-call investigation.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      deliveryRead: {
+        n: 3,
+        types: { mousedown: 1, mouseup: 1, click: 1 },
+        prevented: false,
+        ua: { a: true, h: true },
+      },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect(data.input_delivered).toBe('yes')
+    expect(data.input_events).toEqual({ mousedown: 1, mouseup: 1, click: 1 })
+    expect(data.default_prevented).toBe(false)
+    expect(data.user_activation).toEqual({ active: true, has_been_active: true })
+  })
+
+  it('makes a press that never composed into a click visible as such (#176)', async () => {
+    // The frame-1 QA shape: delivered yes, yet no click in the counts and no
+    // default_prevented claim. The payload must expose the gap instead of
+    // rounding it to a bare "yes".
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      deliveryRead: {
+        n: 2,
+        types: { mousedown: 1, mouseup: 1 },
+        prevented: null,
+        ua: { a: false, h: false },
+      },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect(data.input_delivered).toBe('yes')
+    expect(data.input_events).toEqual({ mousedown: 1, mouseup: 1 })
+    expect(data.default_prevented).toBeUndefined()
+    expect(data.user_activation).toEqual({ active: false, has_been_active: false })
+  })
+
+  it('reports a composed click that a page handler cancelled', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      deliveryRead: { n: 3, types: { mousedown: 1, mouseup: 1, click: 1 }, prevented: true },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect((result.data as Record<string, unknown>).default_prevented).toBe(true)
+  })
+
+  it('keeps user_activation off the non-click verbs', async () => {
+    // Activation is the click family's diagnosis (navigation-class default
+    // actions); on type/key it would be payload noise claiming relevance it
+    // does not have.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      deliveryRead: { n: 1, types: { keydown: 1 }, ua: { a: true, h: true } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'a' })
+
+    const data = result.data as Record<string, unknown>
+    expect(data.input_events).toEqual({ keydown: 1 })
+    expect(data.user_activation).toBeUndefined()
+  })
+
+  it('verifies fill delivery through its trusted input event (#176 rider)', async () => {
+    // fill bypasses the browser input gate, but not every cause of a silent
+    // miss is that gate: a dead frame document or a swallowed commit read the
+    // same. The probe now covers it through the `input` event.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const send = installCdpMock({ deliveryRead: { n: 1, types: { input: 1 } } })
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect(data.input_delivered).toBe('yes')
+    expect(data.input_events).toEqual({ input: 1 })
+    const arm = send.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression ?? '').includes('addEventListener'),
+    )
+    expect(String((arm?.[2] as { expression?: string }).expression)).toContain('"input"')
+  })
+
   it('checks delivery for every verb that goes in through browser-level input', async () => {
-    for (const action of ['click', 'double_click', 'right_click', 'key', 'type']) {
+    for (const action of ['click', 'double_click', 'right_click', 'key', 'type', 'fill']) {
       resetRefs()
       resetDelivery()
       setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
@@ -1698,12 +1799,12 @@ describe('input delivery', () => {
     }
   })
 
-  it('does not probe the verbs that never touch the browser input gate', async () => {
-    // `fill` is Input.insertText, an IME commit on a path the gate does not
-    // consult: it kept working live while every other verb was suppressed.
-    // `select` and `check` run in-page, and `check` already verifies itself.
+  it('does not probe the verbs that verify themselves or never enter input', async () => {
+    // `select` and `check` run in-page, and `check` already verifies itself
+    // by re-reading the control. (`fill` used to be in this list on the gate
+    // rationale; #176 moved it to the probed set through its trusted `input`
+    // event, because a dead frame document reads the same as the gate.)
     for (const [action, extra] of [
-      ['fill', { value: 'x' }],
       ['select', { value: 'Option 2' }],
       ['check', {}],
     ] as const) {
