@@ -19,7 +19,7 @@ import { clearSessionWorlds } from './worlds'
  * id (`snapshotRefs.RefTarget.frameTargetId`) and are resolved to the live
  * session at act time, so a detach costs nothing and a frame that truly
  * left the page refuses honestly at resolution
- * (`frameSessionByTargetId` finding nothing).
+ * (`locateFrame` finding it neither as a session nor in any local tree).
  *
  * debuggerSession's frame tracking consumes the same event for its own
  * session map; the two subscribers are independent. A module (not an inline

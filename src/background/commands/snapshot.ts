@@ -1,7 +1,7 @@
 import type { CommandResult } from '../../shared/types'
-import { frameSessionByTargetId, frameSessions, sendCommand, type Cdp } from '../debuggerSession'
+import { frameIdOf, frameSessions, localFrames, locateFrame, sendCommand, type Cdp } from '../debuggerSession'
 import { sameDocumentUrl } from '../urlMatch'
-import { withProbeWorld } from '../worlds'
+import { evaluateInProbeWorld, withProbeWorld } from '../worlds'
 import {
   nextCounter,
   normalizeAxName,
@@ -10,6 +10,14 @@ import {
   withMintLock,
   type RefTarget,
 } from '../snapshotRefs'
+
+/**
+ * Same-process frames read per session-tree, in document order. A frame-farm
+ * page (ad stacks routinely carry dozens) would otherwise add an unbounded
+ * run of serial CDP reads to a command with a 20s transport budget; past the
+ * cap the payload says exactly how many frames went unread, never silence.
+ */
+const MAX_LOCAL_FRAMES = 8
 
 interface SnapshotArgs {
   tab_id: number
@@ -135,10 +143,35 @@ function renderValue(node: AXNode): string {
   return value ? ` value="${escapeQuoted(value.slice(0, 200))}"` : ''
 }
 
+/**
+ * The ignored reasons that mean CONTENT the page genuinely renders was
+ * dropped from this read (R-02's completeness half). The everyday
+ * `uninteresting` (wrapper divs) and presentational reasons are deliberately
+ * absent: their CHILDREN still render (the walk descends through dropped
+ * nodes), so nothing is lost and counting them would make the honesty note
+ * an always-on fixture the reader learns to skip.
+ */
+const HIDING_REASONS = new Set([
+  'ariaHiddenElement',
+  'ariaHiddenSubtree',
+  'notVisible',
+  'notRendered',
+  'activeModalDialog',
+  'activeAriaModalDialog',
+  'activeFullscreenElement',
+  'inertElement',
+  'inertSubtree',
+])
+
 interface FormattedSnapshot {
   text: string
   refs: Map<string, RefTarget>
   nextCounter: number
+  /** Dropped ignored-node counts by content-hiding reason; each counted node
+   *  may root a subtree Blink excluded from the response entirely, so these
+   *  are floor counts, surfaced so "the tree is small" is distinguishable
+   *  from "the page is small". */
+  hiddenDropped: Record<string, number>
 }
 
 function formatTree(
@@ -151,10 +184,17 @@ function formatTree(
   const refs = new Map<string, RefTarget>()
   let refCounter = opts.startCounter ?? 0
   const lines: string[] = []
+  const hiddenDropped: Record<string, number> = {}
 
   function walk(id: string, depth: number): void {
     const node = byId.get(id)
     if (!node) return
+    if (node.ignored) {
+      const reason = (node.ignoredReasons ?? [])
+        .map((r) => r.name ?? '')
+        .find((name) => HIDING_REASONS.has(name))
+      if (reason) hiddenDropped[reason] = (hiddenDropped[reason] ?? 0) + 1
+    }
     const keep = shouldKeep(node, detail)
     let line: string | null = null
     if (keep) {
@@ -191,7 +231,7 @@ function formatTree(
   }
 
   for (const id of rootIds) walk(id, 0)
-  return { text: lines.join('\n'), refs, nextCounter: refCounter }
+  return { text: lines.join('\n'), refs, nextCounter: refCounter, hiddenDropped }
 }
 
 /** Roots of an AX node list: the nodes whose parent is not in the list. */
@@ -201,13 +241,63 @@ function rootsOf(nodes: AXNode[]): string[] {
 }
 
 async function treeFor(target: Cdp): Promise<AXNode[]> {
+  // A frameId-carrying target reads a SAME-PROCESS frame's document through
+  // the session it shares (`getFullAXTree` resolves local frame ids only;
+  // OOPIFs have their own sessions and never a frameId here).
+  const frameId = frameIdOf(target)
   const resp = await sendCommand<{ nodes: AXNode[] }>(
     target,
     'Accessibility.getFullAXTree',
-    {},
+    frameId ? { frameId } : {},
   )
   return resp.nodes ?? []
 }
+
+/** What the collapse probe found constraining the view; all false = no note. */
+interface ViewState {
+  modal_dialog: boolean
+  aria_modal: boolean
+  fullscreen: boolean
+}
+
+/**
+ * The collapse-honesty probe (R-08). A modal `<dialog>`, an `aria-modal`
+ * widget, or a fullscreen element makes Blink prune the AX tree to (mostly)
+ * that subtree, measured 49 nodes -> 13 with everything else GONE and
+ * unflagged, so a read taken behind a cookie wall reports an almost-empty
+ * page as if that were the page. Runs in the PROBE world: the answer shapes
+ * what the model believes about the page, and `document.fullscreenElement`
+ * or `querySelector` overridden in the main world could hide the constraint
+ * (or fake one). Booleans ONLY, deliberately: the note the backend renders
+ * from this sits OUTSIDE the untrusted-content fence, so nothing
+ * page-controlled (ids, labels) may ride along. `dialog:modal` rather than
+ * `dialog[open]` because a non-modal `show()` dialog does not prune the
+ * tree, and a false "constrained" note is its own honesty bug; per-selector
+ * try keeps one unsupported pseudo-class from muting the other answers.
+ */
+const VIEW_STATE_EXPRESSION = `(function(){
+  function q(sel){ try { return document.querySelector(sel) !== null; } catch (e) { return false; } }
+  var fs = false;
+  try { fs = document.fullscreenElement !== null; } catch (e) {}
+  // aria-modal is page-DECLARED markup, so it gets two forgery gates the
+  // other causes do not need (review round): the element must carry a
+  // dialog role (only those prune the AX tree) and must actually be
+  // VISIBLE (a display:none decoy must not trip a "blocked" note; a page
+  // cannot fake checkVisibility in this world).
+  var am = false;
+  try {
+    var cands = document.querySelectorAll(
+      'dialog[aria-modal="true"], [role="dialog"][aria-modal="true"], [role="alertdialog"][aria-modal="true"]'
+    );
+    for (var i = 0; i < cands.length; i++) {
+      var el = cands[i];
+      var vis = true;
+      try { if (typeof el.checkVisibility === 'function') vis = el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }); } catch (e) {}
+      if (vis) { am = true; break; }
+    }
+  } catch (e) {}
+  return { modal_dialog: q('dialog:modal'), aria_modal: am, fullscreen: fs };
+})()`
 
 /** Resolve a scope ref or selector to a backendNodeId to re-root the tree at. */
 async function resolveScopeNode(
@@ -290,15 +380,16 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     scopeFrameUrl = scoped.frameUrl
   }
 
-  // A scope ref inside a cross-origin frame re-roots INSIDE that frame: the
-  // tree is read from the frame's own live session and the minted refs stay
-  // frame-owned. The registry is warm here because the command dispatcher
-  // attached to the tab before any exec ran; the bounded wait only covers
-  // the re-announce race after that attach.
+  // A scope ref inside a frame re-roots INSIDE that frame: an OOPIF's tree
+  // is read from its own live session, a same-process frame's through the
+  // shared session with its `frameId`, and the minted refs stay frame-owned
+  // either way. The registry is warm here because the command dispatcher
+  // attached to the tab before any exec ran; `locateFrame`'s bounded wait
+  // only covers the OOPIF re-announce race after that attach.
   let treeTarget: Cdp = a.tab_id
   if (scopeFrameTargetId) {
-    const live = await frameSessionByTargetId(a.tab_id, scopeFrameTargetId)
-    if (!live) {
+    const located = await locateFrame(a.tab_id, scopeFrameTargetId)
+    if (!located) {
       return {
         ok: false,
         status: 'error',
@@ -307,25 +398,26 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
           'navigated away or was removed). Re-read the page for current refs.',
       }
     }
-    // Same target id, different document: the frame NAVIGATED since the ref
+    // Same frame token, different document: the frame NAVIGATED since the ref
     // was minted, so its backendNodeId now belongs to a dead document (and
     // could collide inside the new one). Refuse rather than resolve.
-    if (scopeFrameUrl && live.url && !sameDocumentUrl(scopeFrameUrl, live.url)) {
+    if (scopeFrameUrl && located.url && !sameDocumentUrl(scopeFrameUrl, located.url)) {
       return {
         ok: false,
         status: 'error',
         error:
           `the frame that scope ref lives in navigated from ${scopeFrameUrl} to ` +
-          `${live.url} since the read. Re-read the page for current refs.`,
+          `${located.url} since the read. Re-read the page for current refs.`,
       }
     }
-    scopeFrameUrl = live.url || scopeFrameUrl
-    treeTarget = { tabId: a.tab_id, sessionId: live.sessionId }
+    scopeFrameUrl = located.url || scopeFrameUrl
+    treeTarget = located.session
   }
 
   const nodes = await treeFor(treeTarget)
   let rootIds = rootsOf(nodes)
 
+  let scopeIsFrameOwner = false
   if (scopeNodeId != null) {
     const scopeNode = nodes.find((n) => n.backendDOMNodeId === scopeNodeId)
     if (!scopeNode) {
@@ -336,7 +428,18 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
       }
     }
     rootIds = [scopeNode.nodeId]
+    // A frame OWNER's subtree is empty in its parent's tree (the content
+    // lives in the frame's own document), and a scoped read stays in its
+    // scope, so without a marker this read returns near-nothing as if that
+    // were the answer.
+    scopeIsFrameOwner = strVal(scopeNode.role) === 'Iframe'
   }
+
+  // The collapse-honesty probe (see VIEW_STATE_EXPRESSION). Soft: no world,
+  // no note; the read itself is never blocked on it.
+  const viewState = await evaluateInProbeWorld<ViewState>(a.tab_id, VIEW_STATE_EXPRESSION)
+  const viewConstrained =
+    viewState != null && (viewState.modal_dialog || viewState.aria_modal || viewState.fullscreen)
 
   // Minting is serialized per tab and numbers continue from the tab's
   // monotonic counter: two reads never mint the same number, so a ref held
@@ -353,34 +456,100 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     })
     const allRefs = new Map<string, RefTarget>(main.refs)
     const sections = [main.text]
+    if (scopeIsFrameOwner) {
+      sections[0] +=
+        `${sections[0] ? '\n' : ''}` +
+        '  - [frame content not included: this element is a frame owner, and a scoped ' +
+        "read stays in its scope. Read the full page to see the frame's own labelled section]"
+    }
     let counter = main.nextCounter
+    const hidden: Record<string, number> = { ...main.hiddenDropped }
+    const mergeHidden = (more: Record<string, number>): void => {
+      for (const [reason, count] of Object.entries(more)) {
+        hidden[reason] = (hidden[reason] ?? 0) + count
+      }
+    }
 
-    // Cross-origin iframes run in their own process and are absent from the
-    // page's own tree: the <iframe> node appears with an empty subtree and no
-    // error. Reading each attached frame session is what makes a payment field
-    // or a consent dialog reachable at all. A scoped read stays in its scope.
-    if (scopeNodeId == null) {
-      for (const frame of frameSessions(a.tab_id)) {
-        try {
-          const frameNodes = await treeFor({ tabId: a.tab_id, sessionId: frame.sessionId })
-          if (!frameNodes.length) continue
-          const formatted = formatTree(frameNodes, rootsOf(frameNodes), detail, {
-            frameTargetId: frame.targetId,
-            frameUrl: frame.url,
-            startCounter: counter,
-          })
-          if (!formatted.text.trim()) continue
-          counter = formatted.nextCounter
-          for (const [refId, target] of formatted.refs) allRefs.set(refId, target)
-          const indented = formatted.text
-            .split('\n')
-            .map((line) => `  ${line}`)
-            .join('\n')
-          sections.push(`- iframe "${frame.url}"\n${indented}`)
-        } catch {
-          // One unreadable frame must not cost the whole page read.
-          sections.push(`- iframe "${frame.url}" [unreadable]`)
+    /** Render one frame document as a labelled section, threading the ref
+     *  counter so numbers stay globally monotonic across sections. Returns
+     *  whether a REAL section was rendered: the payload's frame counts are
+     *  claims about what the tree contains, so an empty or unreadable frame
+     *  must not inflate them (an over-count here is its own honesty bug,
+     *  review round). */
+    const renderFrameSection = async (
+      target: Cdp,
+      frameToken: string,
+      frameUrl: string,
+    ): Promise<boolean> => {
+      try {
+        const frameNodes = await treeFor(target)
+        if (!frameNodes.length) return false
+        const formatted = formatTree(frameNodes, rootsOf(frameNodes), detail, {
+          frameTargetId: frameToken,
+          frameUrl,
+          startCounter: counter,
+        })
+        mergeHidden(formatted.hiddenDropped)
+        if (!formatted.text.trim()) return false
+        counter = formatted.nextCounter
+        for (const [refId, target_] of formatted.refs) allRefs.set(refId, target_)
+        const indented = formatted.text
+          .split('\n')
+          .map((line) => `  ${line}`)
+          .join('\n')
+        sections.push(`- iframe "${frameUrl}"\n${indented}`)
+        return true
+      } catch {
+        // One unreadable frame must not cost the whole page read. Visible in
+        // the tree, but NOT counted as read.
+        sections.push(`- iframe "${frameUrl}" [unreadable]`)
+        return false
+      }
+    }
+
+    let framesOopifRendered = 0
+    let framesLocalRendered = 0
+    let framesSkipped = 0
+    /** Same-process child frames of one session's document, in document
+     *  order (deterministic ref numbering), capped with an honest tail. */
+    const renderLocalFrames = async (sessionTarget: Cdp): Promise<void> => {
+      const local = await localFrames(sessionTarget)
+      const toRead = local.slice(0, MAX_LOCAL_FRAMES)
+      for (const f of toRead) {
+        const tabId = a.tab_id
+        const sessionId = typeof sessionTarget === 'number' ? undefined : sessionTarget.sessionId
+        if (await renderFrameSection({ tabId, sessionId, frameId: f.frameId }, f.frameId, f.url)) {
+          framesLocalRendered += 1
         }
+      }
+      if (local.length > toRead.length) {
+        const skipped = local.length - toRead.length
+        framesSkipped += skipped
+        sections.push(`- [${skipped} more frame(s) on this page not read: frame cap reached]`)
+      }
+    }
+
+    // Frames, in two complementary sweeps that together cover every document
+    // on the page. SAME-PROCESS frames (same-origin widgets, srcdoc embeds)
+    // are absent from the root tree except as a childless Iframe node and
+    // are read per-frameId through the session they share; CROSS-ORIGIN
+    // (OOPIF) frames are invisible to that walk and are read through their
+    // own flattened sessions, each followed by ITS same-process children (a
+    // same-origin frame nested inside a payment iframe). A scoped read
+    // stays in its scope.
+    if (scopeNodeId == null) {
+      await renderLocalFrames(a.tab_id)
+      for (const frame of frameSessions(a.tab_id)) {
+        if (
+          await renderFrameSection(
+            { tabId: a.tab_id, sessionId: frame.sessionId },
+            frame.targetId,
+            frame.url,
+          )
+        ) {
+          framesOopifRendered += 1
+        }
+        await renderLocalFrames({ tabId: a.tab_id, sessionId: frame.sessionId })
       }
     }
 
@@ -397,7 +566,19 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
         ref_count: allRefs.size,
         detail,
         url,
-        frames: frameSessions(a.tab_id).length,
+        // Frame counts are claims about THIS tree's sections, so a scoped
+        // read (which deliberately renders none) reports none: emitting the
+        // page's frame inventory there put a false "included" note outside
+        // the fence (review round).
+        ...(scopeNodeId == null
+          ? {
+              frames_oopif: framesOopifRendered,
+              frames_same_process: framesLocalRendered,
+              ...(framesSkipped ? { frames_skipped: framesSkipped } : {}),
+            }
+          : {}),
+        ...(viewConstrained ? { view_state: viewState } : {}),
+        ...(Object.keys(hidden).length ? { hidden_dropped: hidden } : {}),
       },
     }
   })

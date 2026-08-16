@@ -21,6 +21,15 @@ import { sendCommand, type Cdp } from './debuggerSession'
  * inside an iframe report rects relative to THAT frame's viewport, which is
  * exactly the space the frame's own session's `Input.*` wants: cross-frame
  * input dispatches there with the frame-local rect, nothing composes.
+ *
+ * SAME-PROCESS frames are the one place the two spaces split (reads-honesty
+ * pass). Their nodes have no session of their own, so dispatch rides the
+ * ROOT session and wants MAIN-frame viewport coordinates, while every
+ * in-world probe (hit test, geometry) still answers frame-locally. The root
+ * space point comes from `sameProcessDispatchPoint` below: a browser-side
+ * `DOM.getContentQuads` read that the root target reports already composed
+ * to main-frame space, nested frames included. Two direct measurements, no
+ * offset arithmetic, and the page cannot lie to either.
  */
 
 export interface Point {
@@ -270,7 +279,46 @@ export async function elementGeometry(target: Cdp, objectId: string): Promise<{ 
 // and the replacement shape (dispatch on the frame's own session with
 // frame-local coordinates) was then measured live to deliver, with the
 // per-frame probe confirming arrival. Nothing composes offsets anymore; do
-// not reintroduce composition for cross-frame input.
+// not reintroduce composition for CROSS-PROCESS frame input.
+// `sameProcessDispatchPoint` below is not that: same-process frames DO
+// receive root-session input (Chrome routes by position within one
+// renderer, measured in frames.test.ts's same-process coordinate case),
+// and the root-space point is read directly from the browser, not composed.
+
+/**
+ * LOCAL-ROOT viewport centre of a node that lives in a SAME-PROCESS frame,
+ * for dispatching that session's input at it. `DOM.getContentQuads` answers
+ * in the CSS pixels of the viewport of the SESSION it is asked on, local
+ * frames composed however deeply nested, because one renderer owns each
+ * local tree; and that is exactly the space the same session's `Input.*`
+ * speaks. Asked on the element's OWN session, never the root: backend node
+ * ids are per-process, so a nested-in-OOPIF node's id asked on the root
+ * session can name an unrelated root-process element and return its quads
+ * (the wrong-click class, review round). Null when the node has no quads
+ * (hidden, detached, display:none) or the read fails: the caller's
+ * no-layout-box fallback (synthetic dispatch, honestly labelled) is
+ * exactly the right degraded shape for both.
+ */
+export async function sameProcessDispatchPoint(
+  target: Cdp,
+  backendNodeId: number,
+): Promise<Point | null> {
+  try {
+    const resp = await sendCommand<{ quads?: number[][] }>(target, 'DOM.getContentQuads', {
+      backendNodeId,
+    })
+    const quad = resp.quads?.[0]
+    if (!quad || quad.length < 8) return null
+    const xs = [quad[0], quad[2], quad[4], quad[6]]
+    const ys = [quad[1], quad[3], quad[5], quad[7]]
+    const x = xs.reduce((a, b) => a + b, 0) / 4
+    const y = ys.reduce((a, b) => a + b, 0) / 4
+    if (!Number.isFinite(x) || !Number.isFinite(y)) return null
+    return { x, y }
+  } catch {
+    return null
+  }
+}
 
 export interface HitTest {
   hit: boolean

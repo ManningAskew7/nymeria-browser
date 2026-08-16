@@ -67,6 +67,18 @@ const FRAME_CAPTURE_DOMAINS = ['Runtime', 'Network', 'Log'] as const
 export interface CdpTarget {
   tabId: number
   sessionId?: string
+  /**
+   * A SAME-PROCESS frame within the addressed session's local tree. The
+   * protocol has no per-frame session for these (they share their local
+   * root's renderer), so commands ride the session unchanged; the field is
+   * read only by the layers that are genuinely per-frame: `worlds.ts` keys
+   * and creates isolated worlds with it, snapshot's `treeFor` passes it to
+   * `getFullAXTree`, and act's coordinate-space split (`dispatchPointFor`,
+   * the owner occlusion gate, the taught click-through point) branches on
+   * it via `frameIdOf`. `debuggee()` ignores it by design, which is what
+   * makes dispatch fall through to the SHARED session automatically.
+   */
+  frameId?: string
 }
 
 export type Cdp = number | CdpTarget
@@ -77,6 +89,11 @@ export function tabOf(target: Cdp): number {
 
 export function sessionOf(target: Cdp): string | undefined {
   return typeof target === 'number' ? undefined : target.sessionId
+}
+
+/** The same-process frame a `Cdp` addresses, when it addresses one. */
+export function frameIdOf(target: Cdp): string | undefined {
+  return typeof target === 'number' ? undefined : target.frameId
 }
 
 function debuggee(target: Cdp): chrome.debugger.Debuggee {
@@ -525,6 +542,98 @@ export async function frameSessionByTargetId(
     if (Date.now() >= deadline) return null
     await new Promise((resolve) => setTimeout(resolve, 100))
   }
+}
+
+/** One same-process frame in a session's local tree, in document order. */
+export interface LocalFrame {
+  frameId: string
+  url: string
+}
+
+interface FrameTreeNode {
+  frame?: { id?: string; url?: string }
+  childFrames?: FrameTreeNode[]
+}
+
+/**
+ * The SAME-PROCESS child frames of a session's document, in document order,
+ * from `Page.getFrameTree`. The session's own root frame is excluded (the
+ * caller already has that document), and so is any frame that owns a live
+ * OOPIF session: `getFrameTree` should already skip those, but the guard is
+ * cheap and rendering one frame under two identities would mint two refs for
+ * every element in it. Soft-fails to an empty list: same-process frame reach
+ * degrades, the command does not.
+ */
+export async function localFrames(target: Cdp): Promise<LocalFrame[]> {
+  try {
+    const tree = await sendCommand<{ frameTree?: FrameTreeNode }>(target, 'Page.getFrameTree', {})
+    // Sampled AFTER the call: a cold attach announces existing OOPIFs while
+    // the command is in flight, and the set must include them.
+    const sessionTargetIds = new Set(frameSessions(tabOf(target)).map((f) => f.targetId))
+    const out: LocalFrame[] = []
+    const walk = (node: FrameTreeNode | undefined, isRoot: boolean): void => {
+      if (!node) return
+      const id = node.frame?.id
+      if (!isRoot && id && !sessionTargetIds.has(id)) {
+        out.push({ frameId: id, url: node.frame?.url ?? '' })
+      }
+      for (const child of node.childFrames ?? []) walk(child, false)
+    }
+    walk(tree.frameTree, true)
+    return out
+  } catch (e) {
+    logger.warn(`Page.getFrameTree failed (tab=${tabOf(target)}):`, e)
+    return []
+  }
+}
+
+/**
+ * Where a frame token currently lives, for ref resolution. The `session`
+ * carries the whole answer: a sessionId for an OOPIF, the shared session
+ * plus a per-frame `frameId` for a same-process frame; callers never need
+ * to know which class they got.
+ */
+export interface LocatedFrame {
+  session: CdpTarget
+  url: string
+}
+
+/**
+ * Resolve a frame's stable token (target id == `Page.FrameId`, one token
+ * space) to its CURRENT addressee, whichever process arrangement the frame
+ * is in today. Checked in cost order: the in-memory session map (OOPIF hot
+ * path, instant), the root session's local tree, each live OOPIF session's
+ * local tree (a same-origin child inside a cross-origin frame), and only
+ * then the bounded announce wait that covers the re-attach race for OOPIFs.
+ * The tree checks come before the wait deliberately: a same-process frame
+ * NEVER announces a session, and making every act on one ride the full wait
+ * out would tax the common case to cover the rare race.
+ */
+export async function locateFrame(tabId: number, frameToken: string): Promise<LocatedFrame | null> {
+  const live = frameSessions(tabId).find((f) => f.targetId === frameToken)
+  if (live) {
+    return { session: { tabId, sessionId: live.sessionId }, url: live.url }
+  }
+  const rootLocal = (await localFrames(tabId)).find((f) => f.frameId === frameToken)
+  if (rootLocal) {
+    return { session: { tabId, frameId: frameToken }, url: rootLocal.url }
+  }
+  for (const frame of frameSessions(tabId)) {
+    const nested = (await localFrames({ tabId, sessionId: frame.sessionId })).find(
+      (f) => f.frameId === frameToken,
+    )
+    if (nested) {
+      return {
+        session: { tabId, sessionId: frame.sessionId, frameId: frameToken },
+        url: nested.url,
+      }
+    }
+  }
+  const announced = await frameSessionByTargetId(tabId, frameToken)
+  if (announced) {
+    return { session: { tabId, sessionId: announced.sessionId }, url: announced.url }
+  }
+  return null
 }
 
 /**

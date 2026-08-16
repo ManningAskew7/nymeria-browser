@@ -36,7 +36,11 @@
  * the frame URL it was minted under and the act layer refuses (`navigated`)
  * when the live frame's URL no longer names the same document. In-process
  * frame navigations need no URL check: the process counter is monotonic, so
- * a dead document's ids never resolve there.
+ * a dead document's ids never resolve there. SAME-PROCESS frame refs
+ * (reads-honesty pass) ride the identical contract: their token is the
+ * frame's `Page.FrameId` (same token space), resolved at act time via
+ * `locateFrame` to the shared session plus a per-frame isolated world, with
+ * the same frame-gone and navigated refusals.
  *
  * Callers never get a bare `null` back: `resolve` returns a typed reason so
  * the agent is told to re-read the page instead of being left to guess why a
@@ -84,8 +88,8 @@ export function fingerprintNameKey(name: string): string {
  * thought for longer than the linger between two commands, which live QA
  * measured as multiple forced re-reads per round (2026-08-16). The act layer
  * maps target id to the CURRENT session at use time
- * (`frameSessionByTargetId`); a frame that no longer exists maps to nothing
- * and refuses honestly there.
+ * (`locateFrame`, either frame class); a frame that no longer exists maps
+ * to nothing and refuses honestly there.
  *
  * `role`/`name` are the accessibility pair the ref was minted from: the
  * fingerprint act re-checks before dispatching input, so a live node whose
@@ -94,8 +98,11 @@ export function fingerprintNameKey(name: string): string {
  */
 export interface RefTarget {
   backendNodeId: number
-  /** Stable target id of the owning cross-origin frame; undefined means the
-   *  root page session. */
+  /** Stable token of the owning frame; undefined means the root document.
+   *  Target id and `Page.FrameId` are one token space, so this covers BOTH
+   *  frame classes: the act layer's `locateFrame` maps it to a live session
+   *  (OOPIF) or to the shared session plus per-frame world addressing
+   *  (same-process) at use time, whichever the frame is today. */
   frameTargetId?: string
   /** URL of the owning frame's document at mint time. The act layer compares
    *  it (sameDocumentUrl) against the LIVE frame's URL: the target id

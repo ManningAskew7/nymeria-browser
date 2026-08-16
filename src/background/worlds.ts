@@ -1,5 +1,5 @@
 import { backgroundLogger as logger } from '../utils/logger'
-import { sendCommand, sessionOf, tabOf, type Cdp, type SendCommandOpts } from './debuggerSession'
+import { frameIdOf, sendCommand, sessionOf, tabOf, type Cdp, type SendCommandOpts } from './debuggerSession'
 
 /**
  * Isolated execution worlds, the mechanism that stops a page lying to us.
@@ -18,10 +18,13 @@ import { sendCommand, sessionOf, tabOf, type Cdp, type SendCommandOpts } from '.
  * (`nymeria_delivery_probe`): it carries exclusive page-side state
  * (`__nymDelivery`) with a tested created-once-per-document lifecycle, and
  * sharing it would couple every probe's world churn to that invariant. All
- * TRUST PROBES share `nymeria_probe`, one per SESSION (the root page session
- * and each flattened OOPIF session get their own; a same-process subframe
- * has no session of its own and shares the root's, which is moot today
- * because refs are never minted inside one, see backlog #160).
+ * TRUST PROBES share `nymeria_probe`, one per DOCUMENT: the root page
+ * session and each flattened OOPIF session get their own, and a
+ * same-process subframe (which shares its local root's session) gets its
+ * own too, addressed by the `Cdp` target's `frameId` (the reads-honesty
+ * pass: refs ARE minted inside same-process frames now, and resolving one
+ * in the root frame's world would fail with a lying staleness story, since
+ * an isolated world is per-frame).
  *
  * FAIL-CLOSED rule for callers: a trust probe that cannot get a world must
  * surface its existing degraded/failure shape, NEVER re-run in the main
@@ -41,7 +44,9 @@ import { sendCommand, sessionOf, tabOf, type Cdp, type SendCommandOpts } from '.
  * Worlds die with their document. Staleness is handled by ERROR, not by
  * event (the four context-gone message shapes below, retry-once), plus
  * explicit cache clears on top-frame commit, tab close, and frame-session
- * detach. Execution context ids are cached per (tab, session, world name);
+ * detach. Execution context ids are cached per (tab, session, frame, world
+ * name), the frame dimension carried by the target's `frameId` for
+ * same-process frames;
  * frame sessions get their own world because a cross-origin frame's DOM is
  * only reachable from its own session.
  */
@@ -51,11 +56,11 @@ export const PROBE_WORLD = 'nymeria_probe'
 /** World owned by delivery.ts; named here so the cache can host both. */
 export const DELIVERY_WORLD = 'nymeria_delivery_probe'
 
-/** `${tabId}:${sessionId|root}:${worldName}` -> executionContextId. */
+/** `${tabId}:${sessionId|root}:${frameId|root}:${worldName}` -> executionContextId. */
 const worlds = new Map<string, number>()
 
 function keyFor(target: Cdp, worldName: string): string {
-  return `${tabOf(target)}:${sessionOf(target) ?? 'root'}:${worldName}`
+  return `${tabOf(target)}:${sessionOf(target) ?? 'root'}:${frameIdOf(target) ?? 'root'}:${worldName}`
 }
 
 export function isContextGone(message: string): boolean {
@@ -93,10 +98,14 @@ export function clearSessionWorlds(tabId: number, sessionId: string): void {
 }
 
 /**
- * Create the named world in the target's own root frame and cache its
- * context id. Returns null on failure (logged with its own line, distinct
+ * Create the named world in the target's own root frame, or in the
+ * SAME-PROCESS frame the target's `frameId` names, and cache its context
+ * id. Returns null on failure (logged with its own line, distinct
  * from probe failures, so a regression is diagnosable; callers surface
- * their own honest shape and never fall back to the main world).
+ * their own honest shape and never fall back to the main world). A
+ * `frameId` target skips the root-frame lookup: the caller located the
+ * frame already, and a frame that has since gone away simply fails the
+ * create, which IS the honest answer.
  *
  * FRAME sessions get one `Page.enable` + retry when the first attempt
  * fails, whichever way it fails (throw or empty answer). This retry was
@@ -114,12 +123,15 @@ export function clearSessionWorlds(tabId: number, sessionId: string): void {
  */
 export async function createWorld(target: Cdp, worldName: string): Promise<number | null> {
   const attempt = async (): Promise<number | null> => {
-    const tree = await sendCommand<{ frameTree?: { frame?: { id?: string } } }>(
-      target,
-      'Page.getFrameTree',
-      {},
-    )
-    const frameId = tree.frameTree?.frame?.id
+    let frameId = frameIdOf(target)
+    if (!frameId) {
+      const tree = await sendCommand<{ frameTree?: { frame?: { id?: string } } }>(
+        target,
+        'Page.getFrameTree',
+        {},
+      )
+      frameId = tree.frameTree?.frame?.id
+    }
     if (!frameId) return null
     const created = await sendCommand<{ executionContextId?: number }>(
       target,

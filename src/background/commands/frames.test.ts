@@ -1057,3 +1057,475 @@ describe('full-page read mints frame-owned refs', () => {
     expect(minted.ok && minted.frameUrl).toBe('https://pay.example/card')
   })
 })
+
+describe('same-process frame refs (reads-honesty pass)', () => {
+  const LOCAL_FRAME = 'LOCAL-1'
+  const LOCAL_URL = 'https://example.com/widget'
+
+  /**
+   * Layer the same-process shape onto the base mock: the root's local tree
+   * lists a child frame, per-frame isolated worlds get their own context id,
+   * and `DOM.getContentQuads` answers the page-space read the dispatch uses.
+   */
+  function overrideSameProcess(
+    opts: { childFrames?: { frame: { id: string; url?: string } }[]; quads?: number[][] | null } = {},
+  ) {
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree' && !target.sessionId) {
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: opts.childFrames ?? [{ frame: { id: LOCAL_FRAME, url: LOCAL_URL } }],
+          },
+        }
+      }
+      if (method === 'Page.createIsolatedWorld' && params.frameId === LOCAL_FRAME) {
+        return { executionContextId: 55 }
+      }
+      if (method === 'DOM.getContentQuads') {
+        if (opts.quads === null) return {}
+        return { quads: opts.quads ?? [[230, 340, 330, 340, 330, 360, 230, 360]] }
+      }
+      return original(...args)
+    })
+    return send
+  }
+
+  function localRef(over: Record<string, unknown> = {}): void {
+    setRefs(
+      TAB,
+      new Map([
+        [
+          'e1',
+          {
+            backendNodeId: 7,
+            frameTargetId: LOCAL_FRAME,
+            frameUrl: LOCAL_URL,
+            role: 'button',
+            name: 'Pay',
+            ...over,
+          },
+        ],
+      ]),
+      TAB_URL,
+      1,
+    )
+  }
+
+  it("resolves in the frame's OWN isolated world and dispatches at page coordinates on the root session", async () => {
+    const cdp = installCdpMock()
+    overrideSameProcess()
+    localRef()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    // The worlds (trust probe AND delivery) were created per-frame: the root
+    // frame's world cannot see this node, and resolving there told a lying
+    // "no longer exists" story.
+    const worldCreates = cdp.mock.calls.filter((c) => c[1] === 'Page.createIsolatedWorld')
+    expect(
+      worldCreates.some((c) => (c[2] as { frameId?: string }).frameId === LOCAL_FRAME),
+    ).toBe(true)
+    expect(
+      worldCreates.some((c) => {
+        const p = c[2] as { frameId?: string; worldName?: string }
+        return p.frameId === LOCAL_FRAME && String(p.worldName).includes('delivery')
+      }),
+    ).toBe(true)
+    const resolveCall = cdp.mock.calls.find((c) => c[1] === 'DOM.resolveNode')
+    expect(resolveCall?.[2]).toMatchObject({ executionContextId: 55 })
+    // Same-process frames have no session of their own: everything rides root.
+    expect(resolveCall?.[0]).toEqual({ tabId: TAB })
+    // Dispatch at the browser-composed page-space quad centre, NOT the
+    // frame-local rect (30, 40) the probes read.
+    const pressed = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
+    )
+    expect(pressed?.[0]).toEqual({ tabId: TAB })
+    expect(pressed?.[2]).toMatchObject({ x: 280, y: 350 })
+  })
+
+  it('a ref whose frame is GONE refuses with the frame-gone story, nothing dispatched', async () => {
+    const cdp = installCdpMock()
+    overrideSameProcess({ childFrames: [] })
+    localRef()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/no longer part of the page/)
+    expect((result.data as { reason?: string }).reason).toBe('frame-gone')
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
+  it('a ref whose frame NAVIGATED refuses naming both URLs, not "no longer exists"', async () => {
+    const cdp = installCdpMock()
+    overrideSameProcess({
+      childFrames: [{ frame: { id: LOCAL_FRAME, url: 'https://example.com/elsewhere' } }],
+    })
+    localRef()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/navigated from https:\/\/example\.com\/widget/)
+    expect(result.error).toMatch(/elsewhere/)
+    expect((result.data as { reason?: string }).reason).toBe('navigated')
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
+  it('fill rides the ROOT session end to end (focus and insertText), resolved in the frame world', async () => {
+    // The OOPIF rule is the opposite (everything on the frame session); for a
+    // same-process frame the root's IME reaches the field because one
+    // renderer owns both documents.
+    const cdp = installCdpMock()
+    overrideSameProcess()
+    localRef({ role: 'textbox', name: 'Card number' })
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: '4242' })
+
+    expect(result.ok).toBe(true)
+    const focus = cdp.mock.calls.find((c) => c[1] === 'DOM.focus')
+    expect(focus?.[0]).toEqual({ tabId: TAB })
+    const insert = cdp.mock.calls.find((c) => c[1] === 'Input.insertText')
+    expect(insert?.[0]).toEqual({ tabId: TAB })
+    expect(insert?.[2]).toMatchObject({ text: '4242' })
+  })
+
+  it('a covered same-process target TEACHES the root-space coordinate click-through', async () => {
+    // Contrast with the OOPIF covered case above, which suppresses the
+    // coordinate because bare coordinates never arrive there. Same-process
+    // frames DO receive root-session coordinate input, so the taught escape
+    // is real, and it must be the PAGE-space point, never the frame-local one.
+    const cdp = installCdpMock()
+    overrideSameProcess()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const params = args[2] as { functionDeclaration?: string } | undefined
+      const fn = String(params?.functionDeclaration ?? '')
+      if (args[1] === 'Runtime.callFunctionOn' && fn.includes('elementFromPoint')) {
+        return { result: { value: { hit: false, blocker: 'div#overlay' } } }
+      }
+      return original(...args)
+    })
+    localRef()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/covered by div#overlay/)
+    expect(result.error).toMatch(/coordinate=\[280, 350\]/)
+    expect((result.data as { click_point?: number[] }).click_point).toEqual([280, 350])
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
+  it('an unreadable page position degrades to a LABELLED synthetic click, never a wrong-place trusted one', async () => {
+    const cdp = installCdpMock()
+    overrideSameProcess({ quads: null })
+    localRef()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input: string }).input).toBe('synthetic')
+    expect((result.data as { synthetic_reason?: string }).synthetic_reason).toMatch(
+      /position.*could not be read/,
+    )
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
+  it('a scoped read of a same-process frame ref re-roots by frameId and mints frame-owned refs', async () => {
+    const cdp = installCdpMock()
+    overrideSameProcess()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      if (args[1] === 'Accessibility.getFullAXTree') {
+        const params = (args[2] ?? {}) as { frameId?: string }
+        if (params.frameId !== LOCAL_FRAME) return { nodes: [] }
+        return {
+          nodes: [
+            {
+              nodeId: 'n1',
+              backendDOMNodeId: 7,
+              role: { value: 'button' },
+              name: { value: 'Pay' },
+              childIds: [],
+            },
+          ],
+        }
+      }
+      return original(...args)
+    })
+    localRef()
+
+    const result = await execSnapshot({ tab_id: TAB, scope_ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const axReads = cdp.mock.calls.filter((c) => c[1] === 'Accessibility.getFullAXTree')
+    expect(
+      axReads.some((c) => ((c[2] ?? {}) as { frameId?: string }).frameId === LOCAL_FRAME),
+    ).toBe(true)
+    const minted = resolveRef(TAB, '@e2', TAB_URL)
+    expect(minted.ok && minted.frameTargetId).toBe(LOCAL_FRAME)
+  })
+
+  it("an OOPIF's own same-origin child frame renders as a section too", async () => {
+    // The per-session local sweep: a same-origin frame nested inside a
+    // cross-origin one is invisible to BOTH the root walk (the OOPIF's tree
+    // is not local to the root) and the session list (it has no session).
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as { frameId?: string }
+      if (method === 'Page.getFrameTree') {
+        if (target.sessionId === FRAME_SESSION) {
+          return {
+            frameTree: {
+              frame: { id: FRAME_TARGET },
+              childFrames: [{ frame: { id: 'NESTED-1', url: 'https://pay.example/inner' } }],
+            },
+          }
+        }
+        return { frameTree: { frame: { id: 'frame-root' } } }
+      }
+      if (method === 'Accessibility.getFullAXTree') {
+        if (target.sessionId === FRAME_SESSION && params.frameId === 'NESTED-1') {
+          return {
+            nodes: [
+              {
+                nodeId: 'i1',
+                backendDOMNodeId: 9,
+                role: { value: 'textbox' },
+                name: { value: 'CVC' },
+                childIds: [],
+              },
+            ],
+          }
+        }
+        if (target.sessionId === FRAME_SESSION && !params.frameId) {
+          // The OOPIF's own document is non-empty (it holds the nested
+          // iframe), so its section renders and counts as read.
+          return {
+            nodes: [
+              { nodeId: 'o1', role: { value: 'StaticText' }, name: { value: 'pay-frame' }, childIds: [] },
+            ],
+          }
+        }
+        return { nodes: [] }
+      }
+      return original(...args)
+    })
+    await attachFrame()
+
+    const result = await execSnapshot({ tab_id: TAB })
+
+    expect(result.ok).toBe(true)
+    const tree = (result.data as { tree: string }).tree
+    expect(tree).toMatch(/iframe "https:\/\/pay\.example\/inner"/)
+    expect((result.data as { frames_same_process: number }).frames_same_process).toBe(1)
+    expect((result.data as { frames_oopif: number }).frames_oopif).toBe(1)
+    const minted = resolveRef(TAB, '@e1', TAB_URL)
+    expect(minted.ok && minted.frameTargetId).toBe('NESTED-1')
+  })
+})
+
+describe('same-process frame refs: review-round defenses', () => {
+  const NESTED = 'NESTED-1'
+  const NESTED_URL = 'https://pay.example/inner'
+
+  /** A same-origin frame nested INSIDE the OOPIF: the dispatch-space reads
+   *  must all ride the OOPIF's session, never the root (backend node ids
+   *  are per-process, so root-session quads can describe an unrelated
+   *  element: the wrong-click class). */
+  function overrideNestedInOopif() {
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree') {
+        if (target.sessionId === FRAME_SESSION) {
+          return {
+            frameTree: {
+              frame: { id: FRAME_TARGET },
+              childFrames: [{ frame: { id: NESTED, url: NESTED_URL } }],
+            },
+          }
+        }
+        return { frameTree: { frame: { id: 'frame-root' } } }
+      }
+      if (method === 'Page.createIsolatedWorld' && params.frameId === NESTED) {
+        return { executionContextId: 66 }
+      }
+      if (method === 'DOM.getContentQuads') {
+        // Only the OOPIF session may be asked; a root-session ask is the bug.
+        if (target.sessionId !== FRAME_SESSION) {
+          throw new Error('getContentQuads asked on the wrong session')
+        }
+        return { quads: [[110, 210, 130, 210, 130, 230, 110, 230]] }
+      }
+      return original(...args)
+    })
+    return send
+  }
+
+  it('a ref nested inside an OOPIF reads quads AND dispatches on the OOPIF session', async () => {
+    const cdp = installCdpMock()
+    overrideNestedInOopif()
+    await attachFrame()
+    setRefs(
+      TAB,
+      new Map([
+        [
+          'e1',
+          { backendNodeId: 9, frameTargetId: NESTED, frameUrl: NESTED_URL, role: 'textbox', name: 'CVC' },
+        ],
+      ]),
+      TAB_URL,
+      1,
+    )
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const quadsCall = cdp.mock.calls.find((c) => c[1] === 'DOM.getContentQuads')
+    expect(quadsCall?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    // The per-frame world was created on the OOPIF session with the nested
+    // frame's id, and resolution used it.
+    expect(
+      cdp.mock.calls.some(
+        (c) =>
+          c[1] === 'Page.createIsolatedWorld' &&
+          (c[2] as { frameId?: string }).frameId === NESTED &&
+          (c[0] as { sessionId?: string }).sessionId === FRAME_SESSION,
+      ),
+    ).toBe(true)
+    const pressed = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
+    )
+    expect(pressed?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    expect(pressed?.[2]).toMatchObject({ x: 120, y: 220 })
+  })
+
+  it('a PARENT-document overlay over the dispatch point refuses before dispatch, naming it', async () => {
+    // The frame-local hit test is clear (the overlay lives in the parent),
+    // but dispatch hit-tests through the whole page: without the owner gate
+    // the trusted click lands on the overlay and the payload blames input
+    // suppression.
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree' && !target.sessionId) {
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [{ frame: { id: 'LOCAL-1', url: 'https://example.com/widget' } }],
+          },
+        }
+      }
+      if (method === 'Page.createIsolatedWorld' && params.frameId === 'LOCAL-1') {
+        return { executionContextId: 55 }
+      }
+      if (method === 'DOM.getContentQuads') {
+        return { quads: [[230, 340, 330, 340, 330, 360, 230, 360]] }
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const fn = String((params as { functionDeclaration?: string }).functionDeclaration ?? '')
+        const argVals = ((params as { arguments?: { value?: unknown }[] }).arguments ?? []).map(
+          (a) => a.value,
+        )
+        // The OWNER gate asks at the dispatch point (280, 350): the parent
+        // overlay intercepts there. The frame-local hit test (30, 40) stays
+        // clear.
+        if (fn.includes('elementFromPoint') && argVals[0] === 280) {
+          return { result: { value: { hit: false, blocker: 'div#cookie-banner' } } }
+        }
+      }
+      return base(...args)
+    })
+    setRefs(
+      TAB,
+      new Map([
+        [
+          'e1',
+          {
+            backendNodeId: 7,
+            frameTargetId: 'LOCAL-1',
+            frameUrl: 'https://example.com/widget',
+            role: 'button',
+            name: 'Pay',
+          },
+        ],
+      ]),
+      TAB_URL,
+      1,
+    )
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/covered in the PARENT document by div#cookie-banner/)
+    expect((result.data as { occluded_in?: string }).occluded_in).toBe('parent-document')
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
+  it('a frame id that owns a live session is never double-rendered by the local walk', async () => {
+    // Belt-and-braces for Chrome-version drift: if getFrameTree ever lists
+    // an OOPIF's frame, rendering it under two identities would mint two
+    // refs for every element in it (the wrong-click hazard).
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      if (method === 'Page.getFrameTree' && !target.sessionId) {
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            // Drifted Chrome: the OOPIF's frame appears in the root tree.
+            childFrames: [{ frame: { id: FRAME_TARGET, url: 'https://pay.example/card' } }],
+          },
+        }
+      }
+      if (method === 'Accessibility.getFullAXTree') {
+        return {
+          nodes: [
+            {
+              nodeId: 'n1',
+              backendDOMNodeId: 7,
+              role: { value: 'button' },
+              name: { value: 'Pay' },
+              childIds: [],
+            },
+          ],
+        }
+      }
+      return base(...args)
+    })
+    await attachFrame()
+
+    const result = await execSnapshot({ tab_id: TAB })
+
+    expect(result.ok).toBe(true)
+    const tree = (result.data as { tree: string }).tree
+    const sections = tree.match(/iframe "https:\/\/pay\.example\/card"/g) ?? []
+    expect(sections).toHaveLength(1)
+  })
+})

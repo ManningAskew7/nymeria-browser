@@ -2,9 +2,12 @@ import type { CommandResult } from '../../shared/types'
 import { readSince as consoleSince } from '../consoleBuffer'
 import {
   CdpCallTimeout,
-  frameSessionByTargetId,
+  frameIdOf,
   frameSessions,
+  locateFrame,
   sendCommand,
+  sessionOf,
+  tabOf,
   TabUnusable,
   type Cdp,
 } from '../debuggerSession'
@@ -23,12 +26,14 @@ import {
   elementGeometry,
   focusElement,
   focusLandedIn,
+  HIT_TEST_FN,
   hitTest,
   InputBudgetExhausted,
   InputDispatchStalled,
   textEntryTarget,
   insertText,
   modifierMask,
+  sameProcessDispatchPoint,
   scrollIntoView,
   selectAllIn,
   trustedClick,
@@ -36,6 +41,7 @@ import {
   trustedHover,
   trustedWheel,
   typeText,
+  type HitTest,
   type Point,
 } from '../input'
 import { commitSeq, commitSince, navigationPending, waitForNavSignal } from '../navWatch'
@@ -1078,14 +1084,19 @@ async function resolveTarget(
     if (!resolution.ok) {
       return { ok: false, error: resolution.detail, stale: resolution.reason }
     }
-    // A frame ref names its frame by STABLE target id; the ephemeral session
-    // is looked up here, at use time, because the idle detach kills sessions
-    // between commands while the frame (and the ref) live on. A frame that
-    // never re-announces within the wait is genuinely gone.
+    // A frame ref names its frame by STABLE token (target id == Page.FrameId,
+    // one token space); its CURRENT addressee is looked up here, at use time,
+    // because the idle detach kills sessions between commands while the frame
+    // (and the ref) live on. `locateFrame` answers for both frame classes: an
+    // OOPIF maps to its live session, a same-process frame to the session it
+    // shares plus its own `frameId` (which routes the world resolution below
+    // to the frame's OWN isolated world; the root frame's world cannot see
+    // its nodes and would tell a lying staleness story). A frame found
+    // nowhere is genuinely gone.
     let session: Cdp = tabId
     if (resolution.frameTargetId) {
-      const live = await frameSessionByTargetId(tabId, resolution.frameTargetId)
-      if (!live) {
+      const located = await locateFrame(tabId, resolution.frameTargetId)
+      if (!located) {
         return {
           ok: false,
           error:
@@ -1094,22 +1105,22 @@ async function resolveTarget(
           stale: 'frame-gone',
         }
       }
-      // Same target id, different document: the frame NAVIGATED since the
+      // Same frame token, different document: the frame NAVIGATED since the
       // mint. The ref's backendNodeId belongs to the document it was minted
       // in, and a cross-process swap starts a fresh counter that can hand
       // the same number to an unrelated element, so resolving it would risk
       // the wrong-click class this store exists to prevent. (In-process
       // navigations need no check here: the old ids simply stop resolving.)
-      if (resolution.frameUrl && live.url && !sameDocumentUrl(resolution.frameUrl, live.url)) {
+      if (resolution.frameUrl && located.url && !sameDocumentUrl(resolution.frameUrl, located.url)) {
         return {
           ok: false,
           error:
             `the frame that ${target} lives in navigated from ${resolution.frameUrl} ` +
-            `to ${live.url} since the page was read. Re-read the page for current refs.`,
+            `to ${located.url} since the page was read. Re-read the page for current refs.`,
           stale: 'navigated',
         }
       }
-      session = { tabId, sessionId: live.sessionId }
+      session = located.session
     }
     try {
       const resolved = await resolveNodeInProbeWorld(session, resolution.backendNodeId)
@@ -1122,7 +1133,7 @@ async function resolveTarget(
         // failure read as "mid-navigation" gets dismissed as transient.
         if (resolved.reason === 'no-world') {
           const what = resolution.frameTargetId
-            ? 'resolving the element inside its cross-origin frame'
+            ? 'resolving the element inside its frame'
             : 'resolving the element'
           return { ok: false, error: probeWorldUnavailableError(what) }
         }
@@ -1183,44 +1194,136 @@ async function resolveTarget(
   }
 }
 
+/**
+ * Where to DISPATCH input at a resolved target. Root and OOPIF targets keep
+ * the frame-local probe point: their session's `Input.*` speaks that space.
+ * A target inside a SAME-PROCESS frame dispatches on the session that frame
+ * shares (the root for a root-local frame, the OOPIF's session for a frame
+ * nested inside one), which speaks that session's LOCAL-ROOT viewport
+ * coordinates, so its point is read separately: browser-side quads asked on
+ * the element's own session (per-process node ids make the root session the
+ * wrong place to ask, review round). The probes keep the frame-local point,
+ * each space measured directly and nothing converted between them. Null
+ * only for the same-process case with no readable quads, which callers
+ * treat exactly like a missing layout box (synthetic fallback, labelled).
+ */
+async function dispatchPointFor(
+  session: Cdp,
+  backendNodeId: number | undefined,
+  localPoint: Point,
+): Promise<Point | null> {
+  if (!frameIdOf(session)) return localPoint
+  if (backendNodeId === undefined) return null
+  return sameProcessDispatchPoint(session, backendNodeId)
+}
+
+/**
+ * The dispatch-space occlusion gate for a same-process frame target.
+ *
+ * The frame-local hit test cannot see an overlay in the DISPATCH document
+ * (a parent cookie banner over a same-origin widget), and input for these
+ * targets hit-tests through the whole page, so a trusted click would land
+ * on the overlay while the payload blamed input suppression (review round).
+ * Asks whether the frame's OWNER element is what sits at the dispatch
+ * point, in the dispatch session's probe world so the answer gates a
+ * refusal a page cannot forge. It also catches a frame scrolled out of the
+ * page viewport (elementFromPoint answers nothing there). Null means "not
+ * a same-process target" or "could not check": the probe failing must not
+ * block the act (the delivery verification backstops), but session-layer
+ * failures rethrow like every other pre-dispatch gate.
+ */
+async function frameOwnerAtPoint(session: Cdp, point: Point): Promise<HitTest | null> {
+  const frameId = frameIdOf(session)
+  if (!frameId) return null
+  const sessionId = sessionOf(session)
+  const host: Cdp = sessionId ? { tabId: tabOf(session), sessionId } : tabOf(session)
+  try {
+    const owner = await sendCommand<{ backendNodeId?: number }>(host, 'DOM.getFrameOwner', {
+      frameId,
+    })
+    if (!owner.backendNodeId) return null
+    const resolved = await resolveNodeInProbeWorld(host, owner.backendNodeId)
+    if (!resolved.ok) return null
+    return await callOn<HitTest>(host, resolved.objectId, HIT_TEST_FN, [point.x, point.y])
+  } catch (e) {
+    if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
+    return null
+  }
+}
+
+/**
+ * A same-process frame target whose DISPATCH point is intercepted in the
+ * parent document. Distinct from `coveredPointError`: the frame's own view
+ * is clear (the frame-local hit test passed), so "part of the target's own
+ * widget" cannot be the story, and teaching a coordinate click-through
+ * would aim at the same interceptor.
+ */
+function frameOccludedError(action: ActionName, target: string | null, blocker?: string): string {
+  return (
+    `the ${action} point for ${target ?? 'that element'} is covered in the PARENT ` +
+    `document by ${blocker ?? 'another element'}: the frame's own view is clear, but ` +
+    'input for a same-origin frame dispatches through the page, where that element ' +
+    `is on top. Nothing was sent. Dismiss or scroll away the covering element (it ` +
+    'has its own ref in a page read), then retry.'
+  )
+}
+
 interface FocusedDescription {
   tag: string
   label: string
-  /** Set when focus rests on a cross-origin frame: the description above is
-   *  then the FRAME'S OWN focused element, read through its session, and
-   *  this names which frame. Without the descent the payload stopped at
+  /** Set when focus rests inside a frame: the description above is then the
+   *  FRAME'S OWN focused element (read in-expression for a same-origin
+   *  frame, through the frame's session for a cross-origin one), and this
+   *  names which frame. Without the descent the payload stopped at
    *  `tag: "iframe"`, which live QA misread twice as a failed click. */
   frame_url?: string
 }
 
 const DESCRIBE_FOCUSED_EXPRESSION = `(function(){
-  const el = document.activeElement;
+  let el = document.activeElement;
+  let frameUrl = null;
+  // Same-origin frame chain: activeElement stops at the frame OWNER, but a
+  // same-origin contentDocument is reachable from here, so descend to the
+  // element actually holding focus (bounded: nested widgets, not cycles).
+  // A cross-origin frame throws or hides its document, leaving el on the
+  // owner for the caller's session-descent path.
+  for (let hops = 0; hops < 5; hops++) {
+    const tag = el ? el.tagName : '';
+    if (tag !== 'IFRAME' && tag !== 'FRAME') break;
+    let doc = null;
+    try { doc = el.contentDocument; } catch (e) { doc = null; }
+    if (!doc || !doc.activeElement || doc.activeElement === doc.body) break;
+    el = doc.activeElement;
+    try { frameUrl = String(el.ownerDocument.location.href).slice(0, 200); } catch (e) { frameUrl = null; }
+  }
   if (!el || el === document.body || el === document.documentElement) return null;
   const raw = el.getAttribute('aria-label') || el.getAttribute('name')
     || el.getAttribute('placeholder') || (el.innerText || '');
-  return { tag: el.tagName.toLowerCase(), label: String(raw || '').trim().slice(0, 60) };
+  const out = { tag: el.tagName.toLowerCase(), label: String(raw || '').trim().slice(0, 60) };
+  if (frameUrl) out.frame_url = frameUrl;
+  return out;
 })()`
 
 async function describeFocused(tabId: number): Promise<FocusedDescription | null> {
+  // Probe world (review round): this read names the payload's `focused`
+  // fact and, through keyboardSessionForFocus's twin, routes trusted
+  // keystrokes; evaluated in the main world a page could forge both.
   try {
-    const resp = await sendCommand<{ result?: { value?: FocusedDescription | null } }>(
+    const top = (await evaluateInProbeWorld<FocusedDescription | null>(
       tabId,
-      'Runtime.evaluate',
-      { expression: DESCRIBE_FOCUSED_EXPRESSION, returnByValue: true },
-    )
-    const top = resp.result?.value ?? null
+      DESCRIBE_FOCUSED_EXPRESSION,
+    )) ?? null
     if (!top || (top.tag !== 'iframe' && top.tag !== 'frame')) return top
     // Focus rests on a frame owner: descend ONE level when it is an attached
     // cross-origin frame, so the payload names the element that actually
-    // holds focus instead of the wall in front of it.
+    // holds focus instead of the wall in front of it. (A SAME-ORIGIN frame
+    // never reaches here: the expression itself descends its chain.)
     const frame = await matchFrameOwner(tabId, OWNER_HAS_FOCUS_FN)
     if (!frame) return top
-    const inner = await sendCommand<{ result?: { value?: FocusedDescription | null } }>(
+    const innerValue = await evaluateInProbeWorld<FocusedDescription | null>(
       { tabId, sessionId: frame.sessionId },
-      'Runtime.evaluate',
-      { expression: DESCRIBE_FOCUSED_EXPRESSION, returnByValue: true },
+      DESCRIBE_FOCUSED_EXPRESSION,
     )
-    const innerValue = inner.result?.value
     return innerValue
       ? { ...innerValue, frame_url: frame.url }
       : { ...top, frame_url: frame.url }
@@ -1238,14 +1341,22 @@ async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
   // Cheap gate before the per-frame scan: only when the ROOT document's own
   // focus rests on a frame owner can the caret be inside a cross-origin
   // frame, so anything else answers with one evaluate instead of three CDP
-  // calls per attached frame.
+  // calls per attached frame. In the PROBE world (review round): this gate
+  // routes TRUSTED keystrokes, and `withProbeWorld` keeps the session-layer
+  // rethrow the main-world try/catch used to carry.
   try {
-    const resp = await sendCommand<{ result?: { value?: FocusedDescription | null } }>(
-      tabId,
-      'Runtime.evaluate',
-      { expression: DESCRIBE_FOCUSED_EXPRESSION, returnByValue: true },
-    )
-    const top = resp.result?.value ?? null
+    const top = await withProbeWorld(tabId, async (contextId) => {
+      const resp = await sendCommand<{
+        result?: { value?: FocusedDescription | null }
+        exceptionDetails?: unknown
+      }>(tabId, 'Runtime.evaluate', {
+        expression: DESCRIBE_FOCUSED_EXPRESSION,
+        contextId,
+        returnByValue: true,
+      })
+      if (resp.exceptionDetails) return null
+      return resp.result?.value ?? null
+    })
     if (!top || (top.tag !== 'iframe' && top.tag !== 'frame')) return tabId
   } catch (e) {
     if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
@@ -1602,9 +1713,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
 
   let objectId: string | null = null
   // Default addressee is the root page session; a ref inside a cross-origin
-  // frame swaps this for that frame's session.
+  // frame swaps this for that frame's session, and one inside a same-process
+  // frame for a frameId-carrying root target (which routes only the world
+  // machinery; commands still ride the root session).
   let elementSession: Cdp = tabId
   let elementFrameTargetId: string | undefined
+  /** For the same-process dispatch-point read; refs only. */
+  let elementBackendNodeId: number | undefined
   /** What a bare coordinate landed on, for the verification payload. */
   let pointTarget: PointTarget | null = null
   if (NEEDS_TARGET.has(a.action) || (OPTIONAL_TARGET.has(a.action) && target)) {
@@ -1652,6 +1767,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       objectId = resolution.objectId
       elementSession = resolution.session
       elementFrameTargetId = resolution.frameTargetId
+      elementBackendNodeId = resolution.backendNodeId
     }
 
     // Checked HERE rather than inside the click case, so it covers every verb
@@ -1794,6 +1910,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           await scrollIntoView(elementSession, objectId)
           const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
+            // Read once, used for the dispatch AND for the coordinates a
+            // refusal teaches: for a same-process frame target this is a
+            // ROOT-space point (coordinate acts DO reach same-process
+            // frames), where an OOPIF target's frame-local point stays
+            // untaught because bare coordinates could never reach it.
+            const dp = await dispatchPointFor(elementSession, elementBackendNodeId, geo.point)
+            const teachPoint = frameIdOf(elementSession) ? dp : elementFrameTargetId ? null : geo.point
             const ht = await hitTest(elementSession, objectId, geo.point)
             let clickThrough: string | null = null
             if (!ht.hit) {
@@ -1809,26 +1932,50 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                 return {
                   ok: false,
                   status: 'error',
-                  error: coveredPointError(
-                    a.action,
-                    target,
-                    ht.blocker,
-                    elementFrameTargetId ? null : geo.point,
-                  ),
+                  error: coveredPointError(a.action, target, ht.blocker, teachPoint),
                   data: {
                     intercepted_by: ht.blocker ?? null,
                     // A frame-local coordinate is useless to the agent (bare
-                    // coordinates are root-space), so a frame target gets no
-                    // click_point rather than a mixed-space one.
-                    ...(elementFrameTargetId
-                      ? {}
-                      : { click_point: [Math.round(geo.point.x), Math.round(geo.point.y)] }),
+                    // coordinates are root-space), so an OOPIF target gets
+                    // no click_point rather than a mixed-space one.
+                    ...(teachPoint
+                      ? { click_point: [Math.round(teachPoint.x), Math.round(teachPoint.y)] }
+                      : {}),
                   },
                 }
               }
               clickThrough = ht.blocker ?? 'a covering element'
             }
-            await trustedClick(elementSession, geo.point, {
+            if (!dp) {
+              // Same-process frame target whose dispatch-space position could
+              // not be read: the honest degraded path is the same synthetic
+              // dispatch a missing layout box gets, labelled as such.
+              await callOn(elementSession, objectId, 'function(){ this.click(); }')
+              inputMode = 'synthetic'
+              extra.synthetic_reason =
+                'the element\'s position on the page could not be read (its frame may be hidden or scrolled away)'
+              if (clickThrough) extra.clicked_through = clickThrough
+              break
+            }
+            // The dispatch-space gate (same-process targets only): the
+            // frame-local hit test above cannot see a PARENT-document
+            // overlay, and this dispatch hit-tests through the whole page.
+            {
+              const ownerHit = await frameOwnerAtPoint(elementSession, dp)
+              if (ownerHit && !ownerHit.hit) {
+                return {
+                  ok: false,
+                  status: 'error',
+                  error: frameOccludedError(a.action, target, ownerHit.blocker),
+                  data: {
+                    intercepted_by: ownerHit.blocker ?? null,
+                    occluded_in: 'parent-document',
+                    input: 'none',
+                  },
+                }
+              }
+            }
+            await trustedClick(elementSession, dp, {
               button,
               clickCount,
               modifiers,
@@ -1897,8 +2044,11 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         if (objectId) {
           await scrollIntoView(elementSession, objectId)
           const geo = await elementGeometry(elementSession, objectId)
-          if (geo) {
-            await trustedHover(elementSession, geo.point, modifiers)
+          const dp = geo
+            ? await dispatchPointFor(elementSession, elementBackendNodeId, geo.point)
+            : null
+          if (dp) {
+            await trustedHover(elementSession, dp, modifiers)
             inputMode = 'trusted'
           } else {
             await callOn(
@@ -1998,6 +2148,8 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           await scrollIntoView(elementSession, objectId)
           const geo = await elementGeometry(elementSession, objectId)
           if (geo) {
+            const dp = await dispatchPointFor(elementSession, elementBackendNodeId, geo.point)
+            const teachPoint = frameIdOf(elementSession) ? dp : elementFrameTargetId ? null : geo.point
             const ht = await hitTest(elementSession, objectId, geo.point)
             if (!ht.hit) {
               // Checkboxes are not text entry, so no click-through here; the
@@ -2007,22 +2159,36 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               return {
                 ok: false,
                 status: 'error',
-                error: coveredPointError(
-                  a.action,
-                  target,
-                  ht.blocker,
-                  elementFrameTargetId ? null : geo.point,
-                ),
+                error: coveredPointError(a.action, target, ht.blocker, teachPoint),
                 data: {
                   intercepted_by: ht.blocker ?? null,
-                  ...(elementFrameTargetId
-                    ? {}
-                    : { click_point: [Math.round(geo.point.x), Math.round(geo.point.y)] }),
+                  ...(teachPoint
+                    ? { click_point: [Math.round(teachPoint.x), Math.round(teachPoint.y)] }
+                    : {}),
                 },
               }
             }
-            await trustedClick(elementSession, geo.point, { modifiers, deadline: budgetDeadline })
-            inputMode = 'trusted'
+            if (dp) {
+              // Same dispatch-space gate as click: a parent overlay eats the
+              // real click, and the force path below would then mask it.
+              const ownerHit = await frameOwnerAtPoint(elementSession, dp)
+              if (ownerHit && !ownerHit.hit) {
+                return {
+                  ok: false,
+                  status: 'error',
+                  error: frameOccludedError(a.action, target, ownerHit.blocker),
+                  data: {
+                    intercepted_by: ownerHit.blocker ?? null,
+                    occluded_in: 'parent-document',
+                    input: 'none',
+                  },
+                }
+              }
+              await trustedClick(elementSession, dp, { modifiers, deadline: budgetDeadline })
+              inputMode = 'trusted'
+            }
+            // dp null (same-process frame position unreadable): fall through
+            // to the state read-back, whose force path is the honest fallback.
           }
           // Deadlined for the same reason the dispatch itself is, and this is
           // the only verb that needs it said separately: its verification runs
@@ -2111,9 +2277,25 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         break
       }
       case 'drag': {
+        const fromLocal = objectId ? (await elementGeometry(elementSession, objectId))?.point ?? null : null
         const from = objectId
-          ? (await elementGeometry(elementSession, objectId))?.point ?? null
+          ? fromLocal
+            ? await dispatchPointFor(elementSession, elementBackendNodeId, fromLocal)
+            : null
           : pointFrom(a.coordinate)
+        if (objectId && fromLocal && !from) {
+          // The element has layout but its dispatch-space position could not
+          // be read: name that, never the generic unresolvable-source copy.
+          return {
+            ok: false,
+            status: 'error',
+            error:
+              "the drag source's position on the page could not be read (its frame may " +
+              'be hidden or scrolled away). Nothing was dispatched; retry after making ' +
+              'the frame visible.',
+            data: { action: 'drag', ...(target ? { target } : {}), input: 'none' },
+          }
+        }
         // The document the whole pointer stream rides in: the source
         // element's frame for a ref, the root for a coordinate source. A
         // drag is ONE stream (press, glide, release) dispatched on one
@@ -2163,7 +2345,24 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               },
             }
           }
-          to = (await elementGeometry(dest.session, dest.objectId))?.point ?? null
+          const toLocal = (await elementGeometry(dest.session, dest.objectId))?.point ?? null
+          // Same coordinate-space rule as the source: a same-process frame
+          // destination dispatches in the shared session's space (the
+          // cross-frame guard above pinned both ends to ONE frame).
+          to = toLocal
+            ? await dispatchPointFor(dest.session, dest.backendNodeId, toLocal)
+            : null
+          if (toLocal && !to) {
+            return {
+              ok: false,
+              status: 'error',
+              error:
+                "the drag destination's position on the page could not be read (its " +
+                'frame may be hidden or scrolled away). Nothing was dispatched; retry ' +
+                'after making the frame visible.',
+              data: { action: 'drag', ...(target ? { target } : {}), input: 'none' },
+            }
+          }
         }
         if (!from || !to) {
           return {

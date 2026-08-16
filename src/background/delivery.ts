@@ -58,11 +58,13 @@ import {
  * ours is registered later on the same node, so it would be skipped.
  *
  * SCOPE, and why absence needs a second question. The probe covers ONE
- * document: the one belonging to the SESSION it is armed on. It is armed
- * where the input goes: the root session for main-document and coordinate
- * acts, the frame's own session for a frame ref, so an in-frame act gets a
- * real verdict from inside its frame instead of a permanent "unknown" (the
- * pre-2026-08-16 shape, which is exactly where the measured silent no-op
+ * document: the one its WORLD lives in. It is armed where the input goes:
+ * the root session for main-document and coordinate acts, the frame's own
+ * session for an OOPIF ref, and the frame's own per-frame world (a
+ * frameId-carrying root target, reads-honesty pass) for a same-process
+ * frame ref, so an in-frame act gets a real verdict from inside its frame
+ * instead of a permanent "unknown" (the pre-2026-08-16 shape, which is
+ * exactly where the measured silent no-op
  * hid). Events inside a NESTED browsing context below the probed document
  * still never reach its window, so a zero count is not by itself proof:
  * `absenceIsConclusive` asks the follow-up, and only a conclusive absence is
