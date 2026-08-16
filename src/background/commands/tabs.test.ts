@@ -65,7 +65,11 @@ function installTabsMock(
       },
     },
   }
-  ;(chrome.windows as unknown) = { update: vi.fn(async () => undefined) }
+  ;(chrome.windows as unknown) = {
+    update: vi.fn(async () => undefined),
+    getAll: vi.fn(async () => [{ id: 1, focused: true, type: 'normal' }]),
+    getLastFocused: vi.fn(async () => ({ id: 1, focused: true, type: 'normal' })),
+  }
   return { finishLoad, listenerCount: () => listeners.length }
 }
 
@@ -198,6 +202,70 @@ describe('tabs create', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+})
+
+describe('driven tab placement (multi-window)', () => {
+  // Creating in the user's focused window rips their view away mid-task
+  // (measured 2026-08-16: the operator was watching a stream there and every
+  // driven tab landed on top of it). With a second normal window, driven
+  // tabs go THERE; with one window there is nowhere politer to go.
+  it('creates the tab in a non-focused window when one exists', async () => {
+    installTabsMock({ loadAfterMs: 10 })
+    ;(chrome.windows.getAll as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 1, focused: true, type: 'normal' },
+      { id: 2, focused: false, type: 'normal' },
+    ])
+    ;(chrome.windows.getLastFocused as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 1,
+      focused: true,
+      type: 'normal',
+    })
+
+    await execTabs({ action: 'create', url: 'https://example.com/' })
+
+    const createArgs = (chrome.tabs.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+    expect(createArgs).toMatchObject({ url: 'https://example.com/', windowId: 2 })
+  })
+
+  it('avoids the last-focused window even when Chrome itself is unfocused', async () => {
+    // Alt-tabbed away, every window reports focused: false; getLastFocused
+    // still names the one the user considers theirs.
+    installTabsMock({ loadAfterMs: 10 })
+    ;(chrome.windows.getAll as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { id: 7, focused: false, type: 'normal' },
+      { id: 9, focused: false, type: 'normal' },
+    ])
+    ;(chrome.windows.getLastFocused as ReturnType<typeof vi.fn>).mockResolvedValue({
+      id: 9,
+      focused: false,
+      type: 'normal',
+    })
+
+    await execTabs({ action: 'create', url: 'https://example.com/' })
+
+    const createArgs = (chrome.tabs.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+    expect(createArgs).toMatchObject({ windowId: 7 })
+  })
+
+  it('passes no windowId with a single window', async () => {
+    installTabsMock({ loadAfterMs: 10 })
+
+    await execTabs({ action: 'create', url: 'https://example.com/' })
+
+    const createArgs = (chrome.tabs.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+    expect(createArgs).not.toHaveProperty('windowId')
+  })
+
+  it('falls back to the old behavior when the windows query fails', async () => {
+    installTabsMock({ loadAfterMs: 10 })
+    ;(chrome.windows.getAll as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('nope'))
+
+    const result = await execTabs({ action: 'create', url: 'https://example.com/' })
+
+    expect(result.ok).toBe(true)
+    const createArgs = (chrome.tabs.create as ReturnType<typeof vi.fn>).mock.calls[0]?.[0]
+    expect(createArgs).not.toHaveProperty('windowId')
   })
 })
 

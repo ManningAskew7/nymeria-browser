@@ -434,6 +434,35 @@ export function frameSessions(tabId: number): FrameSession[] {
 }
 
 /**
+ * The LIVE session for a frame's stable target id, waiting briefly for
+ * auto-attach to announce it.
+ *
+ * Sessions are ephemeral: the tab detaches 10s after its last command
+ * (DETACH_LINGER_MS), killing every frame session, and the next attach
+ * re-announces the same frames under NEW session ids. Anything durable
+ * (refs) therefore keys on the frame's target id, which Chrome keeps stable
+ * for the frame element's lifetime, and maps to a session here at use time.
+ * The wait covers the re-attach race: `Target.attachedToTarget` events for
+ * existing frames arrive moments after the attach that the caller already
+ * holds, so a miss on the first look usually resolves within milliseconds.
+ * A frame that never appears within the bound is genuinely gone (removed
+ * from the page, or the whole document replaced).
+ */
+export async function frameSessionByTargetId(
+  tabId: number,
+  targetId: string,
+  waitMs = 1_500,
+): Promise<FrameSession | null> {
+  const deadline = Date.now() + waitMs
+  for (;;) {
+    const hit = frameSessions(tabId).find((f) => f.targetId === targetId)
+    if (hit) return hit
+    if (Date.now() >= deadline) return null
+    await new Promise((resolve) => setTimeout(resolve, 100))
+  }
+}
+
+/**
  * Refuse to attach to a tab whose renderer provably is not running.
  *
  * A discarded tab (Chrome unloaded it to save memory) has no renderer at all,

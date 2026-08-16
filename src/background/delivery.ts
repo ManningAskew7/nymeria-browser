@@ -58,15 +58,17 @@ import {
  * ours is registered later on the same node, so it would be skipped.
  *
  * SCOPE, and why absence needs a second question. The probe covers ONE
- * document, the top one. Events dispatched inside an iframe never reach the
- * top window, and `chrome_act` deliberately targets iframes (the debugger
- * session module notes that payment fields and consent dialogs almost always
- * live in one). A zero count is therefore not by itself proof of anything: it
- * could mean the event was discarded, or that it landed in a frame this probe
- * never watched. `absenceIsConclusive` asks the follow-up, and only a
- * conclusive absence is allowed to fail a command. That ordering matters
- * because a false "no" is no longer cheap: it tells the agent to abandon a
- * working tab, and it has no way to discover the advice is wrong.
+ * document: the one belonging to the SESSION it is armed on. It is armed
+ * where the input goes: the root session for main-document and coordinate
+ * acts, the frame's own session for a frame ref, so an in-frame act gets a
+ * real verdict from inside its frame instead of a permanent "unknown" (the
+ * pre-2026-08-16 shape, which is exactly where the measured silent no-op
+ * hid). Events inside a NESTED browsing context below the probed document
+ * still never reach its window, so a zero count is not by itself proof:
+ * `absenceIsConclusive` asks the follow-up, and only a conclusive absence is
+ * allowed to fail a command. That ordering matters because a false "no" is
+ * not cheap: it tells the agent to abandon a working tab, and it has no way
+ * to discover the advice is wrong.
  */
 
 /** `unknown` means we could not prove either way, and is NOT a failure. */
@@ -74,6 +76,8 @@ export type DeliveryOutcome = 'yes' | 'no' | 'unknown'
 
 export interface DeliveryReading {
   outcome: DeliveryOutcome
+  /** For `unknown` only: why nothing could be proven, payload-ready. */
+  reason?: string
 }
 
 export interface DeliveryProbe {
@@ -102,13 +106,13 @@ const ORPHAN_MS = 60_000
 let nextProbeId = 0
 
 /**
- * Drop a tab's cached world. A committed navigation destroys the isolated
- * world along with the document, so the cached id would resolve to nothing.
- * The creation/caching machinery itself lives in `worlds.ts` (shared with
- * the trust probes' world); this module keeps only its own POLICY.
+ * Drop one session's cached delivery world. A committed navigation destroys
+ * the isolated world along with the document, so the cached id would resolve
+ * to nothing. The creation/caching machinery itself lives in `worlds.ts`
+ * (shared with the trust probes' world); this module keeps only its POLICY.
  */
-export function clearWorld(tabId: number): void {
-  clearWorldEntry(tabId, DELIVERY_WORLD)
+export function clearWorld(target: Cdp): void {
+  clearWorldEntry(target, DELIVERY_WORLD)
 }
 
 /**
@@ -170,7 +174,7 @@ const FRAMELESS_EXPRESSION = `(function(){
 })()`
 
 async function evaluateInWorld<T>(
-  tabId: number,
+  target: Cdp,
   contextId: number,
   expression: string,
 ): Promise<{ ok: true; value: T } | { ok: false; contextGone: boolean }> {
@@ -178,7 +182,7 @@ async function evaluateInWorld<T>(
     const resp = await sendCommand<{
       result?: { value?: T }
       exceptionDetails?: unknown
-    }>(tabId, 'Runtime.evaluate', { expression, contextId, returnByValue: true })
+    }>(target, 'Runtime.evaluate', { expression, contextId, returnByValue: true })
     if (resp.exceptionDetails) return { ok: false, contextGone: false }
     return { ok: true, value: resp.result?.value as T }
   } catch (e) {
@@ -189,7 +193,10 @@ async function evaluateInWorld<T>(
 
 /** A probe that never armed. Reports `unknown`, never `yes`. */
 const UNARMED: DeliveryProbe = {
-  read: async () => ({ outcome: 'unknown' }),
+  read: async () => ({
+    outcome: 'unknown',
+    reason: 'the delivery probe could not be armed in the target document',
+  }),
 }
 
 /**
@@ -206,20 +213,20 @@ const UNARMED: DeliveryProbe = {
  * listener could not: iframes, closed shadow roots, `showPicker()`, and
  * page-deferred clicks. See the #169 pass record.
  */
-export async function armDelivery(tabId: number, types: readonly string[]): Promise<DeliveryProbe> {
-  let contextId = await worldFor(tabId, DELIVERY_WORLD)
+export async function armDelivery(target: Cdp, types: readonly string[]): Promise<DeliveryProbe> {
+  let contextId = await worldFor(target, DELIVERY_WORLD)
   if (contextId === null) return UNARMED
 
   nextProbeId += 1
   const id = `p${nextProbeId}`
   const arm = () => armExpression(types, id)
-  let armed = await evaluateInWorld<boolean>(tabId, contextId, arm())
+  let armed = await evaluateInWorld<boolean>(target, contextId, arm())
   if (!armed.ok && armed.contextGone) {
     // The cached world died with its document. Rebuild once and retry.
-    clearWorld(tabId)
-    contextId = await createWorld(tabId, DELIVERY_WORLD)
+    clearWorld(target)
+    contextId = await createWorld(target, DELIVERY_WORLD)
     if (contextId === null) return UNARMED
-    armed = await evaluateInWorld<boolean>(tabId, contextId, arm())
+    armed = await evaluateInWorld<boolean>(target, contextId, arm())
   }
   if (!armed.ok || armed.value !== true) return UNARMED
 
@@ -227,22 +234,22 @@ export async function armDelivery(tabId: number, types: readonly string[]): Prom
   let spent = false
   return {
     async read(): Promise<DeliveryReading> {
-      if (spent) return { outcome: 'unknown' }
+      if (spent) return { outcome: 'unknown', reason: 'the delivery probe was already read' }
       spent = true
-      const result = await evaluateInWorld<{ n: number } | null>(tabId, world, readExpression(id))
+      const result = await evaluateInWorld<{ n: number } | null>(target, world, readExpression(id))
       if (!result.ok) {
-        // The context was destroyed between arming and reading, which means the
-        // document went away: the action navigated the page. A navigation is
+        // The context was destroyed between arming and reading, which means
+        // the document went away: the action navigated it. A navigation is
         // proof the input landed, so this is delivery, not ignorance.
         if (result.contextGone) {
-          clearWorld(tabId)
+          clearWorld(target)
           return { outcome: 'yes' }
         }
-        return { outcome: 'unknown' }
+        return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
       const value = result.value
       if (!value || typeof value.n !== 'number') {
-        return { outcome: 'unknown' }
+        return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
       return { outcome: value.n > 0 ? 'yes' : 'no' }
     },
@@ -250,43 +257,48 @@ export async function armDelivery(tabId: number, types: readonly string[]): Prom
 }
 
 /**
- * Can a zero count be believed as "the page received nothing"?
+ * Can a zero count be believed as "the document received nothing"?
  *
  * Only asked when the probe already counted zero, so it costs nothing on the
  * ordinary path. Two ways to be sure, in order of cost:
  *
- *  - The document has no frames at all, so there was nowhere else for the
- *    event to go.
- *  - There are frames, but the target element is in the top document, which is
- *    the one the probe was watching.
+ *  - The probed document has no nested frames at all, so there was nowhere
+ *    else for the event to go.
+ *  - There are nested frames, but the target element lives directly in the
+ *    probed document (not in a nested context below it).
  *
- * Anything else (an untargeted action on a framed page, or a target inside an
- * iframe) is genuinely unknown, and must not be reported as a failure: a
- * cross-origin payment field would otherwise fail every click with advice to
- * open a fresh tab, where it would fail again.
+ * `probeTarget` is the session the probe was armed on (root or a frame).
+ * The direct-membership check compares the element's ownerDocument with the
+ * `document` of its own trust world, in ONE world so wrapper identity holds:
+ * the trust world is created on the session's root frame, which is exactly
+ * the document the delivery world watches. This replaces the old
+ * `w === w.top` expression, which could never be true for a frame element
+ * and so silently disabled conclusiveness for every in-frame act.
+ *
+ * Anything else (an untargeted action on a framed page, or a target in a
+ * nested context below the probed document) is genuinely unknown, and must
+ * not be reported as a failure: a nested payment field would otherwise fail
+ * every click with advice to abandon a working tab.
  */
 export async function absenceIsConclusive(
-  tabId: number,
+  probeTarget: Cdp,
   target: { session: Cdp; objectId: string } | null,
 ): Promise<boolean> {
-  const contextId = cachedWorld(tabId, DELIVERY_WORLD)
+  const contextId = cachedWorld(probeTarget, DELIVERY_WORLD)
   if (contextId !== undefined) {
-    const frameless = await evaluateInWorld<boolean>(tabId, contextId, FRAMELESS_EXPRESSION)
+    const frameless = await evaluateInWorld<boolean>(probeTarget, contextId, FRAMELESS_EXPRESSION)
     if (frameless.ok && frameless.value === true) return true
   }
   if (!target) return false
   try {
-    const inTop = await callOn<boolean>(
+    const direct = await callOn<boolean>(
       target.session,
       target.objectId,
       `function(){
-        try {
-          var w = this.ownerDocument && this.ownerDocument.defaultView;
-          return !!w && w === w.top;
-        } catch (e) { return false; }
+        try { return this.ownerDocument === document; } catch (e) { return false; }
       }`,
     )
-    return inTop === true
+    return direct === true
   } catch {
     return false
   }

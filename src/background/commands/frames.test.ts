@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { execAct } from './act'
+import { execSnapshot } from './snapshot'
 import {
   frameSessions,
   installCdpEventRouter,
@@ -134,13 +135,13 @@ describe('frame session discovery', () => {
 describe('frame-scoped refs', () => {
   it('keeps refs with the same backendNodeId in different frames distinct', () => {
     // backendNodeId is a PROCESS-global counter, so the same number really
-    // does occur in two frames. Without the session the second ref would
+    // does occur in two frames. Without the frame id the second ref would
     // resolve to the first frame's element and click the wrong thing.
     setRefs(
       TAB,
       new Map([
         ['e1', { backendNodeId: 42, role: 'button', name: 'Pay' }],
-        ['e2', { backendNodeId: 42, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }],
+        ['e2', { backendNodeId: 42, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }],
       ]),
       TAB_URL,
     )
@@ -148,14 +149,14 @@ describe('frame-scoped refs', () => {
     const main = resolveRef(TAB, '@e1', TAB_URL)
     const framed = resolveRef(TAB, '@e2', TAB_URL)
 
-    expect(main.ok && main.sessionId).toBeUndefined()
-    expect(framed.ok && framed.sessionId).toBe(FRAME_SESSION)
+    expect(main.ok && main.frameTargetId).toBeUndefined()
+    expect(framed.ok && framed.frameTargetId).toBe(FRAME_TARGET)
   })
 
   it('resolves a frame ref through that frame session, not the page session', async () => {
     const cdp = installCdpMock()
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -188,7 +189,7 @@ describe('frame input dispatch', () => {
       iframeRect: { left: 200, top: 300 },
     })
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -224,7 +225,7 @@ describe('frame input dispatch', () => {
     // the ROOT document's focused element. Text never reached the frame.
     const cdp = installCdpMock()
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'textbox', name: 'Card number' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'textbox', name: 'Card number' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: '4242' })
 
@@ -238,7 +239,7 @@ describe('frame input dispatch', () => {
   it('sends type and key events on the frame session', async () => {
     const cdp = installCdpMock()
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'textbox', name: 'Card number' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'textbox', name: 'Card number' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'hi' })
     await execAct({ tab_id: TAB, action: 'key', ref: '@e1', value: 'Enter' })
@@ -269,7 +270,7 @@ describe('frame input dispatch', () => {
       return original(...args)
     })
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -278,6 +279,287 @@ describe('frame input dispatch', () => {
     expect(result.error).toMatch(/own @ref/)
     expect(result.error).not.toMatch(/coordinate=\[/)
     expect((result.data as { click_point?: unknown })?.click_point).toBeUndefined()
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+})
+
+describe('coordinate acts over frames', () => {
+  function overrideForPoint(opts: { ownerAtPoint: boolean }) {
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1]
+      const params = (args[2] ?? {}) as { expression?: string; functionDeclaration?: string }
+      if (method === 'Runtime.evaluate' && params.expression?.includes('elementFromPoint')) {
+        return {
+          result: {
+            value: { description: 'iframe', opensFileChooser: false, frameOwner: true },
+          },
+        }
+      }
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        params.functionDeclaration?.includes('elementFromPoint(x, y) === this')
+      ) {
+        return { result: { value: opts.ownerAtPoint } }
+      }
+      return original(...args)
+    })
+    return send
+  }
+
+  it('a coordinate click aimed into a cross-origin frame refuses before dispatch', async () => {
+    // Bare coordinates ride the root session, measured never to arrive
+    // inside an OOPIF: proceeding is a knowing no-op wearing ok:true.
+    const cdp = installCdpMock()
+    overrideForPoint({ ownerAtPoint: true })
+    await attachFrame()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [150, 250] })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/cross-origin frame/)
+    expect(result.error).toMatch(/@ref/)
+    expect((result.data as { refused?: string }).refused).toBe('cross_origin_frame_coordinate')
+    expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
+  })
+
+  it('a coordinate click on a SAME-PROCESS iframe still dispatches (no session claims it)', async () => {
+    const cdp = installCdpMock()
+    overrideForPoint({ ownerAtPoint: false })
+    await attachFrame()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [150, 250] })
+
+    expect(result.ok).toBe(true)
+    const pressed = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
+    )
+    expect(pressed?.[2]).toMatchObject({ x: 150, y: 250 })
+    expect(pressed?.[0]).toEqual({ tabId: TAB })
+  })
+})
+
+describe('keyboard follows focus across the frame boundary', () => {
+  function overrideFocus(opts: { frameHasFocus: boolean; inner?: { tag: string; label: string } }) {
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as { expression?: string; functionDeclaration?: string }
+      if (method === 'Runtime.evaluate' && params.expression?.includes('activeElement')) {
+        return target.sessionId
+          ? { result: { value: opts.inner ?? null } }
+          : { result: { value: { tag: 'iframe', label: '' } } }
+      }
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        params.functionDeclaration?.includes('document.activeElement === this')
+      ) {
+        return { result: { value: opts.frameHasFocus } }
+      }
+      return original(...args)
+    })
+    return send
+  }
+
+  it("ref-less type dispatches on the frame session when the frame holds the page's focus", async () => {
+    const cdp = installCdpMock()
+    overrideFocus({ frameHasFocus: true })
+    await attachFrame()
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    const keyEvents = cdp.mock.calls.filter((c) => c[1] === 'Input.dispatchKeyEvent')
+    expect(keyEvents.length).toBeGreaterThan(0)
+    for (const call of keyEvents) {
+      expect(call[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    }
+  })
+
+  it('ref-less type stays on the root when no frame holds focus', async () => {
+    const cdp = installCdpMock()
+    overrideFocus({ frameHasFocus: false })
+    await attachFrame()
+
+    await execAct({ tab_id: TAB, action: 'type', value: 'h' })
+
+    const keyEvents = cdp.mock.calls.filter((c) => c[1] === 'Input.dispatchKeyEvent')
+    expect(keyEvents.length).toBeGreaterThan(0)
+    for (const call of keyEvents) {
+      expect(call[0]).toEqual({ tabId: TAB })
+    }
+  })
+
+  it('a ref-less type into a focused frame arms the probe in that frame and verifies delivery', async () => {
+    // The keystrokes and the delivery probe must agree on the document:
+    // routed keys with a root-armed probe would count zero and report
+    // "unknown" forever, the exact shrug this pass removes.
+    installCdpMock()
+    const send = overrideFocus({ frameHasFocus: true })
+    const prev = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1]
+      const params = (args[2] ?? {}) as { expression?: string }
+      if (method === 'Runtime.evaluate' && params.expression) {
+        if (params.expression.includes('addEventListener')) return { result: { value: true } }
+        if (params.expression.includes('__nymDelivery')) return { result: { value: { n: 1 } } }
+      }
+      return prev(...args)
+    })
+    await attachFrame()
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    const arm = send.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression ?? '').includes('addEventListener'),
+    )
+    expect(arm?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+  })
+
+  it("the focused payload descends into the frame instead of stopping at tag 'iframe'", async () => {
+    // Live QA misread `focused: {tag: "iframe"}` twice as a failed click;
+    // the payload now names the frame's own focused element and its frame.
+    installCdpMock()
+    overrideFocus({ frameHasFocus: true, inner: { tag: 'input', label: 'Card number' } })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { focused?: unknown }).focused).toMatchObject({
+      tag: 'input',
+      label: 'Card number',
+      frame_url: 'https://pay.example/card',
+    })
+  })
+})
+
+describe('in-frame delivery verification', () => {
+  /** Extend the base mock with delivery-probe answers for the FRAME session:
+   *  the probe arms in the frame's own world, so in-frame acts get a real
+   *  verdict instead of a permanent "unknown". */
+  function withFrameDelivery(opts: { count: number; frameless: boolean; direct: boolean }) {
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1]
+      const params = (args[2] ?? {}) as { expression?: string; functionDeclaration?: string }
+      if (method === 'Runtime.evaluate' && params.expression) {
+        if (params.expression.includes('addEventListener')) return { result: { value: true } }
+        if (params.expression.includes("querySelectorAll('iframe,frame')")) {
+          return { result: { value: opts.frameless } }
+        }
+        if (params.expression.includes('__nymDelivery')) return { result: { value: { n: opts.count } } }
+      }
+      if (method === 'Runtime.callFunctionOn' && params.functionDeclaration?.includes('ownerDocument === document')) {
+        return { result: { value: opts.direct } }
+      }
+      return original(...args)
+    })
+    return send
+  }
+
+  it("a frame click that arrived reports input_delivered 'yes' from the frame's own probe", async () => {
+    installCdpMock()
+    const send = withFrameDelivery({ count: 1, frameless: true, direct: true })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    // The probe's arm ran in the FRAME's session, not the root's.
+    const arm = send.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression ?? '').includes('addEventListener'),
+    )
+    expect(arm?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+  })
+
+  it('a frame click counted zero with a conclusive absence FAILS instead of shrugging', async () => {
+    // The pre-2026-08-16 shape reported ok:true, input_delivered:"unknown"
+    // for every in-frame act: the exact payload the measured silent no-op
+    // hid behind for three QA rounds.
+    installCdpMock()
+    withFrameDelivery({ count: 0, frameless: true, direct: true })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/received no event/)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('no')
+  })
+
+  it('an inconclusive zero stays unknown and NAMES the nested-frame reason', async () => {
+    installCdpMock()
+    withFrameDelivery({ count: 0, frameless: false, direct: false })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { input_delivered?: string; input_delivered_reason?: string }
+    expect(data.input_delivered).toBe('unknown')
+    expect(data.input_delivered_reason).toMatch(/nested frame/)
+  })
+})
+
+describe('frame refs across the idle detach', () => {
+  it("a held frame ref survives session churn: it re-resolves through the frame's NEW session", async () => {
+    // The debugger detaches from the tab 10s after its last command, killing
+    // every frame session; the next attach re-announces the same frames
+    // under NEW session ids. Session-keyed refs died right here (measured
+    // 2026-08-16 live QA: three consecutive stale reads to land one click);
+    // target-id-keyed refs must ride through and dispatch on the NEW session.
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    cdpEmitter()({ tabId: TAB }, 'Target.detachedFromTarget', { sessionId: FRAME_SESSION })
+    cdpEmitter()({ tabId: TAB }, 'Target.attachedToTarget', {
+      sessionId: 'SESSION-DEF',
+      targetInfo: { targetId: FRAME_TARGET, type: 'iframe', url: 'https://pay.example/card' },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const pressed = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
+    )
+    expect(pressed?.[0]).toEqual({ tabId: TAB, sessionId: 'SESSION-DEF' })
+  })
+
+  it('a frame that never re-announces refuses with the frame-gone story, nothing dispatched', async () => {
+    const cdp = installCdpMock()
+    await attachFrame()
+    setRefs(
+      TAB,
+      new Map([['e1', { backendNodeId: 7, frameTargetId: 'FRAME-TARGET-GONE', role: 'button', name: 'Pay' }]]),
+      TAB_URL,
+    )
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/no longer part of the page/)
+    expect((result.data as { stale_refs?: boolean; reason?: string })).toMatchObject({
+      stale_refs: true,
+      reason: 'frame-gone',
+    })
     expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
   })
 })
@@ -291,7 +573,7 @@ describe('cross-frame drag', () => {
     setRefs(
       TAB,
       new Map([
-        ['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'listitem', name: 'Card' }],
+        ['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'listitem', name: 'Card' }],
         ['e2', { backendNodeId: 8, role: 'list', name: 'Saved cards' }],
       ]),
       TAB_URL,
@@ -311,8 +593,8 @@ describe('cross-frame drag', () => {
     setRefs(
       TAB,
       new Map([
-        ['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'listitem', name: 'Card' }],
-        ['e2', { backendNodeId: 8, sessionId: FRAME_SESSION, role: 'list', name: 'Saved cards' }],
+        ['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'listitem', name: 'Card' }],
+        ['e2', { backendNodeId: 8, frameTargetId: FRAME_TARGET, role: 'list', name: 'Saved cards' }],
       ]),
       TAB_URL,
     )
@@ -334,7 +616,7 @@ describe('frame probe worlds (#160)', () => {
   it("mints a frame ref's handle in that frame session's own world", async () => {
     const cdp = installCdpMock()
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -370,7 +652,7 @@ describe('frame probe worlds (#160)', () => {
       return original(...args)
     })
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -401,7 +683,7 @@ describe('frame probe worlds (#160)', () => {
       return original(...args)
     })
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -427,7 +709,7 @@ describe('frame probe worlds (#160)', () => {
       return original(...args)
     })
     await attachFrame()
-    setRefs(TAB, new Map([['e1', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]), TAB_URL)
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
@@ -463,4 +745,70 @@ describe('frame probe worlds (#160)', () => {
     expect(rootEnables()).toBe(before)
   })
 
+})
+
+describe('scoped read of a frame ref', () => {
+  it("re-roots INSIDE the frame: the tree comes from the frame's session and mints frame-owned refs", async () => {
+    // Backend node ids are process-global, so resolving a frame ref against
+    // the ROOT tree silently matched an unrelated main-document node and a
+    // scoped read of a payment frame returned the top document as if that
+    // were the answer (measured live 2026-08-16, twice).
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      if (args[1] === 'Accessibility.getFullAXTree') {
+        if (target.sessionId !== FRAME_SESSION) return { nodes: [] }
+        return {
+          nodes: [
+            {
+              nodeId: 'n1',
+              backendDOMNodeId: 7,
+              role: { value: 'button' },
+              name: { value: 'Pay' },
+              childIds: [],
+            },
+          ],
+        }
+      }
+      return original(...args)
+    })
+    await attachFrame()
+    setRefs(
+      TAB,
+      new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]),
+      TAB_URL,
+      1,
+    )
+
+    const result = await execSnapshot({ tab_id: TAB, scope_ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    // The one tree read went to the FRAME's session, not the root's.
+    const axReads = cdp.mock.calls.filter((c) => c[1] === 'Accessibility.getFullAXTree')
+    expect(axReads.length).toBeGreaterThan(0)
+    for (const call of axReads) {
+      expect(call[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    }
+    // The refs it minted stay frame-owned, so acting on them dispatches into
+    // the frame rather than resolving root-side.
+    const minted = resolveRef(TAB, '@e2', TAB_URL)
+    expect(minted.ok && minted.frameTargetId).toBe(FRAME_TARGET)
+  })
+
+  it('a scoped read of a frame whose frame is gone refuses honestly', async () => {
+    installCdpMock()
+    setRefs(
+      TAB,
+      new Map([['e1', { backendNodeId: 7, frameTargetId: 'FRAME-GONE', role: 'button', name: 'Pay' }]]),
+      TAB_URL,
+      1,
+    )
+
+    const result = await execSnapshot({ tab_id: TAB, scope_ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/no longer part of the page/)
+  })
 })

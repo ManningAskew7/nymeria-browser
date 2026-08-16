@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from 'vitest'
 import {
   clear,
-  clearSession,
   dropTab,
   fingerprintNameKey,
   nextCounter,
@@ -222,23 +221,26 @@ describe('counter persistence across worker recycles', () => {
   })
 })
 
-describe('per-frame invalidation', () => {
-  it("clearSession drops only that session's refs; top-frame refs survive", () => {
+describe('frame refs across session churn', () => {
+  it('a frame ref keeps resolving by stable frame target id (no session in the store)', () => {
+    // Sessions die on every idle detach; refs deliberately carry the frame's
+    // stable TARGET id instead, and the act layer maps it to the live
+    // session at use time. This pins the store side of that contract.
     set(
       TAB,
       new Map([
         ['e1', { backendNodeId: 100, role: 'button', name: 'Pay' }],
-        ['e2', { backendNodeId: 200, sessionId: 'S-FRAME', role: 'button', name: 'Pay' }],
+        ['e2', { backendNodeId: 200, frameTargetId: 'FRAME-T-1', role: 'button', name: 'Card' }],
       ]),
       URL_A,
       2,
     )
 
-    clearSession(TAB, 'S-FRAME')
-
-    expect(resolve(TAB, '@e1', URL_A)).toMatchObject({ ok: true })
-    const gone = resolve(TAB, '@e2', URL_A)
-    expect(gone.ok).toBe(false)
-    if (!gone.ok) expect(gone.reason).toBe('stale-read')
+    expect(resolve(TAB, '@e1', URL_A)).toMatchObject({ ok: true, frameTargetId: undefined })
+    expect(resolve(TAB, '@e2', URL_A)).toMatchObject({
+      ok: true,
+      backendNodeId: 200,
+      frameTargetId: 'FRAME-T-1',
+    })
   })
 })

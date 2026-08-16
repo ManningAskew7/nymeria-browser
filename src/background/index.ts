@@ -7,7 +7,7 @@ import { activeTabs as activeDebuggerTabs } from './debuggerSession'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { clearTabWorlds } from './worlds'
 import { clear as clearRefs, dropTab as dropTabRefs } from './snapshotRefs'
-import { installRefInvalidation } from './refInvalidation'
+import { installFrameTeardown } from './frameTeardown'
 import { installCdpConsoleCapture } from './consoleBuffer'
 import { clearTabNav, installNavWatch } from './navWatch'
 import { clearTabStatus, installStatusWatch } from './statusWatch'
@@ -52,16 +52,15 @@ installNavWatch()
 installStatusWatch()
 
 // A committed TOP-FRAME navigation invalidates the tab's refs, and destroys
-// every isolated world cached for the tab (the delivery probe's and the trust
-// probes', frame worlds included: subframe documents die with the top one).
-// A SUBFRAME commit deliberately does neither here: the delivery world is
-// top-frame-only so it survives by construction, and per-frame ref
-// invalidation rides Target.detachedFromTarget (refInvalidation.ts; an OOPIF
-// navigating cross-process detaches its old session), with the act-time
-// detached and
-// fingerprint checks covering the in-process remainder. Network history is
-// kept deliberately: the requests a navigation itself fired are often the
-// answer to "why did that go wrong".
+// every isolated world cached for the tab (the delivery probes' and the
+// trust probes', frame worlds included: subframe documents die with the top
+// one). A SUBFRAME commit deliberately does neither here: per-frame WORLD
+// teardown rides Target.detachedFromTarget (frameTeardown.ts), frame refs
+// key on the frame's stable target id and survive session churn by design
+// (snapshotRefs docstring), and the act-time detached and fingerprint
+// checks cover the in-process remainder. Network history is kept
+// deliberately: the requests a navigation itself fired are often the answer
+// to "why did that go wrong".
 chrome.webNavigation?.onCommitted.addListener?.((details) => {
   if (details.frameId !== 0) return
   clearRefs(details.tabId)
@@ -82,9 +81,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   clearTabNav(tabId)
 })
 
-// Per-frame ref and world invalidation (Target.detachedFromTarget); the
-// module docstring carries the rationale.
-installRefInvalidation()
+// Per-frame world teardown (Target.detachedFromTarget); the module
+// docstring carries the rationale, including why refs deliberately survive.
+installFrameTeardown()
 
 async function bootstrap(): Promise<void> {
   logger.log('bootstrap')

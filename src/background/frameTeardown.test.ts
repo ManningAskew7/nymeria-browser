@@ -4,7 +4,7 @@ import {
   resetForTests as resetDebugger,
   sendCommand,
 } from './debuggerSession'
-import { installRefInvalidation, resetForTests as resetRefInvalidation } from './refInvalidation'
+import { installFrameTeardown, resetForTests as resetFrameTeardown } from './frameTeardown'
 import { resetForTests as resetRefs, resolve, set as setRefs } from './snapshotRefs'
 import {
   cachedWorld,
@@ -14,16 +14,18 @@ import {
 } from './worlds'
 
 /**
- * The per-frame invalidation wiring (#160 behavior 11): a frame session
- * detaching (its OOPIF navigated cross-process or left the page) must kill
- * BOTH that frame's refs and its cached probe world, while the top frame's
- * survive. Tested against the real CDP event router, the way the worker
- * receives the event.
+ * Frame-session teardown wiring: a detach kills that session's cached
+ * WORLDS (context ids are per-session and can never answer again) while
+ * refs deliberately SURVIVE (they key on the frame's stable target id, not
+ * the ephemeral session; the 10s idle detach would otherwise kill every
+ * frame ref between two tool calls, measured 2026-08-16). Tested against
+ * the real CDP event router, the way the worker receives the event.
  */
 
 const TAB = 1
 const TAB_URL = 'https://example.com'
 const FRAME_SESSION = 'SESSION-ABC'
+const FRAME_TARGET = 'FRAME-TARGET-1'
 
 type CdpListener = (source: { tabId: number }, method: string, params: unknown) => void
 
@@ -54,19 +56,19 @@ beforeEach(() => {
   resetRefs()
   resetWorlds()
   resetDebugger()
-  resetRefInvalidation()
-  installRefInvalidation()
+  resetFrameTeardown()
+  installFrameTeardown()
 })
 
-describe('per-frame ref and world invalidation', () => {
-  it("a frame detach drops that session's refs and world; the top frame keeps both", async () => {
+describe('per-frame world teardown', () => {
+  it("a frame detach drops that session's world; refs and the top frame survive", async () => {
     installCdpMock()
     await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
     setRefs(
       TAB,
       new Map([
         ['e1', { backendNodeId: 100, role: 'button', name: 'Pay' }],
-        ['e2', { backendNodeId: 7, sessionId: FRAME_SESSION, role: 'button', name: 'Card' }],
+        ['e2', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Card' }],
       ]),
       TAB_URL,
       2,
@@ -77,12 +79,16 @@ describe('per-frame ref and world invalidation', () => {
 
     cdpEmitter()({ tabId: TAB }, 'Target.detachedFromTarget', { sessionId: FRAME_SESSION })
 
-    const framed = resolve(TAB, '@e2', TAB_URL)
-    expect(framed.ok).toBe(false)
-    if (!framed.ok) expect(framed.reason).toBe('stale-read')
+    // The world is gone with its session...
     expect(cachedWorld({ tabId: TAB, sessionId: FRAME_SESSION }, PROBE_WORLD)).toBeUndefined()
-    // The top frame is untouched: whole-map clearing here would make
-    // ad-heavy pages unusable, their iframes churn constantly.
+    // ...but the frame ref still RESOLVES: sessions churn on the idle
+    // detach, and killing refs with them cost multiple re-reads per round.
+    // Whether the frame is still live is the act layer's question.
+    expect(resolve(TAB, '@e2', TAB_URL)).toMatchObject({
+      ok: true,
+      backendNodeId: 7,
+      frameTargetId: FRAME_TARGET,
+    })
     expect(resolve(TAB, '@e1', TAB_URL)).toMatchObject({ ok: true, backendNodeId: 100 })
     expect(cachedWorld(TAB, PROBE_WORLD)).toBe(88)
   })
@@ -90,32 +96,20 @@ describe('per-frame ref and world invalidation', () => {
   it('a detach event without a sessionId clears nothing', async () => {
     installCdpMock()
     await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
-    setRefs(
-      TAB,
-      new Map([['e1', { backendNodeId: 100, role: 'button', name: 'Pay' }]]),
-      TAB_URL,
-      1,
-    )
     await worldFor(TAB, PROBE_WORLD)
 
     cdpEmitter()({ tabId: TAB }, 'Target.detachedFromTarget', {})
 
-    expect(resolve(TAB, '@e1', TAB_URL)).toMatchObject({ ok: true })
     expect(cachedWorld(TAB, PROBE_WORLD)).toBe(88)
   })
 
-  it('other CDP events pass through without touching refs', async () => {
+  it('other CDP events pass through without touching worlds', async () => {
     installCdpMock()
     await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
-    setRefs(
-      TAB,
-      new Map([['e1', { backendNodeId: 100, sessionId: FRAME_SESSION, role: 'button', name: 'Pay' }]]),
-      TAB_URL,
-      1,
-    )
+    await worldFor({ tabId: TAB, sessionId: FRAME_SESSION }, PROBE_WORLD)
 
     cdpEmitter()({ tabId: TAB }, 'Page.frameNavigated', { sessionId: FRAME_SESSION })
 
-    expect(resolve(TAB, '@e1', TAB_URL)).toMatchObject({ ok: true })
+    expect(cachedWorld({ tabId: TAB, sessionId: FRAME_SESSION }, PROBE_WORLD)).toBe(99)
   })
 })

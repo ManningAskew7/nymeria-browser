@@ -1,5 +1,5 @@
 import type { CommandResult } from '../../shared/types'
-import { frameSessions, sendCommand, type Cdp } from '../debuggerSession'
+import { frameSessionByTargetId, frameSessions, sendCommand, type Cdp } from '../debuggerSession'
 import { withProbeWorld } from '../worlds'
 import {
   nextCounter,
@@ -144,7 +144,7 @@ function formatTree(
   nodes: AXNode[],
   rootIds: string[],
   detail: 'interactive' | 'full' | 'minimal',
-  opts: { sessionId?: string; startCounter?: number } = {},
+  opts: { frameTargetId?: string; startCounter?: number } = {},
 ): FormattedSnapshot {
   const byId = new Map<string, AXNode>(nodes.map((n) => [n.nodeId, n]))
   const refs = new Map<string, RefTarget>()
@@ -164,16 +164,18 @@ function formatTree(
       if (isInteractive(node) && typeof node.backendDOMNodeId === 'number') {
         refCounter += 1
         const refId = `e${refCounter}`
-        // The session is stored with the id: backendNodeId is process-global,
-        // so the same number means different elements in different frames.
-        // Role and name ride along as the mint-time FINGERPRINT: act
-        // re-reads the same browser-computed pair before dispatching input,
-        // so a live node whose meaning changed since this read refuses
-        // instead of firing. The shared normalizer keeps mint and check from
-        // drifting apart, which would refuse every fingerprinted verb.
+        // The owning FRAME rides along as its stable target id (never the
+        // ephemeral session id, which dies on every idle detach):
+        // backendNodeId is process-global, so the same number means
+        // different elements in different frames. Role and name ride along
+        // as the mint-time FINGERPRINT: act re-reads the same
+        // browser-computed pair before dispatching input, so a live node
+        // whose meaning changed since this read refuses instead of firing.
+        // The shared normalizer keeps mint and check from drifting apart,
+        // which would refuse every fingerprinted verb.
         refs.set(refId, {
           backendNodeId: node.backendDOMNodeId,
-          sessionId: opts.sessionId,
+          frameTargetId: opts.frameTargetId,
           role,
           name: normalizeAxName(strVal(node.name)),
         })
@@ -210,12 +212,17 @@ async function resolveScopeNode(
   tabId: number,
   scopeRef?: string,
   scopeSelector?: string,
-): Promise<{ backendNodeId: number | null; error?: string }> {
+): Promise<{ backendNodeId: number | null; frameTargetId?: string; error?: string }> {
   if (scopeRef) {
     const tab = await chrome.tabs.get(tabId).catch(() => null)
     const resolution = resolveRef(tabId, scopeRef, tab?.url ?? null)
     if (!resolution.ok) return { backendNodeId: null, error: resolution.detail }
-    return { backendNodeId: resolution.backendNodeId }
+    // The frame rides along: a frame ref's backendNodeId only means anything
+    // in ITS frame's tree. Resolving it against the root tree silently
+    // matched an unrelated main-document node (backend node ids are
+    // process-global), so a scoped read of a payment frame returned the top
+    // document as if that were the answer (measured live 2026-08-16).
+    return { backendNodeId: resolution.backendNodeId, frameTargetId: resolution.frameTargetId }
   }
   // Probe world (#160): the selector picks the read ROOT, so a main-world
   // `querySelector` override could steer what the model believes the page
@@ -262,13 +269,33 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   // matched something and then returned the whole page anyway, which quietly
   // made every scoped read a full read.
   let scopeNodeId: number | null = null
+  let scopeFrameTargetId: string | undefined
   if (a.scope_ref || a.scope_selector) {
     const scoped = await resolveScopeNode(a.tab_id, a.scope_ref, a.scope_selector)
     if (scoped.error) return { ok: false, status: 'error', error: scoped.error }
     scopeNodeId = scoped.backendNodeId
+    scopeFrameTargetId = scoped.frameTargetId
   }
 
-  const nodes = await treeFor(a.tab_id)
+  // A scope ref inside a cross-origin frame re-roots INSIDE that frame: the
+  // tree is read from the frame's own live session and the minted refs stay
+  // frame-owned.
+  let treeTarget: Cdp = a.tab_id
+  if (scopeFrameTargetId) {
+    const live = await frameSessionByTargetId(a.tab_id, scopeFrameTargetId)
+    if (!live) {
+      return {
+        ok: false,
+        status: 'error',
+        error:
+          'the frame that scope ref lives in is no longer part of the page (it ' +
+          'navigated away or was removed). Re-read the page for current refs.',
+      }
+    }
+    treeTarget = { tabId: a.tab_id, sessionId: live.sessionId }
+  }
+
+  const nodes = await treeFor(treeTarget)
   let rootIds = rootsOf(nodes)
 
   if (scopeNodeId != null) {
@@ -291,7 +318,10 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   // the caller is still holding.
   return withMintLock(a.tab_id, async () => {
     const start = await nextCounter(a.tab_id)
-    const main = formatTree(nodes, rootIds, detail, { startCounter: start })
+    const main = formatTree(nodes, rootIds, detail, {
+      startCounter: start,
+      frameTargetId: scopeFrameTargetId,
+    })
     const allRefs = new Map<string, RefTarget>(main.refs)
     const sections = [main.text]
     let counter = main.nextCounter
@@ -306,7 +336,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
           const frameNodes = await treeFor({ tabId: a.tab_id, sessionId: frame.sessionId })
           if (!frameNodes.length) continue
           const formatted = formatTree(frameNodes, rootsOf(frameNodes), detail, {
-            sessionId: frame.sessionId,
+            frameTargetId: frame.targetId,
             startCounter: counter,
           })
           if (!formatted.text.trim()) continue

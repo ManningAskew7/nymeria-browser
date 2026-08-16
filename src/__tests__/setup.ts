@@ -77,7 +77,11 @@ interface MockChrome {
     onEvent: { addListener: ReturnType<typeof vi.fn> }
     onDetach: { addListener: ReturnType<typeof vi.fn> }
   }
-  windows: { update: ReturnType<typeof vi.fn> }
+  windows: {
+    update: ReturnType<typeof vi.fn>
+    getAll: ReturnType<typeof vi.fn>
+    getLastFocused: ReturnType<typeof vi.fn>
+  }
   webNavigation?: {
     onCommitted: { addListener: ReturnType<typeof vi.fn> }
     onBeforeNavigate: { addListener: ReturnType<typeof vi.fn> }
@@ -161,7 +165,12 @@ function makeMockChrome(): MockChrome {
       onEvent: { addListener: vi.fn() },
       onDetach: { addListener: vi.fn() },
     },
-    windows: { update: vi.fn(async () => undefined) },
+    windows: {
+      update: vi.fn(async () => undefined),
+      // Default: one window, focused. Multi-window placement tests override.
+      getAll: vi.fn(async () => [{ id: 100, focused: true, type: 'normal' }]),
+      getLastFocused: vi.fn(async () => ({ id: 100, focused: true, type: 'normal' })),
+    },
     webNavigation: {
       onCommitted: { addListener: vi.fn() },
       onBeforeNavigate: { addListener: vi.fn() },

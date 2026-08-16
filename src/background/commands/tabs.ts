@@ -23,6 +23,31 @@ interface TabsArgs {
  * says `complete: false` rather than pretending when it could not get one.
  */
 
+/**
+ * Which window a driven tab opens in: another normal window when one exists,
+ * the user's current one only as the fallback.
+ *
+ * Creating in the last-focused window rips the user's view away mid-task
+ * (measured 2026-08-16: the operator was watching a stream in the focused
+ * window and every driven tab landed on top of it). A second window is the
+ * natural "agent workspace": the tab is created active WITHIN it, so it
+ * keeps rendering and compositing, but the window itself is not focused, so
+ * nothing is stolen from the user. With a single window (or the query
+ * failing) the old behavior stands: there is nowhere politer to go.
+ */
+async function drivenWindowId(): Promise<number | undefined> {
+  try {
+    const [wins, last] = await Promise.all([
+      chrome.windows.getAll({ windowTypes: ['normal'] }),
+      chrome.windows.getLastFocused().catch(() => null),
+    ])
+    const other = wins.find((w) => typeof w.id === 'number' && w.id !== last?.id)
+    return other?.id
+  } catch {
+    return undefined
+  }
+}
+
 function describe(tab: chrome.tabs.Tab) {
   return {
     id: tab.id,
@@ -45,7 +70,11 @@ export async function execTabs(args: unknown): Promise<CommandResult> {
     case 'create': {
       if (!a.url) return { ok: false, status: 'error', error: 'create requires url' }
       const t0 = Date.now()
-      const tab = await chrome.tabs.create({ url: a.url })
+      const windowId = await drivenWindowId()
+      const tab = await chrome.tabs.create({
+        url: a.url,
+        ...(windowId === undefined ? {} : { windowId }),
+      })
       if (typeof tab.id !== 'number') {
         // No id means nothing downstream can address this tab, and a success
         // payload silently missing `complete` is worse than saying so.

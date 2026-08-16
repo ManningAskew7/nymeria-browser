@@ -20,10 +20,16 @@
  * full-page map wholesale. A different URL replaces outright.
  *
  * Refs are invalidated by navigation (committed top-frame navigation hooks
- * in background/index.ts), by their frame session detaching (an OOPIF that
- * navigated cross-process; also index.ts), by tab close, and by the
- * recorded URL no longer matching the tab's current URL, the backstop for
- * the cases the hooks miss.
+ * in background/index.ts), by tab close, and by the recorded URL no longer
+ * matching the tab's current URL, the backstop for the cases the hooks
+ * miss. A frame SESSION detaching deliberately does NOT invalidate refs:
+ * the debugger detaches from the whole tab after a 10s idle linger, taking
+ * every frame session with it, and session-keyed frame refs therefore died
+ * between one tool call and the agent's next thought (measured 2026-08-16
+ * live QA: three consecutive stale reads to land one click). Frame refs
+ * key on the frame's STABLE target id instead and are resolved to the live
+ * session at act time; a frame that truly left the page simply never
+ * re-announces, which the act layer reports honestly.
  *
  * Callers never get a bare `null` back: `resolve` returns a typed reason so
  * the agent is told to re-read the page instead of being left to guess why a
@@ -60,8 +66,19 @@ export function fingerprintNameKey(name: string): string {
  *
  * `backendNodeId` is a PROCESS-global counter, not a page-global one, so the
  * same number identifies different elements in the main document and in a
- * cross-origin iframe. Storing the owning session alongside it is what stops
+ * cross-origin iframe. Storing the owning frame alongside it is what stops
  * an iframe ref from silently resolving to an unrelated main-frame element.
+ *
+ * The frame is identified by its TARGET id (== its `Page.FrameId`), never by
+ * the debugger session id. Sessions are ephemeral: the tab detaches 10s
+ * after its last command and every frame session dies with it, coming back
+ * under NEW ids on the next attach, while the target id stays stable for the
+ * frame element's lifetime. Session-keyed refs died whenever the agent
+ * thought for longer than the linger between two commands, which live QA
+ * measured as multiple forced re-reads per round (2026-08-16). The act layer
+ * maps target id to the CURRENT session at use time
+ * (`frameSessionByTargetId`); a frame that no longer exists maps to nothing
+ * and refuses honestly there.
  *
  * `role`/`name` are the accessibility pair the ref was minted from: the
  * fingerprint act re-checks before dispatching input, so a live node whose
@@ -70,8 +87,9 @@ export function fingerprintNameKey(name: string): string {
  */
 export interface RefTarget {
   backendNodeId: number
-  /** Undefined means the root page session. */
-  sessionId?: string
+  /** Stable target id of the owning cross-origin frame; undefined means the
+   *  root page session. */
+  frameTargetId?: string
   /** AX role at mint time ("button"). Empty string skips the role compare. */
   role: string
   /** Normalized AX name at mint time (normalizeAxName). Empty string skips
@@ -85,10 +103,10 @@ interface TabRefs {
   urlAtSnapshot: string | null
 }
 
-export type StaleReason = 'no-snapshot' | 'unknown-ref' | 'navigated' | 'stale-read'
+export type StaleReason = 'no-snapshot' | 'unknown-ref' | 'navigated' | 'stale-read' | 'frame-gone'
 
 export type RefResolution =
-  | { ok: true; backendNodeId: number; sessionId?: string; role: string; name: string }
+  | { ok: true; backendNodeId: number; frameTargetId?: string; role: string; name: string }
   | { ok: false; reason: StaleReason; detail: string }
 
 const cache = new Map<number, TabRefs>()
@@ -218,9 +236,8 @@ export function resolve(tabId: number, target: string, currentUrl?: string | nul
         ok: false,
         reason: 'stale-read',
         detail:
-          `ref @${ref} is from before the last navigation (or from a frame that has ` +
-          'since gone away); its element no longer exists here. Re-read the page and ' +
-          'use a fresh ref',
+          `ref @${ref} is from before the last navigation; its element no longer ` +
+          'exists here. Re-read the page and use a fresh ref',
       }
     }
     return {
@@ -232,7 +249,7 @@ export function resolve(tabId: number, target: string, currentUrl?: string | nul
   return {
     ok: true,
     backendNodeId: refTarget.backendNodeId,
-    sessionId: refTarget.sessionId,
+    frameTargetId: refTarget.frameTargetId,
     role: refTarget.role,
     name: refTarget.name,
   }
@@ -242,16 +259,6 @@ export function resolve(tabId: number, target: string, currentUrl?: string | nul
  *  what keeps a post-navigation read from re-minting held numbers. */
 export function clear(tabId: number): void {
   cache.delete(tabId)
-}
-
-/** Drop refs belonging to one frame session (its target detached: the OOPIF
- *  navigated cross-process or was removed). Top-frame refs stay valid. */
-export function clearSession(tabId: number, sessionId: string): void {
-  const entry = cache.get(tabId)
-  if (!entry) return
-  for (const [ref, target] of Array.from(entry.byRef)) {
-    if (target.sessionId === sessionId) entry.byRef.delete(ref)
-  }
 }
 
 /** Tab closed: everything goes, counter included (tab ids are not reused

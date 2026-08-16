@@ -1,6 +1,13 @@
 import type { CommandResult } from '../../shared/types'
 import { readSince as consoleSince } from '../consoleBuffer'
-import { CdpCallTimeout, sendCommand, TabUnusable, type Cdp } from '../debuggerSession'
+import {
+  CdpCallTimeout,
+  frameSessionByTargetId,
+  frameSessions,
+  sendCommand,
+  TabUnusable,
+  type Cdp,
+} from '../debuggerSession'
 import { absenceIsConclusive, armDelivery, type DeliveryOutcome } from '../delivery'
 import {
   budgetLabel,
@@ -467,6 +474,11 @@ interface PointTarget {
   /** Human-readable: `button "Sign in"`, or just `body`. */
   description: string
   opensFileChooser: boolean
+  /** The point stopped at an `<iframe>`/`<frame>` element: the root document
+   *  cannot see inside it, and if it is CROSS-ORIGIN the coordinate act can
+   *  never reach it either (root-session input was measured never to arrive
+   *  there, 2026-08-15). */
+  frameOwner: boolean
 }
 
 /**
@@ -507,10 +519,64 @@ async function describePoint(tabId: number, point: Point | null): Promise<PointT
       if (!el) return null;
       const opens = (function(){ ${OPENS_FILE_CHOOSER} }).call(el) === true;
       const description = (function(){ ${DESCRIBE_ELEMENT} }).call(el);
-      return { description: String(description || 'unknown'), opensFileChooser: opens };
+      const frameOwner = /^(iframe|frame)$/i.test(el.tagName || '');
+      return { description: String(description || 'unknown'), opensFileChooser: opens, frameOwner: frameOwner };
     })()`,
   )
   return value ?? null
+}
+
+/**
+ * Which ATTACHED cross-origin frame satisfies `ownerPredicate` about its
+ * `<iframe>` owner element in the ROOT document, or null (a frame owner that
+ * matches no attached session is same-process, whose input still rides the
+ * root). Owner handles are minted in the root PROBE world, so a page cannot
+ * forge the answer that gates a refusal. `ownerPredicate` receives the extra
+ * args after the owner element as `this`.
+ */
+async function matchFrameOwner(
+  tabId: number,
+  ownerPredicate: string,
+  args: unknown[] = [],
+): Promise<{ sessionId: string; targetId: string; url: string } | null> {
+  for (const frame of frameSessions(tabId)) {
+    try {
+      const owner = await sendCommand<{ backendNodeId?: number }>(tabId, 'DOM.getFrameOwner', {
+        frameId: frame.targetId,
+      })
+      if (!owner.backendNodeId) continue
+      const resolved = await resolveNodeInProbeWorld(tabId, owner.backendNodeId)
+      if (!resolved.ok) continue
+      const hit = await callOn<boolean>(tabId, resolved.objectId, ownerPredicate, args)
+      if (hit === true) return frame
+    } catch {
+      // One unanswerable frame must not veto the others.
+    }
+  }
+  return null
+}
+
+/** Does a ROOT-document point land on this frame's owner element? */
+const OWNER_AT_POINT_FN = 'function(x, y){ return document.elementFromPoint(x, y) === this; }'
+
+/** Does the ROOT document's focus rest on this frame's owner element? */
+const OWNER_HAS_FOCUS_FN = 'function(){ return document.activeElement === this; }'
+
+/**
+ * A coordinate act aimed into a cross-origin frame: refused BEFORE dispatch.
+ * Bare coordinates ride the root session, which was measured (2026-08-15,
+ * twice, eyewitness-confirmed) never to deliver into an out-of-process
+ * frame, so proceeding would be a knowing no-op wearing a trusted success.
+ * The working route always exists: the frame's contents have their own refs.
+ */
+function crossOriginFrameCoordinateError(action: ActionName, frameUrl: string): string {
+  return (
+    `the ${action} coordinate lands inside a cross-origin frame (${frameUrl}), ` +
+    'which receives its own input separately from the page around it: a bare ' +
+    'coordinate cannot reach it and the event would silently vanish. Nothing ' +
+    'was dispatched. Read the page and use the element\'s @ref instead (the ' +
+    "frame's contents appear as their own labelled section with refs)."
+  )
 }
 
 /**
@@ -947,7 +1013,8 @@ type TargetResolution =
       ok: true
       objectId: string
       session: Cdp
-      sessionId?: string
+      /** Stable target id of the owning cross-origin frame (refs only). */
+      frameTargetId?: string
       backendNodeId?: number
       mintRole?: string
       mintName?: string
@@ -990,9 +1057,24 @@ async function resolveTarget(
     if (!resolution.ok) {
       return { ok: false, error: resolution.detail, stale: resolution.reason }
     }
-    const session: Cdp = resolution.sessionId
-      ? { tabId, sessionId: resolution.sessionId }
-      : tabId
+    // A frame ref names its frame by STABLE target id; the ephemeral session
+    // is looked up here, at use time, because the idle detach kills sessions
+    // between commands while the frame (and the ref) live on. A frame that
+    // never re-announces within the wait is genuinely gone.
+    let session: Cdp = tabId
+    if (resolution.frameTargetId) {
+      const live = await frameSessionByTargetId(tabId, resolution.frameTargetId)
+      if (!live) {
+        return {
+          ok: false,
+          error:
+            `the frame that ${target} lives in is no longer part of the page ` +
+            '(it navigated away or was removed). Re-read the page for current refs.',
+          stale: 'frame-gone',
+        }
+      }
+      session = { tabId, sessionId: live.sessionId }
+    }
     try {
       const resolved = await resolveNodeInProbeWorld(session, resolution.backendNodeId)
       if (!resolved.ok) {
@@ -1003,7 +1085,7 @@ async function resolveTarget(
         // Naming the frame case matters (2026-08-15 QA): a persistent frame
         // failure read as "mid-navigation" gets dismissed as transient.
         if (resolved.reason === 'no-world') {
-          const what = resolution.sessionId
+          const what = resolution.frameTargetId
             ? 'resolving the element inside its cross-origin frame'
             : 'resolving the element'
           return { ok: false, error: probeWorldUnavailableError(what) }
@@ -1018,7 +1100,7 @@ async function resolveTarget(
         ok: true,
         objectId: resolved.objectId,
         session,
-        sessionId: resolution.sessionId,
+        frameTargetId: resolution.frameTargetId,
         backendNodeId: resolution.backendNodeId,
         mintRole: resolution.role,
         mintName: resolution.name,
@@ -1068,28 +1150,57 @@ async function resolveTarget(
 interface FocusedDescription {
   tag: string
   label: string
+  /** Set when focus rests on a cross-origin frame: the description above is
+   *  then the FRAME'S OWN focused element, read through its session, and
+   *  this names which frame. Without the descent the payload stopped at
+   *  `tag: "iframe"`, which live QA misread twice as a failed click. */
+  frame_url?: string
 }
+
+const DESCRIBE_FOCUSED_EXPRESSION = `(function(){
+  const el = document.activeElement;
+  if (!el || el === document.body || el === document.documentElement) return null;
+  const raw = el.getAttribute('aria-label') || el.getAttribute('name')
+    || el.getAttribute('placeholder') || (el.innerText || '');
+  return { tag: el.tagName.toLowerCase(), label: String(raw || '').trim().slice(0, 60) };
+})()`
 
 async function describeFocused(tabId: number): Promise<FocusedDescription | null> {
   try {
     const resp = await sendCommand<{ result?: { value?: FocusedDescription | null } }>(
       tabId,
       'Runtime.evaluate',
-      {
-        expression: `(function(){
-          const el = document.activeElement;
-          if (!el || el === document.body || el === document.documentElement) return null;
-          const raw = el.getAttribute('aria-label') || el.getAttribute('name')
-            || el.getAttribute('placeholder') || (el.innerText || '');
-          return { tag: el.tagName.toLowerCase(), label: String(raw || '').trim().slice(0, 60) };
-        })()`,
-        returnByValue: true,
-      },
+      { expression: DESCRIBE_FOCUSED_EXPRESSION, returnByValue: true },
     )
-    return resp.result?.value ?? null
+    const top = resp.result?.value ?? null
+    if (!top || (top.tag !== 'iframe' && top.tag !== 'frame')) return top
+    // Focus rests on a frame owner: descend ONE level when it is an attached
+    // cross-origin frame, so the payload names the element that actually
+    // holds focus instead of the wall in front of it.
+    const frame = await matchFrameOwner(tabId, OWNER_HAS_FOCUS_FN)
+    if (!frame) return top
+    const inner = await sendCommand<{ result?: { value?: FocusedDescription | null } }>(
+      { tabId, sessionId: frame.sessionId },
+      'Runtime.evaluate',
+      { expression: DESCRIBE_FOCUSED_EXPRESSION, returnByValue: true },
+    )
+    const innerValue = inner.result?.value
+    return innerValue
+      ? { ...innerValue, frame_url: frame.url }
+      : { ...top, frame_url: frame.url }
   } catch {
     return null
   }
+}
+
+/** Where ref-less keystrokes go: the frame holding focus, else the root.
+ *  Keyboard input has no coordinates; what it has is a focused element, and
+ *  when that element lives in a cross-origin frame, root-session key events
+ *  never arrive (the measured wall). Following focus keeps the "type
+ *  continues at the caret" contract across the frame boundary. */
+async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
+  const frame = await matchFrameOwner(tabId, OWNER_HAS_FOCUS_FN)
+  return frame ? { tabId, sessionId: frame.sessionId } : tabId
 }
 
 async function stillConnected(session: Cdp, objectId: string | null): Promise<boolean | null> {
@@ -1440,7 +1551,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // Default addressee is the root page session; a ref inside a cross-origin
   // frame swaps this for that frame's session.
   let elementSession: Cdp = tabId
-  let elementSessionId: string | undefined
+  let elementFrameTargetId: string | undefined
   /** What a bare coordinate landed on, for the verification payload. */
   let pointTarget: PointTarget | null = null
   if (NEEDS_TARGET.has(a.action) || (OPTIONAL_TARGET.has(a.action) && target)) {
@@ -1487,7 +1598,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       }
       objectId = resolution.objectId
       elementSession = resolution.session
-      elementSessionId = resolution.sessionId
+      elementFrameTargetId = resolution.frameTargetId
     }
 
     // Checked HERE rather than inside the click case, so it covers every verb
@@ -1502,6 +1613,42 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     // information, and it is the same call either way.
     if (!objectId && ACCEPTS_COORDINATE.has(a.action)) {
       pointTarget = await describePoint(tabId, explicitPoint)
+    }
+
+    // A coordinate whose point stops at a frame owner: if that frame is an
+    // attached CROSS-ORIGIN one, the trusted pointer verbs refuse before
+    // dispatch (known no-op, see crossOriginFrameCoordinateError). A frame
+    // owner matching no attached session is same-process and proceeds as
+    // always; scroll stays exempt (its miss is a visible root-scroll, not a
+    // silent nothing).
+    if (
+      !objectId &&
+      explicitPoint &&
+      pointTarget?.frameOwner &&
+      (a.action === 'click' ||
+        a.action === 'double_click' ||
+        a.action === 'right_click' ||
+        a.action === 'hover' ||
+        a.action === 'drag')
+    ) {
+      const frame = await matchFrameOwner(tabId, OWNER_AT_POINT_FN, [
+        Math.round(explicitPoint.x),
+        Math.round(explicitPoint.y),
+      ])
+      if (frame) {
+        return {
+          ok: false,
+          status: 'error',
+          error: crossOriginFrameCoordinateError(a.action, frame.url),
+          data: {
+            action: a.action,
+            refused: 'cross_origin_frame_coordinate',
+            hit: pointTarget.description,
+            frame_url: frame.url,
+            input: 'none',
+          },
+        }
+      }
     }
 
     if (ACTIVATES_TARGET.has(a.action)) {
@@ -1572,7 +1719,22 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // gone: `Page.fileChooserOpened` + interception cover every route it could
   // see and the ones it could not; see `fileChooserInterceptedError`.)
   const probeTypes = PROBE_EVENTS[a.action]
-  const probe = probeTypes ? await armDelivery(tabId, probeTypes) : null
+  // Ref-less keystrokes follow the page's FOCUS, including into a
+  // cross-origin frame (keyboardSessionForFocus in the type/key cases).
+  // Resolved here, before the probe arms, so the probe watches the same
+  // document the keys actually enter; armed at the root, an in-frame
+  // ref-less type would count zero and shrug "unknown" forever.
+  const keyboardSession: Cdp | null =
+    !objectId && (a.action === 'type' || a.action === 'key')
+      ? await keyboardSessionForFocus(tabId)
+      : null
+  // Armed on the session the input will ride: the frame's own for a frame
+  // ref, the focused frame's for ref-less keystrokes, the root otherwise.
+  // Arming the root for an in-frame act was the pre-2026-08-16 shape, and
+  // it made every in-frame verdict a permanent "unknown": the exact blind
+  // spot the measured silent no-op hid behind.
+  const probeTarget: Cdp = objectId ? elementSession : keyboardSession ?? tabId
+  const probe = probeTypes ? await armDelivery(probeTarget, probeTypes) : null
 
   try {
     switch (a.action) {
@@ -1605,14 +1767,14 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                     a.action,
                     target,
                     ht.blocker,
-                    elementSessionId ? null : geo.point,
+                    elementFrameTargetId ? null : geo.point,
                   ),
                   data: {
                     intercepted_by: ht.blocker ?? null,
                     // A frame-local coordinate is useless to the agent (bare
                     // coordinates are root-space), so a frame target gets no
                     // click_point rather than a mixed-space one.
-                    ...(elementSessionId
+                    ...(elementFrameTargetId
                       ? {}
                       : { click_point: [Math.round(geo.point.x), Math.round(geo.point.y)] }),
                   },
@@ -1728,9 +1890,11 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         }
         if (a.value) {
           // With a ref this is the element's own session (key events follow
-          // the focus set above); without one `elementSession` is the root,
-          // which is where an unqualified "type at the focused element" goes.
-          await typeText(elementSession, a.value, budgetDeadline)
+          // the focus set above); without one, keystrokes follow the FOCUS,
+          // including into a cross-origin frame the agent just clicked
+          // (keyboardSession, resolved before the probe armed so the two
+          // agree on the document being watched).
+          await typeText(keyboardSession ?? elementSession, a.value, budgetDeadline)
           inputMode = 'trusted'
         }
         break
@@ -1738,7 +1902,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       case 'key': {
         if (!a.value) return { ok: false, status: 'error', error: 'key requires value (the key name)' }
         if (objectId) await focusElement(elementSession, objectId)
-        await dispatchKey(elementSession, a.value, modifiers)
+        await dispatchKey(keyboardSession ?? elementSession, a.value, modifiers)
         inputMode = 'trusted'
         break
       }
@@ -1801,11 +1965,11 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                   a.action,
                   target,
                   ht.blocker,
-                  elementSessionId ? null : geo.point,
+                  elementFrameTargetId ? null : geo.point,
                 ),
                 data: {
                   intercepted_by: ht.blocker ?? null,
-                  ...(elementSessionId
+                  ...(elementFrameTargetId
                     ? {}
                     : { click_point: [Math.round(geo.point.x), Math.round(geo.point.y)] }),
                 },
@@ -1904,10 +2068,11 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         const from = objectId
           ? (await elementGeometry(elementSession, objectId))?.point ?? null
           : pointFrom(a.coordinate)
-        // The session the whole pointer stream rides: the source element's
-        // for a ref, the root for a coordinate source. A drag is ONE stream
-        // (press, glide, release), so both ends must live in this session.
-        const dragSessionId = objectId ? elementSessionId : undefined
+        // The document the whole pointer stream rides in: the source
+        // element's frame for a ref, the root for a coordinate source. A
+        // drag is ONE stream (press, glide, release) dispatched on one
+        // session, so both ends must live in the same frame.
+        const dragFrameId = objectId ? elementFrameTargetId : undefined
         let to: Point | null = null
         if (a.to_ref) {
           const dest = await resolveTarget(tabId, a.to_ref, urlBefore)
@@ -1939,7 +2104,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             'drag destination: ',
           )
           if (destRefusal) return destRefusal
-          if ((dest.sessionId ?? null) !== (dragSessionId ?? null)) {
+          if ((dest.frameTargetId ?? null) !== (dragFrameId ?? null)) {
             return {
               ok: false,
               status: 'error',
@@ -2121,18 +2286,28 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     const reading = await probe.read()
     if (inputMode === 'trusted') {
       delivered = reading.outcome
-      // The probe watches the top document only, and this tool deliberately
-      // acts inside iframes. A zero count there means "not seen here", not
-      // "not delivered", so it is downgraded unless the absence can be
-      // confirmed.
+      let unknownReason = reading.reason
+      // The probe watches ONE document (the one it was armed in). A zero
+      // count with a nested browsing context below the target could mean the
+      // event landed there instead, so it is downgraded unless the absence
+      // is conclusive; the reason is NAMED rather than left as a bare
+      // "unknown" (2026-08-15 QA-operator rider).
       if (delivered === 'no') {
         const conclusive = await absenceIsConclusive(
-          tabId,
+          probeTarget,
           objectId ? { session: elementSession, objectId } : null,
         )
-        if (!conclusive) delivered = 'unknown'
+        if (!conclusive) {
+          delivered = 'unknown'
+          unknownReason =
+            'the probe counted nothing, but a nested frame below the target ' +
+            'could have received it (the probe watches the target document only)'
+        }
       }
       extra.input_delivered = delivered
+      if (delivered === 'unknown' && unknownReason) {
+        extra.input_delivered_reason = unknownReason
+      }
     }
   }
 
