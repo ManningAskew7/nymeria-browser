@@ -233,6 +233,11 @@ const PROBE_EVENTS: Partial<Record<ActionName, readonly string[]>> = {
   fill: ['input'],
 }
 
+/** How long the post-dispatch probe peek may hold the act (see its call
+ * site): long enough for the ordinary one-evaluate round trip, far short of
+ * the CDP deadline a suspended renderer would otherwise cost. */
+const PEEK_RACE_MS = 600
+
 /**
  * Verbs whose ref target gets the mint-fingerprint re-check before input is
  * dispatched (#160 review round): everything that ENTERS input or activates
@@ -2298,6 +2303,17 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       return pendingDialogResult(a.action, target, tabId, raised, inputMode, startedAt, urlBefore, extra)
     }
   }
+  // #176: snapshot the probe's counters NOW, before the page has a chance to
+  // navigate (a successful link click destroys the probe's world along with
+  // the document, and with it the per-type counts, leaving the SUCCESS
+  // payload data-poorer than the failure one). Raced against a short
+  // deadline rather than awaited outright: on a suspended renderer this
+  // evaluate would hang its full CDP deadline in front of the liveness
+  // check that owns that diagnosis. A late peek result still lands in the
+  // probe handle, where the final read can use it.
+  if (probe) {
+    await Promise.race([probe.peek(), new Promise((r) => setTimeout(r, PEEK_RACE_MS))])
+  }
   // The pre-flight cleared the page BEFORE the action, and the check above
   // covers the dialogs we own; this one covers what ownership cannot see (a
   // handler still blocking the page, an event Chrome has not delivered yet).
@@ -2360,14 +2376,16 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       if (reading.clickDefaultPrevented !== undefined) {
         extra.default_prevented = reading.clickDefaultPrevented
       }
-      if (
-        reading.userActivation &&
-        (a.action === 'click' || a.action === 'double_click' || a.action === 'right_click')
-      ) {
+      const clickFamily =
+        a.action === 'click' || a.action === 'double_click' || a.action === 'right_click'
+      if (reading.userActivation && clickFamily) {
         extra.user_activation = {
           active: reading.userActivation.active,
           has_been_active: reading.userActivation.hasBeenActive,
         }
+      }
+      if (reading.clickTarget && clickFamily) {
+        extra.click_target = reading.clickTarget
       }
     }
   }

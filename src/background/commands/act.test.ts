@@ -64,6 +64,9 @@ interface MockOptions {
   /** Full probe-read value, overriding `deliveryCount`: models the enriched
    * #176 shape (`types` per-event counts, `prevented`, `ua`). */
   deliveryRead?: Record<string, unknown>
+  /** Value the post-dispatch PEEK returns (the read's non-disarming twin);
+   * unset models a peek that found nothing. */
+  deliveryPeek?: Record<string, unknown>
   /** Thrown by the probe read, to model a context that died mid-action. */
   deliveryReadThrows?: string
   /**
@@ -132,6 +135,7 @@ function installCdpMock(opts: MockOptions = {}) {
     probeWorld = true,
     deliveryCount = 1,
     deliveryRead,
+    deliveryPeek,
     deliveryReadThrows,
     rendererHangs,
     rendererHangsAfterDispatch,
@@ -250,6 +254,9 @@ function installCdpMock(opts: MockOptions = {}) {
         if (expression.includes('addEventListener')) return { result: { value: true } }
         if (expression.includes('querySelectorAll')) {
           return { result: { value: !pageHasFrames } }
+        }
+        if (expression.includes('nymPeek')) {
+          return { result: { value: deliveryPeek ?? null } }
         }
         if (deliveryReadThrows) throw new Error(deliveryReadThrows)
         if (deliveryRead) return { result: { value: deliveryRead } }
@@ -1748,13 +1755,18 @@ describe('input delivery', () => {
     expect((result.data as Record<string, unknown>).default_prevented).toBe(true)
   })
 
-  it('keeps user_activation off the non-click verbs', async () => {
-    // Activation is the click family's diagnosis (navigation-class default
-    // actions); on type/key it would be payload noise claiming relevance it
-    // does not have.
+  it('keeps user_activation and click_target off the non-click verbs', async () => {
+    // Activation and target identity are the click family's diagnosis
+    // (navigation-class default actions); on type/key they would be payload
+    // noise claiming relevance they do not have.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({
-      deliveryRead: { n: 1, types: { keydown: 1 }, ua: { a: true, h: true } },
+      deliveryRead: {
+        n: 1,
+        types: { keydown: 1 },
+        ua: { a: true, h: true },
+        target: { tag: 'input' },
+      },
     })
 
     const result = await execAct({ tab_id: TAB, action: 'type', ref: '@e1', value: 'a' })
@@ -1762,6 +1774,49 @@ describe('input delivery', () => {
     const data = result.data as Record<string, unknown>
     expect(data.input_events).toEqual({ keydown: 1 })
     expect(data.user_activation).toBeUndefined()
+    expect(data.click_target).toBeUndefined()
+  })
+
+  it("names the composed click's target, anchor href included (#176)", async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      deliveryRead: {
+        n: 3,
+        types: { mousedown: 1, mouseup: 1, click: 1 },
+        prevented: false,
+        target: { tag: 'a', href: 'https://dest.example/x' },
+      },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect((result.data as Record<string, unknown>).click_target).toEqual({
+      tag: 'a',
+      href: 'https://dest.example/x',
+    })
+  })
+
+  it('keeps the event counts on a click that navigated, via the peek (#176)', async () => {
+    // The navigation destroys the probe's world before the final read, but
+    // the post-dispatch peek snapshotted the counters while the document
+    // lived: the success payload stops being data-poorer than the failure.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      deliveryReadThrows: 'Cannot find context with specified id',
+      deliveryPeek: {
+        n: 3,
+        types: { mousedown: 1, mouseup: 1, click: 1 },
+        target: { tag: 'a', href: 'https://dest.example/x' },
+      },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect(data.input_delivered).toBe('yes')
+    expect(data.input_events).toEqual({ mousedown: 1, mouseup: 1, click: 1 })
+    expect(data.click_target).toEqual({ tag: 'a', href: 'https://dest.example/x' })
   })
 
   it('verifies fill delivery through its trusted input event (#176 rider)', async () => {

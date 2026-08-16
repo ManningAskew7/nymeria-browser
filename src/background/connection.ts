@@ -91,6 +91,10 @@ async function connectOnce(): Promise<void> {
 
   const url = new URL('/autonomous/stream', baseUrl)
   url.searchParams.set('client_id', clientId)
+  // The running build's version, so the backend can answer "which build is
+  // live" (#176 rider: chrome_reload_extension reports version_after from
+  // the post-reload resubscribe instead of leaving the deploy unverified).
+  url.searchParams.set('client_version', chrome.runtime.getManifest().version)
 
   activeController = new AbortController()
   let resp: Response

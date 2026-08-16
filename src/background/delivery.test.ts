@@ -34,8 +34,11 @@ function installCdpMock(
       if (method === 'Runtime.evaluate') {
         const expression = String(params.expression ?? '')
         const isArm = expression.includes('addEventListener')
+        const isPeek = expression.includes('nymPeek')
         if (isArm && armThrows) throw new Error(armThrows)
-        if (!isArm && readThrows) throw new Error(readThrows)
+        // `readThrows` models the document dying with the final read; the
+        // peek (taken earlier, while the document lived) stays runnable.
+        if (!isArm && !isPeek && readThrows) throw new Error(readThrows)
         return { result: { value: run(expression) } }
       }
       return {}
@@ -51,8 +54,11 @@ function installCdpMock(
  * its own and would otherwise be able to fake delivery, so a test firing
  * script-made events would silently exercise nothing.
  */
-function firePageEvent(type: string, opts: { trusted?: boolean } = {}): void {
-  const target = document.body ?? document.documentElement
+function firePageEvent(
+  type: string,
+  opts: { trusted?: boolean; target?: Element } = {},
+): void {
+  const target = opts.target ?? document.body ?? document.documentElement
   const event = new Event(type, { bubbles: true, cancelable: true })
   Object.defineProperty(event, 'isTrusted', { value: opts.trusted ?? true })
   target.dispatchEvent(event)
@@ -191,6 +197,49 @@ describe('delivery probe', () => {
     const reading = await probe.read()
     expect(reading.outcome).toBe('yes')
     expect(reading.userActivation).toBeUndefined()
+  })
+
+  it("records the composed click's target identity, anchor href included", async () => {
+    // The #176 round-1 measurement rejected every hypothesis a bare count
+    // can test; whether the click composed ON the anchor is the remaining
+    // in-frame measurable.
+    installCdpMock()
+    document.body.innerHTML = '<a href="https://dest.example/x">go</a>'
+    const anchor = document.querySelector('a') as Element
+
+    const probe = await armDelivery(TAB, ['click'])
+    firePageEvent('click', { target: anchor })
+
+    const reading = await probe.read()
+    expect(reading.clickTarget).toEqual({ tag: 'a', href: 'https://dest.example/x' })
+  })
+
+  it('a peek before a navigating read preserves the counts', async () => {
+    // A successful link click destroys the probe's world with the document,
+    // so the final read proves delivery but loses the per-type counts: the
+    // success payload was data-poorer than the failure one (QA rider).
+    installCdpMock({ readThrows: 'Cannot find context with specified id' })
+
+    const probe = await armDelivery(TAB, ['mousedown'])
+    firePageEvent('mousedown')
+    await probe.peek()
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toEqual({ mousedown: 1 })
+  })
+
+  it('the peek does not disarm: later events still count and the read stays authoritative', async () => {
+    installCdpMock()
+
+    const probe = await armDelivery(TAB, ['mousedown'])
+    firePageEvent('mousedown')
+    await probe.peek()
+    firePageEvent('mousedown')
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toEqual({ mousedown: 2 })
   })
 
   it('reports unknown, never yes, when the isolated world cannot be created', async () => {

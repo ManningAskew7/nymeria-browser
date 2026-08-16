@@ -47,6 +47,33 @@ describe('describeConnectFailure', () => {
   })
 })
 
+describe('subscribe URL', () => {
+  afterEach(async () => {
+    await stopConnection()
+    vi.mocked(whoami).mockReset()
+    vi.unstubAllGlobals()
+  })
+
+  it('announces the running build version on the subscribe (#176 rider)', async () => {
+    // The backend records this per subscriber so chrome_reload_extension can
+    // report which build reconnected after a reload; without the param the
+    // deploy-verification loop stays open.
+    vi.mocked(whoami).mockResolvedValue({ user_id: 'u1' } as never)
+    const fetchSpy = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
+      async () => new Response(null, { status: 500 }),
+    )
+    vi.stubGlobal('fetch', fetchSpy)
+
+    await startConnection()
+
+    expect(fetchSpy).toHaveBeenCalledTimes(1)
+    const url = new URL(String(fetchSpy.mock.calls[0]![0]))
+    expect(url.pathname).toBe('/autonomous/stream')
+    expect(url.searchParams.get('client_id')).toBe('nymeria-browser-test')
+    expect(url.searchParams.get('client_version')).toBe('9.9.9')
+  })
+})
+
 describe('heartbeat vs backoff', () => {
   afterEach(async () => {
     await stopConnection()

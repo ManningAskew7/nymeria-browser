@@ -95,11 +95,29 @@ export interface DeliveryReading {
   /** The probed frame's user-activation state at read time (#176: the gate
    * navigation-class default actions key on). */
   userActivation?: { active: boolean; hasBeenActive: boolean }
+  /**
+   * Identity of the last composed click-family event's target: tag name and,
+   * when the target sits inside an anchor, that anchor's resolved href. The
+   * one remaining in-frame measurable after the #176 round rejected the
+   * simple hypotheses: a click composed on `body` instead of the anchor
+   * would explain a defaultless click and implicate geometry.
+   */
+  clickTarget?: { tag: string; href?: string }
 }
 
 export interface DeliveryProbe {
   /** Read the count and disarm. Safe to call once; further calls report unknown. */
   read(): Promise<DeliveryReading>
+  /**
+   * Snapshot the counters WITHOUT disarming, and keep the snapshot inside
+   * the handle. A navigation that follows a successful click destroys the
+   * probe's world, so the final read can prove delivery but loses the
+   * per-type counts; a peek taken right after dispatch preserves them for
+   * that case (QA-operator rider, 2026-08-16: the SUCCESS payload was
+   * data-poorer than the failure one). Never throws; a peek that finds a
+   * dead context simply stores nothing.
+   */
+  peek(): Promise<void>
 }
 
 /**
@@ -152,6 +170,7 @@ function armExpression(types: readonly string[], id: string): string {
       var n = 0;
       var counts = {};
       var prevented = null;
+      var clickTarget = null;
       var offs = [];
       for (var i = 0; i < types.length; i++) {
         (function(type){
@@ -162,6 +181,13 @@ function armExpression(types: readonly string[], id: string): string {
               counts[type] = (counts[type] || 0) + 1;
               if (composed) {
                 setTimeout(function(){ try { prevented = e.defaultPrevented === true; } catch (err) {} }, 0);
+                try {
+                  var t = e.target;
+                  var info = { tag: t && t.tagName ? String(t.tagName).toLowerCase() : String(t) };
+                  var a = t && t.closest ? t.closest('a[href]') : null;
+                  if (a && a.href) info.href = String(a.href);
+                  clickTarget = info;
+                } catch (err) {}
               }
             }
           };
@@ -171,7 +197,7 @@ function armExpression(types: readonly string[], id: string): string {
       }
       reg[id] = {
         t: now,
-        snap: function(){ return { n: n, types: counts, prevented: prevented }; },
+        snap: function(){ return { n: n, types: counts, prevented: prevented, target: clickTarget }; },
         off: function(){ for (var j = 0; j < offs.length; j++) { try { offs[j](); } catch (e) {} } }
       };
       return true;
@@ -195,6 +221,24 @@ function readExpression(id: string): string {
     } catch (e) { out.ua = null; }
     try { p.off(); } catch (e) {}
     delete reg[id];
+    return out;
+  })(${JSON.stringify(id)})`
+}
+
+/** The read's non-destructive twin (marker: nymPeek). Listeners stay armed
+ * and the registry entry survives, so the authoritative read still happens. */
+function peekExpression(id: string): string {
+  return `(function(id){ /* nymPeek */
+    var g = globalThis;
+    var reg = g.__nymDelivery;
+    if (!reg) return null;
+    var p = reg[id];
+    if (!p || !p.snap) return null;
+    var out = p.snap();
+    try {
+      var ua = navigator.userActivation;
+      out.ua = ua ? { a: ua.isActive === true, h: ua.hasBeenActive === true } : null;
+    } catch (e) { out.ua = null; }
     return out;
   })(${JSON.stringify(id)})`
 }
@@ -223,12 +267,38 @@ async function evaluateInWorld<T>(
   }
 }
 
+/** The raw shape the page-side snap()/read/peek expressions return. */
+type RawSnap = {
+  n: number
+  types?: Record<string, number>
+  prevented?: boolean | null
+  ua?: { a?: boolean; h?: boolean } | null
+  target?: { tag?: unknown; href?: unknown } | null
+}
+
+/** Fold a raw snapshot's optional diagnosis fields into a reading. */
+function enrich(reading: DeliveryReading, value: RawSnap): DeliveryReading {
+  if (value.types && typeof value.types === 'object') reading.events = value.types
+  if (typeof value.prevented === 'boolean') reading.clickDefaultPrevented = value.prevented
+  if (value.ua && typeof value.ua.a === 'boolean') {
+    reading.userActivation = { active: value.ua.a, hasBeenActive: value.ua.h === true }
+  }
+  if (value.target && typeof value.target.tag === 'string') {
+    reading.clickTarget = {
+      tag: value.target.tag,
+      ...(typeof value.target.href === 'string' ? { href: value.target.href } : {}),
+    }
+  }
+  return reading
+}
+
 /** A probe that never armed. Reports `unknown`, never `yes`. */
 const UNARMED: DeliveryProbe = {
   read: async () => ({
     outcome: 'unknown',
     reason: 'the delivery probe could not be armed in the target document',
   }),
+  peek: async () => {},
 }
 
 /**
@@ -264,23 +334,29 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
 
   const world = contextId
   let spent = false
+  let peeked: RawSnap | null = null
   return {
+    async peek(): Promise<void> {
+      if (spent) return
+      const result = await evaluateInWorld<RawSnap | null>(target, world, peekExpression(id))
+      if (result.ok && result.value && typeof result.value.n === 'number') {
+        peeked = result.value
+      }
+    },
     async read(): Promise<DeliveryReading> {
       if (spent) return { outcome: 'unknown', reason: 'the delivery probe was already read' }
       spent = true
-      const result = await evaluateInWorld<{
-        n: number
-        types?: Record<string, number>
-        prevented?: boolean | null
-        ua?: { a?: boolean; h?: boolean } | null
-      } | null>(target, world, readExpression(id))
+      const result = await evaluateInWorld<RawSnap | null>(target, world, readExpression(id))
       if (!result.ok) {
         // The context was destroyed between arming and reading, which means
         // the document went away: the action navigated it. A navigation is
-        // proof the input landed, so this is delivery, not ignorance.
+        // proof the input landed, so this is delivery, not ignorance. The
+        // peek's snapshot, taken just after dispatch, restores the per-type
+        // counts the navigation destroyed.
         if (result.contextGone) {
           clearWorld(target)
-          return { outcome: 'yes' }
+          const reading: DeliveryReading = { outcome: 'yes' }
+          return peeked ? enrich(reading, peeked) : reading
         }
         return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
@@ -288,13 +364,7 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
       if (!value || typeof value.n !== 'number') {
         return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
-      const reading: DeliveryReading = { outcome: value.n > 0 ? 'yes' : 'no' }
-      if (value.types && typeof value.types === 'object') reading.events = value.types
-      if (typeof value.prevented === 'boolean') reading.clickDefaultPrevented = value.prevented
-      if (value.ua && typeof value.ua.a === 'boolean') {
-        reading.userActivation = { active: value.ua.a, hasBeenActive: value.ua.h === true }
-      }
-      return reading
+      return enrich({ outcome: value.n > 0 ? 'yes' : 'no' }, value)
     },
   }
 }
