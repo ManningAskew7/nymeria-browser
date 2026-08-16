@@ -49,6 +49,38 @@ export function push(tabId: number, entry: ConsoleEntry): void {
   buffers.set(tabId, buf)
 }
 
+/**
+ * Push unless an identical entry is already buffered.
+ *
+ * Runtime and Log REPLAY their backlog on every enable, and the attach is
+ * per-command-burst (10s linger), so each re-attach re-delivers entries the
+ * buffer already holds; measured live 2026-08-16 as duplicate advisories at
+ * identical timestamps. A replayed entry is byte-identical including its
+ * CDP timestamp, so an exact-tuple match is the discriminator. The
+ * collateral: a page emitting the same text twice within the same rounded
+ * millisecond collapses to one entry, an acceptable trade for a diagnosis
+ * window. Capture handlers use this; direct `push` stays exact.
+ */
+function pushCaptured(tabId: number, entry: ConsoleEntry): void {
+  const buf = buffers.get(tabId)
+  if (
+    buf?.some(
+      (e) =>
+        e.ts === entry.ts &&
+        e.text === entry.text &&
+        e.level === entry.level &&
+        e.frame === entry.frame &&
+        e.browser === entry.browser &&
+        e.source === entry.source &&
+        e.line === entry.line &&
+        e.col === entry.col,
+    )
+  ) {
+    return
+  }
+  push(tabId, entry)
+}
+
 export function read(tabId: number, opts: { only_errors?: boolean; limit?: number }): ConsoleEntry[] {
   const buf = buffers.get(tabId) ?? []
   let out = buf
@@ -148,7 +180,7 @@ export function installCdpConsoleCapture(): () => void {
       const p = params as { type?: string; args?: RemoteObject[]; timestamp?: number }
       const level = CDP_LEVELS[p.type ?? 'log'] ?? 'log'
       const text = (p.args ?? []).map(remoteObjectToText).join(' ')
-      push(tabId, { level, text, ts: cdpTimestamp(p.timestamp), ...frameOf(tabId, sessionId) })
+      pushCaptured(tabId, { level, text, ts: cdpTimestamp(p.timestamp), ...frameOf(tabId, sessionId) })
       return
     }
     if (method === 'Runtime.exceptionThrown') {
@@ -165,7 +197,7 @@ export function installCdpConsoleCapture(): () => void {
       const d = p.exceptionDetails ?? {}
       const described = d.exception ? remoteObjectToText(d.exception) : ''
       const text = [d.text, described].filter(Boolean).join(': ') || 'uncaught exception'
-      push(tabId, {
+      pushCaptured(tabId, {
         level: 'exception',
         text,
         ts: cdpTimestamp(p.timestamp),
@@ -191,7 +223,7 @@ export function installCdpConsoleCapture(): () => void {
         }
       }
       const e = p.entry ?? {}
-      push(tabId, {
+      pushCaptured(tabId, {
         level: LOG_DOMAIN_LEVELS[e.level ?? 'info'] ?? 'info',
         text: e.text ?? '',
         ts: cdpTimestamp(e.timestamp),

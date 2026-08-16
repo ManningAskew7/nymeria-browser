@@ -1,6 +1,6 @@
 import type { CommandResult } from '../../shared/types'
 import { clear as clearBuffer, read } from '../consoleBuffer'
-import { withSession } from '../debuggerSession'
+import { isAttached, withSession } from '../debuggerSession'
 
 /**
  * Read buffered console messages and uncaught exceptions.
@@ -23,13 +23,27 @@ interface ConsoleArgs {
   limit?: number
 }
 
+/**
+ * How long a COLD attach gets for the enable backlog to arrive before the
+ * first read. Runtime and Log replay their buffered entries on enable, but
+ * the enables are fire-and-forget inside the attach, so a read issued the
+ * same instant returns before the replay lands: the exact "empty the first
+ * time you ask" failure this capture design exists to prevent (measured
+ * live 2026-08-16: a first read right after attach missed a frame's whole
+ * load history, then a re-ask saw it). Local IPC, so the replay is a
+ * few-ms affair; the bound just keeps a wedged tab from eating the budget.
+ */
+const COLD_ATTACH_REPLAY_MS = 400
+
 export async function execConsole(args: unknown): Promise<CommandResult> {
   const a = args as ConsoleArgs
   if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'tab_id required' }
 
   // Touch the session so capture is enabled even if this is the first command
   // ever sent to the tab.
+  const wasAttached = isAttached(a.tab_id)
   await withSession(a.tab_id, async () => undefined)
+  if (!wasAttached) await new Promise((resolve) => setTimeout(resolve, COLD_ATTACH_REPLAY_MS))
 
   const entries = read(a.tab_id, { only_errors: a.only_errors, limit: a.limit })
   if (a.clear) clearBuffer(a.tab_id)

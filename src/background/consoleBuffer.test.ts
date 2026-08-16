@@ -168,6 +168,36 @@ describe('console capture', () => {
     expect(entries[199].text).toBe('line 204')
   })
 
+  it('collapses a replayed backlog delivery instead of duplicating it', () => {
+    const emit = wireCapture()
+    const ts = Date.now()
+    const advisory = {
+      entry: { source: 'network', level: 'error', text: 'Failed to load resource: 404', timestamp: ts },
+    }
+    // Same entry delivered twice, the shape a re-enable replay produces.
+    emit({ tabId: TAB }, 'Log.entryAdded', advisory)
+    emit({ tabId: TAB }, 'Log.entryAdded', advisory)
+    emit({ tabId: TAB }, 'Runtime.consoleAPICalled', {
+      type: 'log',
+      args: [{ type: 'string', value: 'boot line' }],
+      timestamp: ts,
+    })
+    emit({ tabId: TAB }, 'Runtime.consoleAPICalled', {
+      type: 'log',
+      args: [{ type: 'string', value: 'boot line' }],
+      timestamp: ts,
+    })
+    // The same text at a DIFFERENT timestamp is a genuine repeat: kept.
+    emit({ tabId: TAB }, 'Runtime.consoleAPICalled', {
+      type: 'log',
+      args: [{ type: 'string', value: 'boot line' }],
+      timestamp: ts + 7,
+    })
+
+    const texts = read(TAB, {}).map((e) => e.text)
+    expect(texts).toEqual(['Failed to load resource: 404', 'boot line', 'boot line'])
+  })
+
   it('readSince windows out entries from before the action', () => {
     const emit = wireCapture()
     emit({ tabId: TAB }, 'Runtime.consoleAPICalled', {
