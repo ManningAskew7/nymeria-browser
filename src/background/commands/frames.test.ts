@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { execAct } from './act'
+import { __test as actTest, execAct } from './act'
 import { execSnapshot } from './snapshot'
 import {
   CdpCallTimeout,
@@ -1332,11 +1332,231 @@ describe('same-process frame refs (reads-honesty pass)', () => {
 
     expect(result.ok).toBe(true)
     const tree = (result.data as { tree: string }).tree
-    expect(tree).toMatch(/iframe "https:\/\/pay\.example\/inner"/)
+    // Indented one level: the nested frame belongs to the OOPIF's section,
+    // and a flat render read as a sibling of it (QA round 1).
+    expect(tree).toMatch(/\n {2}- iframe "https:\/\/pay\.example\/inner"/)
     expect((result.data as { frames_same_process: number }).frames_same_process).toBe(1)
     expect((result.data as { frames_oopif: number }).frames_oopif).toBe(1)
     const minted = resolveRef(TAB, '@e1', TAB_URL)
     expect(minted.ok && minted.frameTargetId).toBe('NESTED-1')
+  })
+})
+
+describe('QA round 1 fix round: nested-frame acts and frame-aware waits', () => {
+  const OUTER = 'LOCAL-OUTER'
+  const INNER = 'LOCAL-INNER'
+  const INNER_URL = 'https://example.com/deep'
+
+  it("a ref in a DOUBLY-nested local frame dispatches: the occlusion gate tests the OUTERMOST ancestor's owner, not the immediate one", async () => {
+    // The live QA bug: the immediate owner of a nested frame lives in the
+    // MIDDLE document, so the dispatch document's elementFromPoint can only
+    // ever answer the ancestor iframe, and the gate read the target's own
+    // ancestor as a blocker: a deterministic false refusal on every nested
+    // target. The gate must ask about `path[0]`, the one owner element that
+    // actually lives in the dispatch document.
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree' && !target.sessionId) {
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [
+              {
+                frame: { id: OUTER, url: 'https://example.com/outer' },
+                childFrames: [{ frame: { id: INNER, url: INNER_URL } }],
+              },
+            ],
+          },
+        }
+      }
+      if (method === 'Page.createIsolatedWorld' && params.frameId === INNER) {
+        return { executionContextId: 77 }
+      }
+      if (method === 'DOM.getContentQuads') {
+        return { quads: [[230, 340, 330, 340, 330, 360, 230, 360]] }
+      }
+      if (method === 'DOM.getFrameOwner') {
+        // Distinct owners so the hit test below can tell which one the gate
+        // resolved: the outer's owner sits in the dispatch document, the
+        // inner's owner sits in the MIDDLE document.
+        return { backendNodeId: params.frameId === OUTER ? 600 : 601 }
+      }
+      if (method === 'DOM.resolveNode' && (args[2] as { backendNodeId?: number }).backendNodeId === 600) {
+        return { object: { objectId: 'obj-outer-owner' } }
+      }
+      if (method === 'DOM.resolveNode' && (args[2] as { backendNodeId?: number }).backendNodeId === 601) {
+        return { object: { objectId: 'obj-inner-owner' } }
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const fn = String((params as { functionDeclaration?: string }).functionDeclaration ?? '')
+        const argVals = ((params as { arguments?: { value?: unknown }[] }).arguments ?? []).map(
+          (a) => a.value,
+        )
+        if (fn.includes('elementFromPoint') && argVals[0] === 280) {
+          // The dispatch document's element at the point IS the outer
+          // iframe: containment for obj-outer-owner, a "blocker" for the
+          // cross-document obj-inner-owner (the measured live shape).
+          if (params.objectId === 'obj-outer-owner') return { result: { value: { hit: true } } }
+          return { result: { value: { hit: false, blocker: 'iframe' } } }
+        }
+      }
+      return base(...args)
+    })
+    setRefs(
+      TAB,
+      new Map([
+        [
+          'e1',
+          { backendNodeId: 7, frameTargetId: INNER, frameUrl: INNER_URL, role: 'button', name: 'Go' },
+        ],
+      ]),
+      TAB_URL,
+      1,
+    )
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const ownerAsks = cdp.mock.calls
+      .filter((c) => c[1] === 'DOM.getFrameOwner')
+      .map((c) => (c[2] as { frameId?: string }).frameId)
+    expect(ownerAsks).toContain(OUTER)
+    expect(ownerAsks).not.toContain(INNER)
+    const pressed = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
+    )
+    expect(pressed?.[0]).toEqual({ tabId: TAB })
+    expect(pressed?.[2]).toMatchObject({ x: 280, y: 350 })
+  })
+
+  it('the wait text condition sees text living in a same-origin frame document', async () => {
+    // The live QA bug: `wait_for` text scanned only the root document while
+    // the page read includes same-origin frame content, so a wait on text
+    // the read showed came back `found: false`. The scan expression is
+    // EXECUTED here against a nested document graph, not string-matched.
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    const grand = { body: { innerText: 'deep frame-needle text' }, querySelectorAll: () => [] }
+    const child = {
+      body: { innerText: 'child text' },
+      querySelectorAll: () => [{ contentDocument: grand }],
+    }
+    const root = {
+      body: { innerText: 'root text' },
+      // A cross-origin frame answers a null contentDocument: skipped, and it
+      // must not abort the scan before the same-origin sibling.
+      querySelectorAll: () => [{ contentDocument: null }, { contentDocument: child }],
+    }
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1]
+      const params = (args[2] ?? {}) as { expression?: string }
+      if (method === 'Runtime.evaluate' && String(params.expression).includes('scan(document, 0)')) {
+        const value = new Function('document', `return ${params.expression}`)(root) as boolean
+        return { result: { value } }
+      }
+      return base(...args)
+    })
+
+    const seen = await actTest.performWait(TAB, { text: 'frame-needle' }, 500)
+    expect(seen).toEqual({ found: true, condition: 'text:frame-needle' })
+
+    // Negative control: the mock executes the real expression, so an absent
+    // needle times out honestly (this is what proves the scan has teeth).
+    const missed = await actTest.performWait(TAB, { text: 'nowhere-needle' }, 250)
+    expect(missed.found).toBe(false)
+  })
+
+  it('the wait text condition sees text living in an OOPIF document (scanned through its own session)', async () => {
+    // A page read includes OOPIF content through its flattened session, so
+    // the wait must too: the same scan expression runs in each frame
+    // session's probe world after the root scan misses (review round).
+    installCdpMock()
+    await attachFrame()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    const rootDoc = { body: { innerText: 'root text only' }, querySelectorAll: () => [] }
+    const oopifDoc = { body: { innerText: 'the oopif-needle lives here' }, querySelectorAll: () => [] }
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as { expression?: string }
+      if (method === 'Runtime.evaluate' && String(params.expression).includes('scan(document, 0)')) {
+        const doc = target.sessionId === FRAME_SESSION ? oopifDoc : rootDoc
+        const value = new Function('document', `return ${params.expression}`)(doc) as boolean
+        return { result: { value } }
+      }
+      return base(...args)
+    })
+
+    const seen = await actTest.performWait(TAB, { text: 'oopif-needle' }, 500)
+    expect(seen).toEqual({ found: true, condition: 'text:oopif-needle' })
+  })
+
+  it('a gate-time tree walk that answers nothing SKIPS the occlusion gate instead of refusing', async () => {
+    // The fail-open contract: with no ancestor chain readable (walk
+    // soft-failed, or the frame left between resolve and gate), falling
+    // back to the immediate owner would reinstate the nested false refusal
+    // this gate was fixed for. The act dispatches; delivery verification
+    // backstops.
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    let sawQuads = false
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree' && !target.sessionId) {
+        // The quads read marks the boundary between resolve and gate: the
+        // gate's walk (after it) finds the frame gone.
+        if (sawQuads) return { frameTree: { frame: { id: 'frame-root' } } }
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [
+              {
+                frame: { id: OUTER, url: 'https://example.com/outer' },
+                childFrames: [{ frame: { id: INNER, url: INNER_URL } }],
+              },
+            ],
+          },
+        }
+      }
+      if (method === 'Page.createIsolatedWorld' && params.frameId === INNER) {
+        return { executionContextId: 77 }
+      }
+      if (method === 'DOM.getContentQuads') {
+        sawQuads = true
+        return { quads: [[230, 340, 330, 340, 330, 360, 230, 360]] }
+      }
+      return base(...args)
+    })
+    setRefs(
+      TAB,
+      new Map([
+        [
+          'e1',
+          { backendNodeId: 7, frameTargetId: INNER, frameUrl: INNER_URL, role: 'button', name: 'Go' },
+        ],
+      ]),
+      TAB_URL,
+      1,
+    )
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect(cdp.mock.calls.some((c) => c[1] === 'DOM.getFrameOwner')).toBe(false)
+    const pressed = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mousePressed',
+    )
+    expect(pressed?.[2]).toMatchObject({ x: 280, y: 350 })
   })
 })
 
@@ -1480,7 +1700,7 @@ describe('same-process frame refs: review-round defenses', () => {
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect(result.ok).toBe(false)
-    expect(result.error).toMatch(/covered in the PARENT document by div#cookie-banner/)
+    expect(result.error).toMatch(/covered in the EMBEDDING document by div#cookie-banner/)
     expect((result.data as { occluded_in?: string }).occluded_in).toBe('parent-document')
     expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
   })

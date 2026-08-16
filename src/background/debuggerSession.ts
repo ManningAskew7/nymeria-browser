@@ -548,6 +548,18 @@ export async function frameSessionByTargetId(
 export interface LocalFrame {
   frameId: string
   url: string
+  /**
+   * The ancestor local-frame chain, OUTERMOST first, self LAST (so a frame
+   * embedded directly in the session's document has `path: [frameId]`, and
+   * `path.length - 1` is its nesting depth). Two consumers: snapshot
+   * indents nested sections under their parent, and the act layer's
+   * occlusion gate hit-tests `path[0]`, the one ancestor whose OWNER
+   * element actually lives in the dispatch document (testing the immediate
+   * owner of a nested frame found its own ancestor iframe "covering" it,
+   * measured live: an ancestor is on top at those coordinates by
+   * construction).
+   */
+  path: string[]
 }
 
 interface FrameTreeNode {
@@ -571,15 +583,17 @@ export async function localFrames(target: Cdp): Promise<LocalFrame[]> {
     // the command is in flight, and the set must include them.
     const sessionTargetIds = new Set(frameSessions(tabOf(target)).map((f) => f.targetId))
     const out: LocalFrame[] = []
-    const walk = (node: FrameTreeNode | undefined, isRoot: boolean): void => {
+    const walk = (node: FrameTreeNode | undefined, isRoot: boolean, ancestors: string[]): void => {
       if (!node) return
       const id = node.frame?.id
+      let chain = ancestors
       if (!isRoot && id && !sessionTargetIds.has(id)) {
-        out.push({ frameId: id, url: node.frame?.url ?? '' })
+        chain = [...ancestors, id]
+        out.push({ frameId: id, url: node.frame?.url ?? '', path: chain })
       }
-      for (const child of node.childFrames ?? []) walk(child, false)
+      for (const child of node.childFrames ?? []) walk(child, false, chain)
     }
-    walk(tree.frameTree, true)
+    walk(tree.frameTree, true, [])
     return out
   } catch (e) {
     logger.warn(`Page.getFrameTree failed (tab=${tabOf(target)}):`, e)

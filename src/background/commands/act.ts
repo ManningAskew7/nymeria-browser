@@ -4,6 +4,7 @@ import {
   CdpCallTimeout,
   frameIdOf,
   frameSessions,
+  localFrames,
   locateFrame,
   sendCommand,
   sessionOf,
@@ -1224,13 +1225,24 @@ async function dispatchPointFor(
  * (a parent cookie banner over a same-origin widget), and input for these
  * targets hit-tests through the whole page, so a trusted click would land
  * on the overlay while the payload blamed input suppression (review round).
- * Asks whether the frame's OWNER element is what sits at the dispatch
- * point, in the dispatch session's probe world so the answer gates a
- * refusal a page cannot forge. It also catches a frame scrolled out of the
- * page viewport (elementFromPoint answers nothing there). Null means "not
- * a same-process target" or "could not check": the probe failing must not
- * block the act (the delivery verification backstops), but session-layer
- * failures rethrow like every other pre-dispatch gate.
+ * Asks whether the frame's owner chain is what sits at the dispatch point,
+ * in the dispatch session's probe world so the answer gates a refusal a
+ * page cannot forge. It also catches a frame scrolled out of the page
+ * viewport (elementFromPoint answers nothing there). The element tested is
+ * the target frame's OUTERMOST local ancestor's owner (`path[0]`), the one
+ * iframe element that actually lives in the dispatch document: testing a
+ * nested frame's IMMEDIATE owner found its own ancestor iframe "covering"
+ * it (the owner lives in the middle document, so the dispatch document's
+ * elementFromPoint can only ever answer the ancestor, and `contains()`
+ * never crosses the document boundary), a deterministic false refusal on
+ * every nested target, measured live (QA round 1). An overlay DEEPER in
+ * the chain (inside the middle document, over the nested frame) passes
+ * this gate; the delivery probe, armed in the target frame's own world,
+ * still catches the eaten click, so that degrades to an honest
+ * "undelivered", not a false "clicked". Null means "not a same-process
+ * target" or "could not check": the probe failing must not block the act
+ * (the delivery verification backstops), but session-layer failures
+ * rethrow like every other pre-dispatch gate.
  */
 async function frameOwnerAtPoint(session: Cdp, point: Point): Promise<HitTest | null> {
   const frameId = frameIdOf(session)
@@ -1238,8 +1250,15 @@ async function frameOwnerAtPoint(session: Cdp, point: Point): Promise<HitTest | 
   const sessionId = sessionOf(session)
   const host: Cdp = sessionId ? { tabId: tabOf(session), sessionId } : tabOf(session)
   try {
+    const chain = (await localFrames(host)).find((f) => f.frameId === frameId)
+    // No chain (the walk soft-failed, or the frame left between resolve and
+    // gate): skip the gate rather than fall back to the immediate owner,
+    // which for a nested frame would reinstate the exact false refusal this
+    // gate was fixed for (review round). Fail-open is this probe's contract;
+    // the delivery verification backstops.
+    if (!chain) return null
     const owner = await sendCommand<{ backendNodeId?: number }>(host, 'DOM.getFrameOwner', {
-      frameId,
+      frameId: chain.path[0],
     })
     if (!owner.backendNodeId) return null
     const resolved = await resolveNodeInProbeWorld(host, owner.backendNodeId)
@@ -1253,14 +1272,16 @@ async function frameOwnerAtPoint(session: Cdp, point: Point): Promise<HitTest | 
 
 /**
  * A same-process frame target whose DISPATCH point is intercepted in the
- * parent document. Distinct from `coveredPointError`: the frame's own view
- * is clear (the frame-local hit test passed), so "part of the target's own
- * widget" cannot be the story, and teaching a coordinate click-through
- * would aim at the same interceptor.
+ * embedding document (the immediate parent for a directly-embedded frame,
+ * the outermost ancestor's document for a nested one: the gate tests
+ * there). Distinct from `coveredPointError`: the frame's own view is clear
+ * (the frame-local hit test passed), so "part of the target's own widget"
+ * cannot be the story, and teaching a coordinate click-through would aim
+ * at the same interceptor.
  */
 function frameOccludedError(action: ActionName, target: string | null, blocker?: string): string {
   return (
-    `the ${action} point for ${target ?? 'that element'} is covered in the PARENT ` +
+    `the ${action} point for ${target ?? 'that element'} is covered in the EMBEDDING ` +
     `document by ${blocker ?? 'another element'}: the frame's own view is clear, but ` +
     'input for a same-origin frame dispatches through the page, where that element ' +
     `is on top. Nothing was sent. Dismiss or scroll away the covering element (it ` +
@@ -1512,6 +1533,44 @@ async function readValue(session: Cdp, objectId: string): Promise<string | null>
   }
 }
 
+/**
+ * The wait `text` condition's in-page scan. Descends same-origin frames: a
+ * page read includes their content, so a wait on text the read showed must
+ * see it too; scanning only the root document returned a false
+ * `found: false` on text sitting in a child frame, measured live (QA
+ * round). Cross-origin frames answer a null contentDocument here and are
+ * skipped; the POLL covers them instead by running this same expression in
+ * each OOPIF session's probe world, mirroring the read's two-sweep
+ * coverage. Both depth and total frame count are bounded (the read's
+ * frame-cap philosophy: this runs every poll tick and `innerText` forces
+ * layout); past the budget the poll simply keeps polling and times out
+ * honestly. The descent is exercised as EXECUTED code by the wait tests'
+ * evaluate mock, not string-matched.
+ */
+function waitTextExpression(text: string): string {
+  return `(function(){
+    var NEEDLE = ${JSON.stringify(text)};
+    var budget = 16;
+    function scan(doc, depth) {
+      if (!doc || depth > 4) return false;
+      try {
+        if (doc.body && doc.body.innerText && doc.body.innerText.includes(NEEDLE)) return true;
+      } catch (e) {}
+      var frames;
+      try { frames = doc.querySelectorAll('iframe,frame'); } catch (e) { return false; }
+      for (var i = 0; i < frames.length; i++) {
+        if (budget <= 0) return false;
+        budget -= 1;
+        var inner = null;
+        try { inner = frames[i].contentDocument; } catch (e) { inner = null; }
+        if (inner && scan(inner, depth + 1)) return true;
+      }
+      return false;
+    }
+    return scan(document, 0);
+  })()`
+}
+
 async function performWait(
   tabId: number,
   waitFor: WaitFor | undefined,
@@ -1543,10 +1602,20 @@ async function performWait(
       // Probe world (#160): this answer GATES a batch, so a page faking the
       // condition met would charge a whole batch onward. A failed evaluate
       // (world churn mid-wait) keeps polling until the deadline.
-      const seen = await evaluateInProbeWorld<boolean>(
-        tabId,
-        `document.body ? document.body.innerText.includes(${JSON.stringify(waitFor.text)}) : false`,
-      )
+      let seen = await evaluateInProbeWorld<boolean>(tabId, waitTextExpression(waitFor.text))
+      if (seen !== true) {
+        // OOPIF documents are separate targets the root scan cannot reach,
+        // and a page read includes their content (review round): the same
+        // expression runs in each frame session's own probe world, which
+        // also covers that frame's same-origin children.
+        for (const frame of frameSessions(tabId)) {
+          seen = await evaluateInProbeWorld<boolean>(
+            { tabId, sessionId: frame.sessionId },
+            waitTextExpression(waitFor.text),
+          )
+          if (seen === true) break
+        }
+      }
       if (seen === true) return { found: true, condition: `text:${waitFor.text}` }
     }
     if (waitFor.ref) {

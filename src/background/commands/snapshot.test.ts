@@ -326,7 +326,7 @@ describe('same-process frame reads (reads-honesty pass)', () => {
     expect(data.frames).toBeUndefined()
   })
 
-  it('renders nested same-process frames, in document order', async () => {
+  it('renders nested same-process frames in document order, indented under their parent', async () => {
     installLocalFramesMock({
       rootNodes,
       frameTree: {
@@ -354,6 +354,11 @@ describe('same-process frame reads (reads-honesty pass)', () => {
     const innerAt = tree.indexOf('iframe "https://example.com/inner"')
     expect(outerAt).toBeGreaterThan(-1)
     expect(innerAt).toBeGreaterThan(outerAt)
+    // Containment is visible (QA round 1): the outer section sits at the
+    // margin, the nested one indents a level, and its BODY indents with it.
+    expect(tree).toMatch(/\n- iframe "https:\/\/example\.com\/outer"/)
+    expect(tree).toMatch(/\n {2}- iframe "https:\/\/example\.com\/inner"/)
+    expect(tree).toMatch(/\n {6}- textbox "Name"/)
     expect((result.data as { frames_same_process: number }).frames_same_process).toBe(2)
   })
 
@@ -382,7 +387,7 @@ describe('same-process frame reads (reads-honesty pass)', () => {
     const tree = data.tree as string
     expect(tree).toMatch(/iframe "https:\/\/example\.com\/f7"/)
     expect(tree).not.toMatch(/iframe "https:\/\/example\.com\/f8"/)
-    expect(tree).toMatch(/2 more frame\(s\) on this page not read/)
+    expect(tree).toMatch(/2 more frame\(s\) in this document not read/)
     // The count is frames RENDERED, never frames discovered: 8 read + 2
     // skipped, and the two must not double-count (review round: "10
     // included, 2 more not read" claimed twelve frames on a ten-frame page).

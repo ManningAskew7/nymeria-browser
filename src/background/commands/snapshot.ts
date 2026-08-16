@@ -475,12 +475,16 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
      *  whether a REAL section was rendered: the payload's frame counts are
      *  claims about what the tree contains, so an empty or unreadable frame
      *  must not inflate them (an over-count here is its own honesty bug,
-     *  review round). */
+     *  review round). `depth` indents the whole section by nesting level, so
+     *  a frame-inside-a-frame reads as contained rather than as a sibling
+     *  (a flat render hid the containment, QA round 1). */
     const renderFrameSection = async (
       target: Cdp,
       frameToken: string,
       frameUrl: string,
+      depth = 0,
     ): Promise<boolean> => {
+      const pad = '  '.repeat(depth)
       try {
         const frameNodes = await treeFor(target)
         if (!frameNodes.length) return false
@@ -495,14 +499,14 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
         for (const [refId, target_] of formatted.refs) allRefs.set(refId, target_)
         const indented = formatted.text
           .split('\n')
-          .map((line) => `  ${line}`)
+          .map((line) => `${pad}  ${line}`)
           .join('\n')
-        sections.push(`- iframe "${frameUrl}"\n${indented}`)
+        sections.push(`${pad}- iframe "${frameUrl}"\n${indented}`)
         return true
       } catch {
         // One unreadable frame must not cost the whole page read. Visible in
         // the tree, but NOT counted as read.
-        sections.push(`- iframe "${frameUrl}" [unreadable]`)
+        sections.push(`${pad}- iframe "${frameUrl}" [unreadable]`)
         return false
       }
     }
@@ -511,21 +515,30 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     let framesLocalRendered = 0
     let framesSkipped = 0
     /** Same-process child frames of one session's document, in document
-     *  order (deterministic ref numbering), capped with an honest tail. */
-    const renderLocalFrames = async (sessionTarget: Cdp): Promise<void> => {
+     *  order (deterministic ref numbering), capped with an honest tail.
+     *  `baseDepth` nests a session's local frames under the section that
+     *  introduced the session (1 for an OOPIF's children). */
+    const renderLocalFrames = async (sessionTarget: Cdp, baseDepth = 0): Promise<void> => {
       const local = await localFrames(sessionTarget)
       const toRead = local.slice(0, MAX_LOCAL_FRAMES)
       for (const f of toRead) {
         const tabId = a.tab_id
         const sessionId = typeof sessionTarget === 'number' ? undefined : sessionTarget.sessionId
-        if (await renderFrameSection({ tabId, sessionId, frameId: f.frameId }, f.frameId, f.url)) {
+        const depth = baseDepth + (f.path.length - 1)
+        if (
+          await renderFrameSection({ tabId, sessionId, frameId: f.frameId }, f.frameId, f.url, depth)
+        ) {
           framesLocalRendered += 1
         }
       }
       if (local.length > toRead.length) {
         const skipped = local.length - toRead.length
         framesSkipped += skipped
-        sections.push(`- [${skipped} more frame(s) on this page not read: frame cap reached]`)
+        // Padded with the section's own base indent: unpadded under an OOPIF
+        // this rendered at the margin as a page-level claim (review round).
+        sections.push(
+          `${'  '.repeat(baseDepth)}- [${skipped} more frame(s) in this document not read: frame cap reached]`,
+        )
       }
     }
 
@@ -549,7 +562,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
         ) {
           framesOopifRendered += 1
         }
-        await renderLocalFrames({ tabId: a.tab_id, sessionId: frame.sessionId })
+        await renderLocalFrames({ tabId: a.tab_id, sessionId: frame.sessionId }, 1)
       }
     }
 

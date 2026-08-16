@@ -289,8 +289,12 @@ function installCdpMock(opts: MockOptions = {}) {
       }
       if (expression.includes('innerWidth')) return { result: { value: { x: 400, y: 300 } } }
       if (expression.includes('innerText.includes')) {
-        const needle = expression.slice(expression.indexOf('includes(') + 9, expression.lastIndexOf(')'))
-        return { result: { value: bodyText.includes(JSON.parse(needle)) } }
+        // The frame-descending scan (QA round 2) carries its needle as a
+        // `var NEEDLE = "..."` binding; a shape drift must fail loudly, not
+        // silently match everything.
+        const m = expression.match(/var NEEDLE = (".*");/)
+        if (!m) throw new Error('wait text needle not found in expression')
+        return { result: { value: bodyText.includes(JSON.parse(m[1]) as string) } }
       }
       if (expression.includes('querySelector') || expression.includes('document.evaluate')) {
         return { result: { objectId: 'css-obj' } }
@@ -888,8 +892,9 @@ describe('verification payload', () => {
         const params = args[2] as { expression?: string } | undefined
         const e = params?.expression
         if (e?.includes('innerText.includes')) {
-          const needle = e.slice(e.indexOf('includes(') + 9, e.lastIndexOf(')'))
-          return { result: { value: body.includes(JSON.parse(needle)) } }
+          const m = e.match(/var NEEDLE = (".*");/)
+          if (!m) throw new Error('wait text needle not found in expression')
+          return { result: { value: body.includes(JSON.parse(m[1]) as string) } }
         }
         return original(...args)
       })
