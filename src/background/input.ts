@@ -1,6 +1,5 @@
 import { budgetSpent } from './budget'
 import { sendCommand, type Cdp } from './debuggerSession'
-import { resolveNodeInProbeWorld } from './worlds'
 
 /**
  * Trusted input primitives.
@@ -99,26 +98,6 @@ export class InputBudgetExhausted extends Error {
     this.delivered = delivered
     this.requested = requested
     this.unit = unit
-  }
-}
-
-/**
- * A cross-frame pointer action whose frame offset could not be measured
- * (`frameOffset` returned null). Its own type because the refusal is
- * load-bearing: dispatching with a guessed or zero offset clicks the wrong
- * PLACE on the root document with full confidence, the exact class the
- * probe-world geometry exists to remove. Nothing has been dispatched when
- * this is thrown; callers turn it into a nothing-was-sent refusal.
- *
- * CURRENTLY UNTHROWN: frame input now dispatches on the frame's own session
- * with frame-local coordinates (see `frameOffset` below), so no caller
- * composes an offset. Kept until the live measurement of that dispatch shape
- * settles whether composition is gone for good.
- */
-export class FrameOffsetUnavailable extends Error {
-  constructor() {
-    super('the frame offset for a cross-frame action could not be measured')
-    this.name = 'FrameOffsetUnavailable'
   }
 }
 
@@ -284,51 +263,14 @@ export async function elementGeometry(target: Cdp, objectId: string): Promise<{ 
   return { point: { x: rect.x, y: rect.y } }
 }
 
-/**
- * Origin of a cross-origin frame in ROOT viewport coordinates.
- *
- * CURRENTLY UNREFERENCED, pending the frame-dispatch live measurement. This
- * composed the root-space point for the old dispatch shape: frame-local rect
- * plus this offset, dispatched on the ROOT session, trusting Chrome to
- * hit-test the point and route the event into the frame's widget. That
- * routing assumption was measured FALSE live (2026-08-15): on the user's
- * Chrome, root-session `Input.*` never reaches OOPIF content at all, however
- * the point is composed (a screenshot-aimed coordinate click no-ops the same
- * way). Input now dispatches on the frame's own session with the frame-local
- * rect directly, so nothing composes. Kept (with `FrameOffsetUnavailable`
- * above) until the measurement confirms the frame-session shape, in case the
- * frame session turns out to want root-space coordinates instead.
- *
- * Handles one level of nesting only. The owner handle is minted in the PROBE
- * WORLD (#160). FAIL-CLOSED: null when the offset cannot be measured; the
- * pre-review shape returned {0,0}, a guaranteed wrong-place click.
- */
-export async function frameOffset(tabId: number, frameId: string): Promise<Point | null> {
-  try {
-    const owner = await sendCommand<{ backendNodeId?: number }>(tabId, 'DOM.getFrameOwner', {
-      frameId,
-    })
-    if (!owner.backendNodeId) return null
-    const resolved = await resolveNodeInProbeWorld(tabId, owner.backendNodeId)
-    if (!resolved.ok) return null
-    const offset = await callOn<Point | null>(
-      tabId,
-      resolved.objectId,
-      `function(){
-        const r = this.getBoundingClientRect();
-        const cs = getComputedStyle(this);
-        const px = (v) => parseFloat(v || '0') || 0;
-        return {
-          x: r.left + px(cs.paddingLeft) + px(cs.borderLeftWidth),
-          y: r.top + px(cs.paddingTop) + px(cs.borderTopWidth),
-        };
-      }`,
-    )
-    return offset ?? null
-  } catch {
-    return null
-  }
-}
+// Frame-offset composition (root-space point = frame-local rect + frame
+// origin, dispatched on the ROOT session) lived here until 2026-08-16. It
+// was removed, not refactored: root-session Input.* was measured live to
+// NEVER reach OOPIF content however the point was composed (2026-08-15),
+// and the replacement shape (dispatch on the frame's own session with
+// frame-local coordinates) was then measured live to deliver, with the
+// per-frame probe confirming arrival. Nothing composes offsets anymore; do
+// not reintroduce composition for cross-frame input.
 
 export interface HitTest {
   hit: boolean

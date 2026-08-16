@@ -1710,11 +1710,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // a main-document ref and the frame's flattened session for an OOPIF ref,
   // and `elementGeometry` reads the rect in that same session, so geometry
   // and dispatch share one coordinate space end to end and nothing composes.
-  // The old shape (root-session dispatch at root coordinates composed via
-  // `frameOffset`, trusting Chrome to hit-test the point into the frame's
-  // widget) was measured live 2026-08-15 to NEVER deliver into an OOPIF on
-  // the user's Chrome: every event acked ok and nothing arrived, while
-  // main-document input landed concurrently in the same tab.
+  // The old shape (root-session dispatch at root coordinates composed from
+  // the frame owner's offset) was measured live 2026-08-15 to NEVER deliver
+  // into an OOPIF on the user's Chrome: every event acked ok and nothing
+  // arrived, while main-document input landed concurrently in the same tab.
 
   let inputMode: 'trusted' | 'synthetic' | 'none' = 'none'
   let previousValue: string | null | undefined
