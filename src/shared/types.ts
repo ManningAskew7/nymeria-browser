@@ -26,6 +26,7 @@ export type CommandType =
   | 'network'
   | 'dialog'
   | 'cdp'
+  | 'reload_extension'
 
 export interface BrowserCommandEvent extends AutonomousEvent {
   type: 'browser_command'

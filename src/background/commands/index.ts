@@ -11,6 +11,7 @@ import { execExtractText } from './extract_text'
 import { execHistory } from './history'
 import { execNavigate } from './navigate'
 import { execNetwork } from './network'
+import { execReloadExtension } from './reload_extension'
 import { execScreenshot } from './screenshot'
 import { execSnapshot } from './snapshot'
 import { execTabs } from './tabs'
@@ -80,6 +81,9 @@ const READS_THE_PAGE: Record<CommandType, boolean> = {
   dialog: false,
   batch: false,
   cdp: false,
+  // Talks only to chrome.runtime; a suspended renderer is irrelevant, and
+  // reloading is exactly what a wedged extension needs.
+  reload_extension: false,
 }
 
 async function runSingle(type: string, args: unknown, ctx?: ExecContext): Promise<CommandResult> {
@@ -128,6 +132,7 @@ export const EXECUTORS: Record<CommandType, Executor> = {
   network: execNetwork,
   dialog: execDialog,
   cdp: execCdp,
+  reload_extension: execReloadExtension,
 }
 
 function errorToString(e: unknown): string {
