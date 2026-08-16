@@ -26,8 +26,11 @@ POSTs results. Consequences:
   ask the user to reload by hand at chrome://extensions.
 - Backend code changes are inert until COMMITTED to main: deploy-sync (a
   5-min idle-gated timer) restarts the stack on commit. Never manually
-  restart after a push; for QA of the backend half, commit first (settled
-  precedent from the #168 and #175 passes). Skew trap (measured
+  restart after a push; for QA of the backend half, commit first, then
+  WAIT for the bounce to land before prompting QA (up to ~5 idle minutes;
+  confirm with `docker inspect nymeria-api --format '{{.State.StartedAt}}'`,
+  since a round dispatched before the restart tests the OLD backend).
+  Settled precedent from the #168 and #175 passes. Skew trap (measured
   2026-08-16): kit manifests (`skills_bundled/*/SKILL.md`) are read from
   the bind mount per-activation while the tool registry loads per-restart,
   so an uncommitted manifest edit naming a not-yet-registered tool makes
