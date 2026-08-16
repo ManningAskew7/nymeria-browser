@@ -808,10 +808,11 @@ Read console messages and uncaught exceptions from a Chrome tab.
     when investigating something broader: what the page logged during load, or
     errors from a step you did not drive.
 
-    Blind spot: capture covers the tab's top document only. A cross-origin
-    iframe logs into its own process and browser-generated policy refusals
-    (X-Frame-Options, CSP) are not captured either, so SILENCE here is not
-    evidence that a frame did nothing (backlog #177).
+    Coverage: cross-origin iframes are captured too, each entry attributed
+    with "frame": "<origin>" (top-document entries carry no frame field).
+    The browser's OWN refusals (X-Frame-Options, CSP, mixed content, CORS)
+    appear as entries marked "browser": true, so a silently blocked action
+    usually names its blocker here in one read.
 ````
 
 ---
@@ -861,12 +862,15 @@ Read the network requests a Chrome tab made, with status codes.
 
     Capture runs from the moment the tab is first driven, so this is history,
     not a recording you have to start. Use it when a page looks fine but
-    something did not take.
+    something did not take. Cross-origin iframe requests are captured too,
+    attributed with "frame": "<origin>".
 
-    Blind spot: capture covers the tab's top document only. Requests a
-    cross-origin iframe makes (its navigations included) go through that
-    frame's own process and do not appear here, so an empty result is not
-    evidence that a frame made no requests (backlog #177).
+    One honest gap: a frame's LOAD-TIME requests often precede capture
+    reaching that frame (its session attaches moments after the frame
+    starts loading), so an iframe's early requests being absent is not
+    evidence they never happened. A load-time failure still surfaces in
+    chrome_console as a "browser": true advisory, so check there before
+    concluding anything from absence.
 ````
 
 ---

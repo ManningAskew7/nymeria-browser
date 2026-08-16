@@ -17,9 +17,13 @@ POSTs results. Consequences:
   EXACTLY 3 minutes (the user's machine auto-pulls and rebuilds on its own
   schedule), then start the QA session on the sanctioned thread and have it
   run `chrome_reload_extension` FIRST, before any testing. No manual step
-  remains in the ordinary loop. Fallback: a build that fails to load
-  strands the extension (the reload tool cannot revive it); only then ask
-  the user to reload by hand at chrome://extensions.
+  remains in the ordinary loop. Bump the manifest version each shipped
+  pass: `version_after` in the reload result is the build confirmation,
+  and a stale value means the rebuild has not landed yet (measured
+  2026-08-16: 3 minutes was once not enough; wait ~2 more and retry the
+  reload rather than QA'ing old code). Fallback: a build that fails to
+  load strands the extension (the reload tool cannot revive it); only then
+  ask the user to reload by hand at chrome://extensions.
 - Backend code changes are inert until COMMITTED to main: deploy-sync (a
   5-min idle-gated timer) restarts the stack on commit. Never manually
   restart after a push; for QA of the backend half, commit first (settled
@@ -59,13 +63,22 @@ POSTs results. Consequences:
   at `gist.githack.com/ManningAskew7/<id>/raw/nymeria-qa-oopif-fixture-2.html`
   and `...-fixture-3.html` (fixture-3: example.org frame + a statically
   frame with links to BOTH example.org and www.iana.org; githack shows a
-  one-click interstitial on first visit). TRAP, measured 2026-08-16
-  (#176 resolution): iana.org serves `X-Frame-Options: DENY` on its whole
-  redirect chain, so an IN-FRAME link to it NEVER navigates, silently, in
-  any frame, and console/network capture shows nothing (both are blind to
-  OOPIF subframes, backlog #177). Use iana links only as a deliberate
-  negative control; example.org's own page link points at iana, which is
-  what made fixture-2's frame look cursed for three rounds.
+  one-click interstitial on first visit), and `...-fixture-4.html`
+  (fixture-3 plus deterministic capture signals: frame B is
+  `nymeria-qa-frame-links-2.html`, which logs "frame-b alive" and fires a
+  same-origin 404 fetch `./nonexistent-177` on load; built for #177, the
+  statically CDN caches gist files hard, so cache-bust with NEW filenames
+  rather than editing one in place). TRAP, measured 2026-08-16 and
+  corrected same day by #177's live capture: an in-frame link to iana.org
+  NEVER navigates. The operative blocker is MIXED CONTENT
+  (`https://www.iana.org/domains/example` 301s to `http://...`, blocked
+  from an HTTPS page before the fetch), with `X-Frame-Options: DENY` on
+  the chain behind it; a curl -L follows past where the browser stops.
+  Since #177 shipped this is no longer silent: the refusal appears as a
+  `browser: true` console advisory and in the act payload's
+  `console_errors`. Use iana links as a deliberate negative control;
+  example.org's own page link points at iana, which is what made
+  fixture-2's frame look cursed for three rounds.
 - Measured 2026-08-15: a fullscreen game occluding the Chrome window makes
   driven navigations onto Basic-auth 401s auto-cancel
   (`net::ERR_INVALID_AUTH_CREDENTIALS`, no prompt, no http_status), and an
@@ -104,12 +117,13 @@ POSTs results. Consequences:
   confirm the user actually clicked Enable + Allow (this bit us 2026-08-15:
   round 1 read as a feature failure and was just the missing grant).
 - MV3 worker recycles: state is in-memory per worker; backend dispatch
-  rides a 75s post-disconnect grace (#172). A "not connected" right after
-  reload is usually just the SSE reconnect, wait a beat. But a BACKEND
-  restart outliving that window (deploy-sync bounce, measured 2026-08-16)
-  leaves the extension disconnected for good: the operator must click
-  Connect in the popup before any QA round. Backlog #176 carries the
-  auto-reconnect row.
+  rides a 75s post-disconnect grace (#172), and a backend RESTART gets its
+  own startup grace (#176 pass: a dispatch in the first ~75s of backend
+  process life holds for the extension's reconnect instead of hard-failing
+  with "click Connect"). The extension DOES auto-reconnect through an
+  ordinary backend restart (measured; the 2026-08-16 strand was a
+  one-off): a "not connected" right after a bounce usually just wants a
+  beat, not a popup click.
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
@@ -137,7 +151,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 13-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `5420f577` / extension `bbf83d3` (2026-08-16).
+live code at backend commit `513b6181` / extension `13c6b82` (2026-08-16).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):
 
