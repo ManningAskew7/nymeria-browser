@@ -99,7 +99,16 @@ POSTs results. Consequences:
   round 1 read as a feature failure and was just the missing grant).
 - MV3 worker recycles: state is in-memory per worker; backend dispatch
   rides a 75s post-disconnect grace (#172). A "not connected" right after
-  reload is usually just the SSE reconnect, wait a beat.
+  reload is usually just the SSE reconnect, wait a beat. But a BACKEND
+  restart outliving that window (deploy-sync bounce, measured 2026-08-16)
+  leaves the extension disconnected for good: the operator must click
+  Connect in the popup before any QA round. Backlog #176 carries the
+  auto-reconnect row.
+- Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
+  STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
+  they refuse honestly when the frame left (`frame-gone`) or navigated
+  (mint-URL compare). Do not "fix" a stale-looking frame ref by re-keying
+  it to a session id.
 
 ## Check commands
 

@@ -18,9 +18,9 @@ import { sendCommand, type Cdp } from './debuggerSession'
  * CDP `DOM.getBoxModel`. Both are CSS pixels but they disagree on coordinate
  * space in ways that vary by Chrome version, whereas `getBoundingClientRect`
  * is unambiguously viewport-relative, which is what `Input.*` wants. Elements
- * inside an iframe report rects relative to THAT frame's viewport, so
- * frame-offset compensation is required before this reaches cross-frame
- * targets.
+ * inside an iframe report rects relative to THAT frame's viewport, which is
+ * exactly the space the frame's own session's `Input.*` wants: cross-frame
+ * input dispatches there with the frame-local rect, nothing composes.
  */
 
 export interface Point {
