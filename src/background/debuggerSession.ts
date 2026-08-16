@@ -36,8 +36,23 @@ const DETACH_LINGER_MS = 10_000
  * Ownership spans exactly the attach and ends with it; a dialog raised
  * outside an attach is not ours and cannot be (a reactive enable does not
  * own a dialog already standing; measured).
+ *
+ * `Log` (#177) carries the browser's OWN advisories: policy refusals
+ * (X-Frame-Options, CSP, mixed content, CORS) ride `Log.entryAdded`, never
+ * the page console, so without it Chrome can refuse an action's whole
+ * effect while every capture reads silence.
  */
-const CAPTURE_DOMAINS = ['Runtime', 'Network', 'Page'] as const
+const CAPTURE_DOMAINS = ['Runtime', 'Network', 'Page', 'Log'] as const
+
+/**
+ * Domains enabled on every auto-attached FRAME session (#177). A
+ * cross-origin iframe is its own target in its own process: nothing it
+ * logs, throws, fetches, or has refused by policy reaches the root
+ * session's streams. Same set as the root minus `Page`: dialog ownership
+ * and chooser interception are tab-scoped concerns the root enable already
+ * covers, and enabling Page per-frame buys nothing here.
+ */
+const FRAME_CAPTURE_DOMAINS = ['Runtime', 'Network', 'Log'] as const
 
 /**
  * A CDP addressee: a tab (the root page session) or one flattened frame
@@ -221,7 +236,18 @@ function boundedCdpCall<T>(
   })
 }
 
-export type CdpEventHandler = (tabId: number, method: string, params: unknown) => void
+/**
+ * `sessionId` names the flattened frame session an event arrived on, or is
+ * undefined for the root page session. Capture subscribers use it to
+ * attribute a frame's console/network activity to that frame (#177);
+ * subscribers that do not care simply declare the shorter signature.
+ */
+export type CdpEventHandler = (
+  tabId: number,
+  method: string,
+  params: unknown,
+  sessionId?: string,
+) => void
 
 const eventHandlers = new Set<CdpEventHandler>()
 
@@ -276,9 +302,13 @@ export function onCdpEvent(handler: CdpEventHandler): () => void {
 function routeCdpEvent(source: { tabId?: number }, method: string, params: unknown): void {
   const tabId = source.tabId
   if (typeof tabId !== 'number') return
+  // Events from flattened frame sessions arrive with `source.sessionId`
+  // set. Read it through a cast: older @types/chrome versions do not
+  // declare the field on Debuggee even though Chrome delivers it.
+  const sessionId = (source as { sessionId?: string }).sessionId
   for (const handler of eventHandlers) {
     try {
-      handler(tabId, method, params)
+      handler(tabId, method, params, sessionId)
     } catch (e) {
       logger.warn(`CDP event handler failed for ${method}:`, e)
     }
@@ -417,6 +447,19 @@ export function installFrameTracking(): void {
       })
       // Arm the child so ITS out-of-process children surface too.
       void armAutoAttach({ tabId, sessionId: p.sessionId })
+      // Give the frame the same capture the root already has (#177). Fire
+      // and forget like the root enables: a frame that refuses degrades to
+      // unattributed silence for that frame, not a failed command.
+      for (const domain of FRAME_CAPTURE_DOMAINS) {
+        void boundedCdpCall(
+          { tabId, sessionId: p.sessionId },
+          `${domain}.enable`,
+          {},
+          CDP_CALL_DEADLINE_MS,
+        ).catch((e: unknown) =>
+          logger.warn(`${domain}.enable failed for frame session tab=${tabId}:`, e),
+        )
+      }
       return
     }
     if (method === 'Target.detachedFromTarget') {
@@ -431,6 +474,28 @@ installFrameTracking()
 /** Flattened cross-origin frame sessions currently known for a tab. */
 export function frameSessions(tabId: number): FrameSession[] {
   return Array.from(sessions.get(tabId)?.frames.values() ?? [])
+}
+
+/**
+ * The ORIGIN of the frame behind a live session id, for capture
+ * attribution (#177). Resolved at event-receipt time while the session is
+ * live, and stored as a plain string on the buffer entry, so attribution
+ * survives the 10s detach without keying anything on the ephemeral
+ * sessionId. The URL is the frame's mint-time URL from auto-attach; a
+ * frame that later navigates in-process keeps its mint attribution, the
+ * same staleness contract the rest of the frame machinery carries.
+ * "unknown" should not happen (auto-attach only announces iframes, and an
+ * event cannot precede its session's announcement), but a wrong label is
+ * worse than an honest one.
+ */
+export function frameOriginForSession(tabId: number, sessionId: string): string {
+  const url = sessions.get(tabId)?.frames.get(sessionId)?.url
+  if (!url) return 'unknown'
+  try {
+    return new URL(url).origin
+  } catch {
+    return 'unknown'
+  }
 }
 
 /**
@@ -520,9 +585,10 @@ async function doAttach(tabId: number, s: Session): Promise<void> {
     s.domains.clear()
     logger.log(`debugger attached tab=${tabId}`)
     // Runtime carries console messages and uncaught exceptions; Network
-    // carries request failures. Both feed the post-action verification
-    // payload, so both are enabled eagerly: capture that starts when you
-    // first ASK is capture that is always empty the first time you ask.
+    // carries request failures; Log carries the browser's own policy
+    // advisories (#177). All feed the post-action verification payload, so
+    // all are enabled eagerly: capture that starts when you first ASK is
+    // capture that is always empty the first time you ask.
     // Through boundedCdpCall, NOT sendCommand: these ride the attach that
     // acquire is already paying for, and re-entering acquire from here would
     // churn the refcount and the detach linger for no benefit. Bounded so a

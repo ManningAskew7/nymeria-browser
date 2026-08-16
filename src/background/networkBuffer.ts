@@ -10,9 +10,13 @@
  * first question you ask about the network is always answered "nothing yet"
  * and you have to reload to see anything. Enabling at attach costs one CDP
  * call per tab and removes that whole class of confusion.
+ *
+ * Requests from cross-origin frame sessions land here too (#177),
+ * frame-attributed; one buffer per tab, shared across its frames, so a
+ * noisy frame can evict root entries (a diagnosis window, not a recorder).
  */
 
-import { onCdpEvent } from './debuggerSession'
+import { frameOriginForSession, onCdpEvent } from './debuggerSession'
 
 export interface NetworkEntry {
   url: string
@@ -23,13 +27,27 @@ export interface NetworkEntry {
   error?: string
   resource_type?: string
   ts: number
+  /**
+   * Origin of the cross-origin frame that made the request (#177). Absent
+   * for the top document, so root entries keep their pre-#177 shape.
+   */
+  frame?: string
 }
 
 const MAX_PER_TAB = 200
 
 const buffers = new Map<number, NetworkEntry[]>()
-/** requestId -> entry, so a response can find the request that opened it. */
+/**
+ * Correlation key -> entry, so a response can find the request that opened
+ * it. Keys are `<sessionId or root>:<requestId>` (#177): requestIds are
+ * only unique WITHIN a CDP session, so two frames (or a frame and the root)
+ * can reuse the same id and must not cross-contaminate.
+ */
 const pending = new Map<number, Map<string, NetworkEntry>>()
+
+function correlationKey(sessionId: string | undefined, requestId: string): string {
+  return `${sessionId ?? 'root'}:${requestId}`
+}
 
 function bufferFor(tabId: number): NetworkEntry[] {
   const buf = buffers.get(tabId) ?? []
@@ -87,7 +105,7 @@ let captureInstalled = false
 export function installCdpNetworkCapture(): () => void {
   if (captureInstalled) return () => undefined
   captureInstalled = true
-  const unsubscribe = onCdpEvent((tabId, method, params) => {
+  const unsubscribe = onCdpEvent((tabId, method, params, sessionId) => {
     if (method === 'Network.requestWillBeSent') {
       const p = params as {
         requestId?: string
@@ -100,8 +118,9 @@ export function installCdpNetworkCapture(): () => void {
         method: p.request.method ?? 'GET',
         resource_type: p.type,
         ts: Date.now(),
+        ...(sessionId ? { frame: frameOriginForSession(tabId, sessionId) } : {}),
       }
-      pendingFor(tabId).set(p.requestId, entry)
+      pendingFor(tabId).set(correlationKey(sessionId, p.requestId), entry)
       push(tabId, entry)
       return
     }
@@ -111,7 +130,7 @@ export function installCdpNetworkCapture(): () => void {
         response?: { status?: number; mimeType?: string }
       }
       if (!p.requestId) return
-      const entry = pendingFor(tabId).get(p.requestId)
+      const entry = pendingFor(tabId).get(correlationKey(sessionId, p.requestId))
       if (!entry) return
       // Mutating the entry already in the buffer keeps request order intact.
       entry.status = p.response?.status
@@ -121,15 +140,16 @@ export function installCdpNetworkCapture(): () => void {
     if (method === 'Network.loadingFailed') {
       const p = params as { requestId?: string; errorText?: string; canceled?: boolean }
       if (!p.requestId) return
-      const entry = pendingFor(tabId).get(p.requestId)
+      const key = correlationKey(sessionId, p.requestId)
+      const entry = pendingFor(tabId).get(key)
       if (!entry) return
       entry.error = p.canceled ? 'canceled' : (p.errorText ?? 'failed')
-      pendingFor(tabId).delete(p.requestId)
+      pendingFor(tabId).delete(key)
       return
     }
     if (method === 'Network.loadingFinished') {
       const p = params as { requestId?: string }
-      if (p.requestId) pendingFor(tabId).delete(p.requestId)
+      if (p.requestId) pendingFor(tabId).delete(correlationKey(sessionId, p.requestId))
     }
   })
   return () => {

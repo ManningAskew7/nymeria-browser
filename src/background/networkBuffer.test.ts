@@ -1,5 +1,9 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { installCdpEventRouter, resetForTests as resetDebugger } from './debuggerSession'
+import {
+  installCdpEventRouter,
+  resetForTests as resetDebugger,
+  sendCommand,
+} from './debuggerSession'
 import {
   failuresSince,
   installCdpNetworkCapture,
@@ -8,8 +12,13 @@ import {
 } from './networkBuffer'
 
 const TAB = 1
+const FRAME_SESSION = 'SESSION-ABC'
 
-type CdpListener = (source: { tabId: number }, method: string, params: unknown) => void
+type CdpListener = (
+  source: { tabId: number; sessionId?: string },
+  method: string,
+  params: unknown,
+) => void
 
 /**
  * Re-bind the CDP router onto the freshly installed chrome mock and hand back
@@ -150,5 +159,65 @@ describe('network capture', () => {
       response: { status: 200 },
     })
     expect(read(TAB)).toHaveLength(0)
+  })
+})
+
+describe('frame-session capture (#177)', () => {
+  /** Attach the tab, then announce a cross-origin frame the way Chrome does. */
+  async function attachFrame(emit: CdpListener): Promise<void> {
+    await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
+    emit({ tabId: TAB }, 'Target.attachedToTarget', {
+      sessionId: FRAME_SESSION,
+      targetInfo: { targetId: 'FRAME-TARGET-1', type: 'iframe', url: 'https://pay.example/card' },
+    })
+  }
+
+  it('attributes a frame request to the frame origin and leaves root entries unadorned', async () => {
+    const emit = wireCapture()
+    await attachFrame(emit)
+
+    emit({ tabId: TAB, sessionId: FRAME_SESSION }, 'Network.requestWillBeSent', {
+      requestId: 'f1',
+      request: { url: 'https://pay.example/api/tokenize', method: 'POST' },
+      type: 'Fetch',
+    })
+    request(emit, 'r1', 'https://example.com/api/cart')
+
+    const entries = read(TAB)
+    expect(entries.map((e) => e.frame)).toEqual(['https://pay.example', undefined])
+    expect('frame' in entries[1]).toBe(false)
+  })
+
+  it('correlates within the session that made the request when requestIds collide', async () => {
+    const emit = wireCapture()
+    await attachFrame(emit)
+
+    // Root and frame both use requestId "1": legal, ids are per-session.
+    // Frame first, root second: a naive shared-key map would have the root
+    // OVERWRITE the frame's pending record, sending the frame's response
+    // to the root's entry.
+    emit({ tabId: TAB, sessionId: FRAME_SESSION }, 'Network.requestWillBeSent', {
+      requestId: '1',
+      request: { url: 'https://pay.example/frame-doc', method: 'GET' },
+    })
+    request(emit, '1', 'https://example.com/root-doc')
+
+    emit({ tabId: TAB, sessionId: FRAME_SESSION }, 'Network.responseReceived', {
+      requestId: '1',
+      response: { status: 404, mimeType: 'text/html' },
+    })
+    emit({ tabId: TAB, sessionId: FRAME_SESSION }, 'Network.loadingFailed', {
+      requestId: '1',
+      errorText: 'net::ERR_BLOCKED_BY_RESPONSE',
+    })
+
+    const entries = read(TAB)
+    const root = entries.find((e) => e.url.includes('root-doc'))
+    const frame = entries.find((e) => e.url.includes('frame-doc'))
+    expect(frame?.status).toBe(404)
+    expect(frame?.error).toBe('net::ERR_BLOCKED_BY_RESPONSE')
+    // The root's identically numbered request is untouched by the frame's fate.
+    expect(root?.status).toBeUndefined()
+    expect(root?.error).toBeUndefined()
   })
 })

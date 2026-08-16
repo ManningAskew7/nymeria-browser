@@ -546,6 +546,31 @@ describe('verification payload', () => {
     expect(errors.map((e) => e.text)).toEqual(['POST /cart 500'])
   })
 
+  it('passes frame attribution and browser advisories through to console_errors (#177)', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+
+    const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+    // The shape a refused in-frame navigation produces: a Log-domain
+    // advisory attributed to the frame. act must relay it verbatim, so the
+    // payload itself names the cause without a separate chrome_console call.
+    pushConsole(TAB, {
+      level: 'error',
+      text: "Refused to display 'https://a.example/' in a frame because it set 'X-Frame-Options' to 'deny'.",
+      ts: Date.now() + 5,
+      browser: true,
+      frame: 'https://pay.example',
+    })
+    const result = await pending
+
+    const errors =
+      (result.data as { console_errors?: { text: string; browser?: boolean; frame?: string }[] })
+        .console_errors ?? []
+    expect(errors).toHaveLength(1)
+    expect(errors[0].browser).toBe(true)
+    expect(errors[0].frame).toBe('https://pay.example')
+  })
+
   // The navigation cases mock the TIMELINE honestly: `chrome.tabs.get` keeps
   // returning the OLD url until a webNavigation commit fires, which is what
   // real Chrome does. The previous shape here flipped the url the instant

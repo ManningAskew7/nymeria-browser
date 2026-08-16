@@ -8,7 +8,7 @@ import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { clearTabWorlds } from './worlds'
 import { clear as clearRefs, dropTab as dropTabRefs } from './snapshotRefs'
 import { installFrameTeardown } from './frameTeardown'
-import { installCdpConsoleCapture } from './consoleBuffer'
+import { clear as clearConsole, installCdpConsoleCapture } from './consoleBuffer'
 import { clearTabNav, installNavWatch } from './navWatch'
 import { clearTabStatus, installStatusWatch } from './statusWatch'
 import { clear as clearNetwork, installCdpNetworkCapture } from './networkBuffer'
@@ -75,6 +75,10 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   // keep it so numbering stays monotonic.
   dropTabRefs(tabId)
   clearNetwork(tabId)
+  // Console was the one per-tab store this listener missed (#177 rider):
+  // a closed tab's id can be reused by Chrome, and its console history
+  // must not greet the new tab.
+  clearConsole(tabId)
   clearTabWorlds(tabId)
   clearTabDialogState(tabId)
   clearTabStatus(tabId)
