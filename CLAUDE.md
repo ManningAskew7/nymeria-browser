@@ -5,6 +5,25 @@ this file over memory; update it when a fact changes. It lives in this repo
 (moved 2026-08-16 from an operator-local skill) so it loads automatically
 when working on the extension.
 
+## Priorities (user-set, 2026-08-16)
+
+Design and review decisions in this stack weigh in this ORDER:
+
+1. **Maximum agent control, functionality, and browser driveability.**
+   When a trade-off surfaces, capability for the driving agent wins. Do
+   not shave capability to buy anything in tiers 2 or 3 without the user's
+   explicit say-so; a reviewer proposing a capability-narrowing change is
+   arguing against the number one priority and needs a case strong enough
+   to escalate, not silently apply.
+2. **Agent best practices.** Clear tool descriptions and schemas, honest
+   payloads, and context discipline: no single call may dump a massive
+   token count into the driving agent's window (caps, pagination, and
+   terse notes exist for this). General agent-UX heuristics live here too
+   (refusals that teach the next step, one fact once, stable keys).
+3. **Everything else**, including security hardening and human-facing UX
+   polish. Real concerns, filed and worked, but they yield to 1 and 2
+   when they collide.
+
 ## The one picture to hold
 
 The EXTENSION runs in the USER'S Chrome on THEIR machine, not on the VPS.
