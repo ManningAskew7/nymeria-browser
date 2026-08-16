@@ -195,6 +195,23 @@ Read a Chrome tab's accessibility tree: the map you act on.
     max_chars: model-facing cap. Oversized trees are truncated with a pointer
         to the full copy on disk.
 
+    Iframes are included, not blind spots: cross-origin and same-origin
+    frames alike each render as their own ``- iframe "<url>"`` section with
+    actable refs, nested frames included, and a trailing [Frames: ...] note
+    counts what was covered (a frame-farm page reads the first 8 per document
+    and says how many were skipped). A scoped read stays in its scope, so an
+    iframe element's own subtree is empty there; read the full page for the
+    frame's section.
+
+    Two honesty notes can follow the tree, both read through the browser's
+    isolated inspection context, so a page cannot suppress them or write
+    them: a [View constraint] note means a modal dialog, aria-modal widget,
+    or fullscreen element is up and content OUTSIDE it is omitted, so a
+    sparse tree means blocked, not empty (the aria-modal signal is page
+    markup, but only a visible dialog-role element counts); a hidden-nodes
+    note counts content the page hides (aria-hidden, inert) that was
+    dropped from the tree.
+
     A payload carrying "page_loading": true was captured while the tab was
     still loading: the tree is whatever had committed at that instant. If it
     looks sparse, re-read after a moment rather than concluding the page is
@@ -287,7 +304,9 @@ Find elements on a Chrome tab by describing them in plain language.
     Returns matching ``@eN`` refs with their role and name, best first, ready
     to hand to chrome_act. Matching is semantic, so it finds an element by what
     it DOES even when the wording differs, and it reaches elements a screenshot
-    cannot, including ones scrolled far off the visible viewport.
+    cannot, including ones scrolled far off the visible viewport and elements
+    inside iframes (cross-origin and same-origin alike: the searched tree
+    includes every frame's section).
 
     It searches the accessibility tree, so it sees what a screen reader sees.
     An element the page hides outright (``display:none``, ``hidden``) is not in
@@ -500,7 +519,8 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     wait_for_text / wait_for_url / wait_for_ref / timeout_ms: a wait
         condition, honoured on EVERY action, not just action="wait". The
         action is delivered first; the call then returns as soon as the
-        condition holds (text visible on the page, URL containing a
+        condition holds (text visible on the page, frame content included,
+        both frame classes, the same coverage as a read; URL containing a
         substring, an element present: a "@eN" ref or a "css=" selector), or
         once timeout_ms (default 5000) elapses. A met condition is positive
         evidence the action did what it was for. An unmet one on a delivered
@@ -550,17 +570,21 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     that your input missed. A fill reports "input_delivered" through its
     trusted input event the same way.
 
-    Frames are full targets, not blind spots. A ref inside a cross-origin
-    iframe gets its input dispatched inside that frame and its delivery
-    verified there, so an in-frame silent no-op FAILS like anything else, and
-    the ref stays valid while the frame lives; if the frame navigated away or
-    was removed, the act refuses and says to re-read. Ref-less type/key follow
-    the focused element into a frame and verify there too. Two deliberate
-    refusals: a coordinate click/hover/drag landing on a cross-origin iframe
-    is refused up front (page coordinates cannot reach into another origin's
-    frame; act on that frame's own refs from the page read instead), and so is
-    a drag whose two ends do not sit in the same frame, root to frame
-    included.
+    Frames are full targets, not blind spots. A ref inside an iframe, whether
+    cross-origin or same-origin, gets its input dispatched into that frame
+    and its delivery verified there, so an in-frame silent no-op FAILS like
+    anything else, and the ref stays valid while the frame lives; if the
+    frame navigated away or was removed, the act refuses and says to
+    re-read. Ref-less type/key follow the focused element into a
+    cross-origin frame and verify there; focused inside a SAME-ORIGIN frame
+    they deliver correctly but verification reads "unknown" (the probe
+    watches the top document). Two deliberate refusals: a coordinate click/hover/drag
+    landing on a CROSS-ORIGIN iframe is refused up front (page coordinates
+    cannot reach into another origin's frame; act on that frame's own refs
+    from the page read instead; same-origin frames accept coordinates
+    normally), and so is a drag whose two ends do not sit in the same frame,
+    root to frame included. One limit: css=/xpath= targets resolve in the
+    ROOT document only; inside any frame, use the frame section's @refs.
 
     Page dialogs your own action raises are OWNED while you drive
     (alert/confirm/prompt/"Leave site?"). An alert is acknowledged

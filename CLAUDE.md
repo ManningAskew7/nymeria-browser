@@ -71,7 +71,12 @@ POSTs results. Consequences:
   `nymeria-qa-frame-links-2.html`, which logs "frame-b alive" and fires a
   same-origin 404 fetch `./nonexistent-177` on load; built for #177, the
   statically CDN caches gist files hard, so cache-bust with NEW filenames
-  rather than editing one in place). TRAP, measured 2026-08-16 and
+  rather than editing one in place), and `...-sameproc-fixture-5.html`
+  (reads-honesty pass: same-origin child frame with `#child-btn`/
+  `#child-input`/`#child-status`, DOUBLY-nested grandchild with
+  `#grand-btn`/`#grand-status`, showModal `#open-modal` + dialog `#dlg`,
+  an aria-hidden block, `#behind-modal`; the nested-frame and
+  collapse/hidden honesty target). TRAP, measured 2026-08-16 and
   corrected same day by #177's live capture: an in-frame link to iana.org
   NEVER navigates. The operative blocker is MIXED CONTENT
   (`https://www.iana.org/domains/example` 301s to `http://...`, blocked
@@ -131,7 +136,20 @@ POSTs results. Consequences:
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
   (mint-URL compare). Do not "fix" a stale-looking frame ref by re-keying
-  it to a session id.
+  it to a session id. Since the reads-honesty pass (v0.4.0/0.5.0) the same
+  token space also covers SAME-PROCESS frames (`Page.FrameId`; no session,
+  everything rides the shared one).
+- Reads-honesty traps (v0.5.0, measured): the same-process occlusion gate
+  must test the OUTERMOST local ancestor's owner (`LocalFrame.path[0]`),
+  never the immediate one, and must SKIP (fail open) when no ancestor
+  chain is readable; both wrong forms deterministically refuse every
+  nested-frame act as covered by its own ancestor. Same-process dispatch
+  points come from `DOM.getContentQuads` on the element's OWN session
+  (backendNodeIds are per-process; root-session quads for a
+  nested-in-OOPIF node describe the wrong element). act.test's wait
+  mocks extract the needle from the scan expression's
+  `var NEEDLE = "..."` binding and THROW on shape drift: changing
+  `waitTextExpression`'s shape means updating both mock sites.
 
 ## Check commands
 
@@ -154,7 +172,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 13-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `513b6181` / extension `13c6b82` (2026-08-16).
+live code at backend commit `ecdc5d92` / extension `18fe21e` (2026-08-16).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):
 
