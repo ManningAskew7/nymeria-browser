@@ -537,6 +537,19 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     "unknown" is not a failure, it means the check could not be made, and
     "input_delivered_reason" names why; judge those by the rest of the payload.
 
+    Delivery comes with a diagnosis, not just a verdict. "input_events" counts
+    the trusted events by type (for a click, a missing "click" key means the
+    press arrived but never composed into a click); on the click family,
+    "default_prevented" says whether a page handler cancelled the composed
+    click, "click_target" names the element it composed on (tag, and the
+    enclosing link's URL when there is one), and "user_activation" reports the
+    frame's activation state after dispatch. Together these turn "the click
+    did nothing" from a four-call investigation into one read: delivered plus
+    a composed, un-prevented click on the link you meant, with no navigation
+    following, means the page or browser declined the default action, not
+    that your input missed. A fill reports "input_delivered" through its
+    trusted input event the same way.
+
     Frames are full targets, not blind spots. A ref inside a cross-origin
     iframe gets its input dispatched inside that frame and its delivery
     verified there, so an in-frame silent no-op FAILS like anything else, and
@@ -794,6 +807,11 @@ Read console messages and uncaught exceptions from a Chrome tab.
     chrome_act already reports errors caused by an action, so reach for this
     when investigating something broader: what the page logged during load, or
     errors from a step you did not drive.
+
+    Blind spot: capture covers the tab's top document only. A cross-origin
+    iframe logs into its own process and browser-generated policy refusals
+    (X-Frame-Options, CSP) are not captured either, so SILENCE here is not
+    evidence that a frame did nothing (backlog #177).
 ````
 
 ---
@@ -844,6 +862,11 @@ Read the network requests a Chrome tab made, with status codes.
     Capture runs from the moment the tab is first driven, so this is history,
     not a recording you have to start. Use it when a page looks fine but
     something did not take.
+
+    Blind spot: capture covers the tab's top document only. Requests a
+    cross-origin iframe makes (its navigations included) go through that
+    frame's own process and do not appear here, so an empty result is not
+    evidence that a frame made no requests (backlog #177).
 ````
 
 ---
@@ -976,13 +999,15 @@ Reload the Nymeria browser extension from disk (dev-loop helper).
     chrome://extensions. Use it when asked to reload the extension, or when
     a just-deployed extension change needs to go live before testing it.
 
-    The extension acks first and reloads itself about 2.5 seconds later, so
-    the result reports the version that WAS running, not the new one. The
-    reload drops the extension's connection for a few seconds (it
-    re-establishes itself), releases every driven tab (the debugger banner
-    clears, held dialogs are dropped), and loses any in-flight commands:
-    run it alone, never inside chrome_batch, and wait about 10 seconds
-    before the next chrome_* call. If the code on disk does not load,
-    the extension stays down until the user reloads it by hand at
-    chrome://extensions, so only use it on a build known to be good.
+    The extension acks first and reloads itself about 2.5 seconds later.
+    The payload's version_before is the build that WAS running; this tool
+    then waits (bounded) for the reloaded worker to resubscribe and appends
+    a line naming the version now running (version_after), at which point
+    the next chrome_* call is safe immediately. If that line instead says
+    the extension did not come back, the new build may have failed to load,
+    and the extension stays down until the user reloads it by hand at
+    chrome://extensions, so only use this on a build known to be good. The
+    reload releases every driven tab (the debugger banner clears, held
+    dialogs are dropped) and loses any in-flight commands: run it alone,
+    never inside chrome_batch.
 ````

@@ -54,12 +54,18 @@ POSTs results. Consequences:
   SAMEORIGIN, unusable inside iframes), `https://pypi.nymeriaos.com/simple/`
   (our own bare 401, `WWW-Authenticate: Basic realm="pypi"`). httpbin.org
   and httpstat.us were both DOWN during the 2026-08-15 QA; curl-check
-  before building a round on them. OOPIF fixture (gist
-  `5abcda526e35b6ad0bee69af96989a44`, editable via `gh gist edit`):
-  parent `gist.githack.com/ManningAskew7/<id>/raw/nymeria-qa-oopif-fixture-2.html`
-  (main-doc button + example.org frame + cross-site input frame served via
-  cdn.statically.io; githack shows a one-click interstitial on first
-  visit).
+  before building a round on them. OOPIF fixtures (gist
+  `5abcda526e35b6ad0bee69af96989a44`, editable via `gh gist edit`), parents
+  at `gist.githack.com/ManningAskew7/<id>/raw/nymeria-qa-oopif-fixture-2.html`
+  and `...-fixture-3.html` (fixture-3: example.org frame + a statically
+  frame with links to BOTH example.org and www.iana.org; githack shows a
+  one-click interstitial on first visit). TRAP, measured 2026-08-16
+  (#176 resolution): iana.org serves `X-Frame-Options: DENY` on its whole
+  redirect chain, so an IN-FRAME link to it NEVER navigates, silently, in
+  any frame, and console/network capture shows nothing (both are blind to
+  OOPIF subframes, backlog #177). Use iana links only as a deliberate
+  negative control; example.org's own page link points at iana, which is
+  what made fixture-2's frame look cursed for three rounds.
 - Measured 2026-08-15: a fullscreen game occluding the Chrome window makes
   driven navigations onto Basic-auth 401s auto-cancel
   (`net::ERR_INVALID_AUTH_CREDENTIALS`, no prompt, no http_status), and an
@@ -131,7 +137,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 13-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `f99b9867` / extension `57ee19b` (2026-08-16).
+live code at backend commit `5420f577` / extension `bbf83d3` (2026-08-16).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):
 

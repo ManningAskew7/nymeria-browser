@@ -114,8 +114,11 @@ export interface DeliveryProbe {
    * probe's world, so the final read can prove delivery but loses the
    * per-type counts; a peek taken right after dispatch preserves them for
    * that case (QA-operator rider, 2026-08-16: the SUCCESS payload was
-   * data-poorer than the failure one). Never throws; a peek that finds a
-   * dead context simply stores nothing.
+   * data-poorer than the failure one). BEST EFFORT: an instantly-committing
+   * navigation can kill the context before even this runs (measured live on
+   * a hot-cache frame nav, 2026-08-16); the payload then simply omits the
+   * counts, as before. Never throws; a peek that finds a dead context
+   * stores nothing.
    */
   peek(): Promise<void>
 }
