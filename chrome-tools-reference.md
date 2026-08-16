@@ -659,6 +659,26 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     blocker named and the exact coordinate included: dismiss a real overlay
     and retry, or, when the blocker is the target's own widget (a styled
     control), click that coordinate deliberately.
+
+    Three more refusals come BEFORE anything is dispatched, each naming the
+    state it found rather than letting it surface as a mystery. A target the
+    browser marks disabled refuses with "refused": "disabled" (a disabled
+    control receives no events at all, so a retry cannot land: something has
+    to enable it first). A read-only field refuses a fill or type with
+    "refused": "readonly". A target with CSS pointer-events: none refuses
+    with "refused": "pointer_events_none", which is NOT an overlay to
+    dismiss: the element cannot take a click where it stands, and the
+    message names what the click would have hit instead. All three sent
+    nothing, so nothing needs undoing. These three read the element itself,
+    which only a "@eN" ref allows: a "css="/"xpath=" target is not probed
+    and behaves as it did before.
+
+    Acting on something invisible is reported, not refused. A transparent
+    element that still wins the hit test is usually the deliberate target
+    (custom file pickers and checkboxes are built exactly that way), so the
+    click goes in and the result carries "target_invisible": true. Take it
+    as a prompt to check you meant that element and not the thing the user
+    can actually see there.
 ````
 
 ---

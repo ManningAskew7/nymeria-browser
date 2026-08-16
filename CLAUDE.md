@@ -45,7 +45,11 @@ POSTs results. Consequences:
   holds the running QA history (#168 fused waits, nav honesty, #175
   http_status, budget, batched upload, #160 worlds/refs, OOPIF input). The
   driving agent there is capable; give it one focused round per message and
-  have it quote payload fields.
+  have it quote payload fields. A FRESH thread is fine (and better when the
+  user may be working in that one): the actionability pass ran on `01f4dec8`
+  with no loss, since each round carries its own fixture and expectations.
+  Set the model on a new thread (`/model claude-opus-5 thread`); a fresh
+  thread otherwise inherits the default, which is not the QA-grade one.
 - After an extension push, the round starts with `chrome_reload_extension`
   (see the deploy flow above) so QA always runs the just-shipped code.
 - Standing user request: after functional rounds, ALWAYS ask the thread
@@ -76,7 +80,20 @@ POSTs results. Consequences:
   `#child-input`/`#child-status`, DOUBLY-nested grandchild with
   `#grand-btn`/`#grand-status`, showModal `#open-modal` + dialog `#dlg`,
   an aria-hidden block, `#behind-modal`; the nested-frame and
-  collapse/hidden honesty target). TRAP, measured 2026-08-16 and
+  collapse/hidden honesty target), `...-actionability-fixture-6.html`
+  (actionability pass: `#disabled-btn` + `#disabled-check` (disabled),
+  `#readonly-input` (readonly) beside `#normal-input` (control),
+  `#invisible-input` (opacity:0 real control over a styled box,
+  the annotate case), `#ghost-btn` (pointer-events:none over page
+  background), and `#child-frame` under a real `#overlay` with
+  `#dismiss-overlay`; child is `...-actionability-child-6.html` with
+  `#child-btn`/`#child-status`. Every status paragraph starts
+  `*-untouched`, so a refusal that actually acted is visible in one read),
+  and `...-mixed-kind-fixture-1.html` (`#parent-btn`, same-origin
+  `#wrapper-frame` -> `...-mixed-kind-wrapper-1.html` with
+  `#wrapper-btn`/`#wrapper-input` and an example.org OOPIF `#oopif-frame`:
+  an out-of-process frame nested inside a same-process one, so both frame
+  kinds are exercised in a single tree). TRAP, measured 2026-08-16 and
   corrected same day by #177's live capture: an in-frame link to iana.org
   NEVER navigates. The operative blocker is MIXED CONTENT
   (`https://www.iana.org/domains/example` 301s to `http://...`, blocked
@@ -131,7 +148,11 @@ POSTs results. Consequences:
   with "click Connect"). The extension DOES auto-reconnect through an
   ordinary backend restart (measured; the 2026-08-16 strand was a
   one-off): a "not connected" right after a bounce usually just wants a
-  beat, not a popup click.
+  beat, not a popup click. Snapshots die with the worker too: measured
+  2026-08-16, both QA tabs answered `stale_refs: true, reason: "no-snapshot"`
+  about 90 seconds after their last act, with NO navigation and page state
+  intact. Mid-QA that is the worker recycling, not a bug in the round: re-read
+  the page and carry on (the honest-copy half is filed as a residual).
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
@@ -150,6 +171,28 @@ POSTs results. Consequences:
   mocks extract the needle from the scan expression's
   `var NEEDLE = "..."` binding and THROW on shape drift: changing
   `waitTextExpression`'s shape means updating both mock sites.
+- Actionability traps (v0.6.0, measured): `elementFromPoint` on a
+  `pointer-events: none` target answers its ANCESTOR, so a gate keyed on
+  `hit === false` alone would almost never fire live while the click landed
+  on the wrapper and the payload reported delivery. `HIT_TEST_FN` therefore
+  returns `via: 'self' | 'descendant' | 'ancestor'`, and only a MISS or an
+  ancestor hit is a pointer-events refusal (a descendant hit is the
+  legitimate `pointer-events: none` container). Two page facts are live, not
+  static: `readonly` clears on focus (anti-autofill fields, date pickers) so
+  that decision sits in fill/type AFTER their own `focusElement`, and
+  `pointer-events` changes mid-transition, so both re-ask a single fact on
+  the refusal path only. The facts ride the EXISTING ref-resolution probe
+  (`ACTIONABILITY_FN` in `input.ts`), which is why they cover `@eN` refs and
+  not `css=`/`xpath=`; act.test pins both the zero-extra-round-trips
+  property and the one-probe-world-per-act ratchet, so a new probe call is a
+  test failure, not a review catch. Pre-dispatch refusals use the payload
+  key `refused` (`disabled`, `readonly`, `pointer_events_none`), never
+  `reason` (that is the STALE-ref key). act.test's `Runtime.callFunctionOn`
+  mock routes by SUBSTRING and the actionability body contains
+  `isConnected`, `isContentEditable` and `getComputedStyle`, so its branch
+  must come FIRST and key on `checkVisibility`; frames.test had a DEAD
+  `getComputedStyle` branch (a legacy frame-offset probe) that would
+  otherwise have answered the new probe with `{x, y}`.
 
 ## Check commands
 
@@ -172,7 +215,8 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 13-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `ecdc5d92` / extension `18fe21e` (2026-08-16).
+live code at backend commit `ed1fdbef` / extension `4705dfb` (v0.6.0,
+2026-08-16).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):
 
