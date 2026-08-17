@@ -123,11 +123,20 @@ POSTs results. Consequences:
   `#tiny-a`/`#tiny-b`/`#tiny-c` that no plain capture can resolve, a
   canvas, a compositor-promoted layer, four fixed viewport-corner markers,
   and a 1400px scroll band so an element sits well below the fold),
-  and `...-mixed-kind-fixture-1.html` (`#parent-btn`, same-origin
+  `...-mixed-kind-fixture-1.html` (`#parent-btn`, same-origin
   `#wrapper-frame` -> `...-mixed-kind-wrapper-1.html` with
   `#wrapper-btn`/`#wrapper-input` and an example.org OOPIF `#oopif-frame`:
   an out-of-process frame nested inside a same-process one, so both frame
-  kinds are exercised in a single tree). TRAP, measured 2026-08-16 and
+  kinds are exercised in a single tree), `...-shadow-fixture-8.html`
+  (selector pass: `#shadow-btn`/`#shadow-input` in an OPEN root, `#deep-btn`
+  in a root nested in a root, `#closed-btn` in a CLOSED one, `.dup-target`
+  in BOTH light and shadow, three `.triple` buttons, `#shadow-disabled`),
+  and `...-frames-order-8.html` (the frame EMISSION-ORDER case: its first
+  same-origin frame is the mixed-kind wrapper holding an example.org OOPIF,
+  its second is `...-deep-child-8.html` holding
+  `...-deep-grand-8.html#tab2`, so a cross-origin section printed after
+  both local ones reads as the second one's child, and the grandchild gives
+  a two-deep focus target whose frame URL carries a fragment). TRAP, measured 2026-08-16 and
   corrected same day by #177's live capture: an in-frame link to iana.org
   NEVER navigates. The operative blocker is MIXED CONTENT
   (`https://www.iana.org/domains/example` 301s to `http://...`, blocked
@@ -216,8 +225,9 @@ POSTs results. Consequences:
   that decision sits in fill/type AFTER their own `focusElement`, and
   `pointer-events` changes mid-transition, so both re-ask a single fact on
   the refusal path only. The facts ride the EXISTING ref-resolution probe
-  (`ACTIONABILITY_FN` in `input.ts`), which is why they cover `@eN` refs and
-  not `css=`/`xpath=`; act.test pins both the zero-extra-round-trips
+  (`ACTIONABILITY_FN` in `input.ts`), and since v0.8.0 a SELECTOR target gets
+  them too, from `SELECTOR_FACTS_FN`, which composes that same body and adds
+  the selector-only pair (match count, shadow provenance) on the same call; act.test pins both the zero-extra-round-trips
   property and the one-probe-world-per-act ratchet, so a new probe call is a
   test failure, not a review catch. Pre-dispatch refusals use the payload
   key `refused` (`disabled`, `readonly`, `pointer_events_none`), never
@@ -227,6 +237,44 @@ POSTs results. Consequences:
   must come FIRST and key on `checkVisibility`; frames.test had a DEAD
   `getComputedStyle` branch (a legacy frame-offset probe) that would
   otherwise have answered the new probe with `{x, y}`.
+
+- Selector and frame traps (v0.8.0, measured):
+  - `document.elementFromPoint` RETARGETS a shadow hit to the HOST and
+    `Node.contains` never crosses a shadow boundary, so a hit test run in the
+    document refuses a button inside an open root as "covered by" its own
+    component. Test the point in the target's OWN `getRootNode()`
+    (`HIT_TEST_FN`, `FOCUS_LANDED_FN`). Everything else that hit-tests a
+    point (`OWNER_AT_POINT_FN`, `describePoint`, `OPENS_FILE_CHOOSER`) is
+    still document-only, deliberately: filed, not forgotten.
+  - A CLOSED shadow root is unreachable from EVERY world (encapsulation is
+    not world-scoped) and cannot be told apart from "no root at all", since
+    `el.shadowRoot` is null for both. Any hint built on that fact has to be
+    soft; refs reach closed content because they ride the AX tree.
+  - The bounded open-root walk lives in `src/background/shadowWalk.ts`, not
+    in a command: two probes need the SAME walk and must agree about it (the
+    resolution stops at the first match, the count adds up every match), and
+    a count taken over different scopes than the resolution searched is worse
+    than no count. It is also the reusable piece for the filed alignment of
+    `region_ref` / `scope_selector` / `extract_text`.
+  - `Runtime.evaluate` returns primitives ON the RemoteObject even with
+    `returnByValue: false`, which is what lets one call return either a node
+    handle or a by-value miss marker. Key the branch on `result.type ===
+    'string'`, never on the value alone.
+  - A thrown expression still returns a `result`: the Error OBJECT, with a
+    usable objectId. Check `exceptionDetails`, or an invalid selector
+    resolves to an exception and the act proceeds on it.
+  - An OOPIF is ABSENT from its parent's frame tree, but its own session's
+    root node carries `parentId`: the only place that relationship is on the
+    wire. Emission ORDER matters as much as depth, because indentation is the
+    tree's only containment signal.
+  - `document.activeElement` is the frame OWNER in every ancestor of the
+    focused document (so a first-true-wins sweep picks the outermost frame)
+    AND is a per-document record that survives its document leaving the focus
+    chain (so asking each frame's own parent turns one question into N and
+    the first stale yes wins, which sends trusted keystrokes into the wrong
+    origin). Ask in the ONE document the focus read names.
+  - `Page.Frame.url` is defined WITHOUT the fragment; `location.href` carries
+    it. Compare the two fragment-free or the match silently empties.
 
 - Capture traps (v0.7.x, every one measured, several the opposite of what
   reasoning predicted):
@@ -293,7 +341,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 13-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `ecbf4719` / extension `b428133` (v0.7.2,
+live code at backend commit `9da56b61` / extension `b55b068` (v0.8.0,
 2026-08-17).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):

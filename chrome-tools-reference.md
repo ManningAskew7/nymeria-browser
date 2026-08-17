@@ -197,20 +197,22 @@ Read a Chrome tab's accessibility tree: the map you act on.
 
     Iframes are included, not blind spots: cross-origin and same-origin
     frames alike each render as their own ``- iframe "<url>"`` section with
-    actable refs, nested frames included, and a trailing [Frames: ...] note
-    counts what was covered (a frame-farm page reads the first 8 per document
-    and says how many were skipped). A scoped read stays in its scope, so an
-    iframe element's own subtree is empty there; read the full page for the
-    frame's section.
+    actable refs, indented under the frame that embeds them, and a trailing
+    [Frames: ...] note counts what was covered and how much of it was nested
+    (a frame-farm page reads the first 8 per document and says how many were
+    skipped). A scoped read stays in its scope, so an iframe element's own
+    subtree is empty there; read the full page for the frame's section.
 
     Two honesty notes can follow the tree, both read through the browser's
     isolated inspection context, so a page cannot suppress them or write
     them: a [View constraint] note means a modal dialog, aria-modal widget,
     or fullscreen element is up and content OUTSIDE it is omitted, so a
     sparse tree means blocked, not empty (the aria-modal signal is page
-    markup, but only a visible dialog-role element counts); a hidden-nodes
-    note counts content the page hides (aria-hidden, inert) that was
-    dropped from the tree.
+    markup, but only a visible dialog-role element counts; the probe reads
+    the TOP document only, so a modal inside an iframe is not reported and a
+    sparse frame section is worth checking by eye); a hidden-nodes note
+    counts content the page hides (aria-hidden, inert) that was dropped from
+    the tree.
 
     A payload carrying "page_loading": true was captured while the tab was
     still loading: the tree is whatever had committed at that instant. If it
@@ -313,7 +315,8 @@ Find elements on a Chrome tab by describing them in plain language.
     that tree and will not be found here. The usual case is the real
     ``<input type="file">`` behind a styled upload button: target it directly
     with ``chrome_act(ref="css=input[type=file]", action="upload")``, which
-    resolves through the DOM and does not care whether it is visible.
+    resolves through the DOM (open shadow roots included) and does not care
+    whether it is visible.
 
     Returns "no matches" rather than an error when nothing fits, so a failed
     search costs you a note instead of a dead turn. Prefer this over reading a
@@ -508,7 +511,17 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         (3)" to "Cart (4)"); for the rare label that rewords itself
         constantly, target it with "css=". Believe those refusals and
         re-read; they exist because acting on a repurposed element clicks
-        the wrong thing with full confidence.
+        the wrong thing with full confidence. A "css=" selector HERE (this
+        tool only, not chrome_read_page's scope or extract_text) tries the
+        page's own DOM first and, only when that matches nothing, searches
+        OPEN shadow roots, so a control inside a web component needs no new
+        syntax; the result says "matched_in": "shadow-root" when that is
+        where it came from. Nothing reaches a CLOSED shadow root by
+        selector, but a page read does: use the element's "@eN" ref there.
+        "xpath=" never crosses a shadow boundary (XPath cannot express one),
+        so prefer "css=". A selector matching several elements acts on ONE
+        of them and reports "selector_matches": N, so narrow it if the count
+        surprises you.
     value: the text for fill/type, the option label or value for select, the
         key name for key (e.g. "Enter", "Tab", "Escape").
     coordinate: [x, y] viewport pixels, as an alternative target for click,
@@ -527,7 +540,13 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         both frame classes, the same coverage as a read; URL containing a
         substring, an element present: a "@eN" ref or a "css=" selector), or
         once timeout_ms (default 5000) elapses. A met condition is positive
-        evidence the action did what it was for. An unmet one on a delivered
+        evidence the action did what it was for ("waited_ms" times the wait
+        itself, nothing before it). On a bare action="wait" a met condition
+        can carry "condition_met_before_wait": true, meaning it already held
+        at the first check rather than appearing while you waited; a wait
+        fused to an action never reports it, because that wait opens after
+        the action has settled, where already-true is the ordinary shape of
+        success. An unmet one on a delivered
         action does NOT fail the call: the payload carries found: false and
         the input still went in, so judge the outcome, not the wait. This
         makes "click and confirm the row appeared" ONE call, not a click
@@ -579,10 +598,11 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     and its delivery verified there, so an in-frame silent no-op FAILS like
     anything else, and the ref stays valid while the frame lives; if the
     frame navigated away or was removed, the act refuses and says to
-    re-read. Ref-less type/key follow the focused element into a
-    cross-origin frame and verify there; focused inside a SAME-ORIGIN frame
-    they deliver correctly but verification reads "unknown" (the probe
-    watches the top document). Two deliberate refusals: a coordinate click/hover/drag
+    re-read. Ref-less type/key follow the focused element into a frame of
+    either kind and are verified inside that frame's own document, so an
+    in-frame keystroke that vanished usually FAILS rather than reporting
+    "unknown" (a frame that itself embeds another frame still reports
+    "unknown": the probe cannot rule out a deeper document). Two deliberate refusals: a coordinate click/hover/drag
     landing on a CROSS-ORIGIN iframe is refused up front (page coordinates
     cannot reach into another origin's frame; act on that frame's own refs
     from the page read instead; same-origin frames accept coordinates
@@ -673,9 +693,9 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     with "refused": "pointer_events_none", which is NOT an overlay to
     dismiss: the element cannot take a click where it stands, and the
     message names what the click would have hit instead. All three sent
-    nothing, so nothing needs undoing. These three read the element itself,
-    which only a "@eN" ref allows: a "css="/"xpath=" target is not probed
-    and behaves as it did before.
+    nothing, so nothing needs undoing. They read the element itself, which
+    every ref and selector target gets; only a bare coordinate, having no
+    element to read, goes unchecked.
 
     Acting on something invisible is reported, not refused. A transparent
     element that still wins the hit test is usually the deliberate target
