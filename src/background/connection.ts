@@ -143,16 +143,26 @@ async function connectOnce(): Promise<void> {
       for (const frame of frames) {
         const data = frameToData(frame)
         if (!data) continue
+        let event: AutonomousEvent
         try {
-          const event = JSON.parse(data) as AutonomousEvent
-          await recordEvent(event)
-          if (event.type === 'browser_command') {
-            // Fire-and-forget; per-command try/catch is inside the dispatcher.
-            void dispatchBrowserCommand(event as BrowserCommandEvent)
-          }
+          event = JSON.parse(data) as AutonomousEvent
         } catch (error) {
           logger.warn('failed to parse SSE frame:', error, data.slice(0, 200))
+          continue
         }
+        if (event.type === 'browser_command') {
+          // Fire-and-forget; per-command try/catch is inside the dispatcher.
+          void dispatchBrowserCommand(event as BrowserCommandEvent)
+        }
+        // Journal AFTER dispatch, and never on its critical path. The journal
+        // writes to `chrome.storage.local`, whose 10MB quota REJECTS a large
+        // upload envelope: with the write first and inside the same try, that
+        // rejection ate the command, so every upload over roughly 7.5MB
+        // silently never ran and rode the transport timeout out as a page
+        // problem. Bookkeeping is a diagnostic; the command is the job.
+        void recordEvent(event).catch((error: unknown) => {
+          logger.warn('failed to journal event:', error)
+        })
       }
     }
   } catch (error) {

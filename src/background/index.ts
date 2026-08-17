@@ -3,7 +3,7 @@ import { clearConfig, ensureClientId, getConfig, setConfig } from '../utils/stor
 import { HttpError, ping, whoami } from './api'
 import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
-import { activeTabs as activeDebuggerTabs } from './debuggerSession'
+import { activeTabs as activeDebuggerTabs, forgetTab as forgetDebuggerTab } from './debuggerSession'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { clearTabWorlds } from './worlds'
 import { clear as clearRefs, dropTab as dropTabRefs } from './snapshotRefs'
@@ -75,6 +75,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   // keep it so numbering stays monotonic.
   dropTabRefs(tabId)
   clearNetwork(tabId)
+  // Same reason as the refs above: tab ids come back around, and a new tab
+  // must not inherit "capture has run here" from the one that closed.
+  forgetDebuggerTab(tabId)
   // Console was the one per-tab store this listener missed (#177 rider):
   // a closed tab's id can be reused by Chrome, and its console history
   // must not greet the new tab.

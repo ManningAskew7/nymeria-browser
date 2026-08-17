@@ -152,6 +152,22 @@ describe('network capture', () => {
     ])
   })
 
+  it('reads limit 0 as none and an omitted limit as everything buffered', () => {
+    // `limit: 0` used to fall through a `> 0` guard and return the whole
+    // buffer, so the caller asking for nothing got the most this can give.
+    const emit = wireCapture()
+    request(emit, 'a', 'https://example.com/one')
+    request(emit, 'b', 'https://example.com/two')
+    request(emit, 'c', 'https://example.com/three')
+
+    expect(read(TAB, { limit: 0 })).toEqual([])
+    expect(read(TAB, { limit: 2 }).map((e) => e.url)).toEqual([
+      'https://example.com/two',
+      'https://example.com/three',
+    ])
+    expect(read(TAB).map((e) => e.url)).toHaveLength(3)
+  })
+
   it('ignores a response for a request it never saw', () => {
     const emit = wireCapture()
     emit({ tabId: TAB }, 'Network.responseReceived', {

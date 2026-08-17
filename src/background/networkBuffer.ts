@@ -11,6 +11,13 @@
  * and you have to reload to see anything. Enabling at attach costs one CDP
  * call per tab and removes that whole class of confusion.
  *
+ * It is not CONTINUOUS, though, and the reader owns saying so: the session
+ * is released after an idle linger (DETACH_LINGER_MS), so anything the page
+ * does between commands is never seen. `network.ts` asks the session layer
+ * (`isAttached` plus `everAttached`) to tell a never-watched tab from a
+ * lapsed one and flags both, because an unqualified empty answer reads as a
+ * claim about the page.
+ *
  * Requests from cross-origin frame sessions land here too (#177),
  * frame-attributed; one buffer per tab, shared across its frames, so a
  * noisy frame can evict root entries (a diagnosis window, not a recorder).
@@ -70,6 +77,7 @@ export function push(tabId: number, entry: NetworkEntry): void {
 export interface ReadOptions {
   url_pattern?: string
   only_failures?: boolean
+  /** Newest N entries. OMIT for everything buffered; 0 returns none. */
   limit?: number
   since?: number
 }
@@ -84,8 +92,13 @@ export function read(tabId: number, opts: ReadOptions = {}): NetworkEntry[] {
   if (opts.only_failures) {
     out = out.filter((e) => Boolean(e.error) || (typeof e.status === 'number' && e.status >= 400))
   }
-  if (typeof opts.limit === 'number' && opts.limit > 0 && out.length > opts.limit) {
-    out = out.slice(out.length - opts.limit)
+  // `limit: 0` means ZERO. It used to fall through a `> 0` guard and return
+  // the WHOLE buffer, so the one spelling that unambiguously asks for nothing
+  // returned the most this can give (up to MAX_PER_TAB). Unlimited is spelled
+  // by omitting the option.
+  if (typeof opts.limit === 'number') {
+    const limit = Math.max(0, Math.trunc(opts.limit))
+    if (out.length > limit) out = out.slice(out.length - limit)
   }
   return out
 }

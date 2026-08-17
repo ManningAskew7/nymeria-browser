@@ -160,6 +160,8 @@ interface Session {
 }
 
 const sessions = new Map<number, Session>()
+/** Tabs attached at least once this worker lifetime (see `everAttached`). */
+const capturedEver = new Set<number>()
 
 /**
  * Every CDP call gets a bounded lifetime.
@@ -780,6 +782,7 @@ async function doAttach(tabId: number, s: Session): Promise<void> {
     })
     s.attached = true
     s.domains.clear()
+    capturedEver.add(tabId)
     logger.log(`debugger attached tab=${tabId}`)
     // Runtime carries console messages and uncaught exceptions; Network
     // carries request failures; Log carries the browser's own policy
@@ -996,11 +999,29 @@ export function isAttached(tabId: number): boolean {
   return sessions.get(tabId)?.attached === true
 }
 
+/**
+ * Has this tab been attached at all this worker lifetime? Capture (console,
+ * network) runs exactly while attached, so the readers need the difference
+ * between "silent because nothing has ever watched" and "silent because
+ * watching lapsed between commands", and neither is answerable from the live
+ * session map (it is emptied by the idle detach). Worker-scoped, like the
+ * buffers it explains, so the two facts cannot disagree.
+ */
+export function everAttached(tabId: number): boolean {
+  return capturedEver.has(tabId)
+}
+
+/** A closed tab surrenders the fact too: Chrome reuses tab ids. */
+export function forgetTab(tabId: number): void {
+  capturedEver.delete(tabId)
+}
+
 export function resetForTests(): void {
   for (const [, s] of sessions) {
     if (s.detachTimer) clearTimeout(s.detachTimer)
   }
   sessions.clear()
+  capturedEver.clear()
   pendingCalls.clear()
   eventHandlers.clear()
   // A test-registered gate must not leak into the next test: a never-resolving

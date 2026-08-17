@@ -37,7 +37,16 @@ export async function loadFromStorage(): Promise<void> {
 }
 
 async function persist(): Promise<void> {
-  await chrome.storage.local.set({ [SNAPSHOT_KEY]: current })
+  // The snapshot is bookkeeping: it survives a worker recycle so the popup
+  // can render counters, and nothing else depends on it. A storage failure
+  // (the 10MB quota is the realistic one) must therefore cost the write and
+  // nothing more, or one oversized entry sitting in `current` would reject
+  // every later write and take the connection path's status updates with it.
+  try {
+    await chrome.storage.local.set({ [SNAPSHOT_KEY]: current })
+  } catch (error) {
+    logger.warn('failed to persist snapshot:', error)
+  }
 }
 
 function broadcast(): void {
@@ -53,10 +62,41 @@ export async function setStatus(status: ConnectionStatus): Promise<void> {
   broadcast()
 }
 
+/** Longest string value the journal keeps verbatim. */
+const JOURNAL_STRING_LIMIT = 1_024
+
+function redactLongStrings(value: unknown): unknown {
+  if (typeof value === 'string') {
+    return value.length > JOURNAL_STRING_LIMIT ? `[${value.length} chars omitted]` : value
+  }
+  if (Array.isArray(value)) return value.map(redactLongStrings)
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([k, v]) => [k, redactLongStrings(v)]),
+    )
+  }
+  return value
+}
+
+/**
+ * The journalled copy of an event: its SHAPE, never its bytes.
+ *
+ * The journal is a diagnostic (the popup renders type, thread and age) that
+ * lands on the USER'S DISK, and `chrome.storage.local` is capped at 10MB, a
+ * quota a single upload envelope can exceed on its own. Every long string
+ * becomes a size marker, which keeps the shape readable for a developer
+ * inspecting storage while the bytes stay out of it. Small events (everything
+ * but uploads, in practice) are unchanged, so the popup's display is exactly
+ * what it was.
+ */
+function journalCopy(event: AutonomousEvent): AutonomousEvent {
+  return redactLongStrings(event) as AutonomousEvent
+}
+
 export async function recordEvent(event: AutonomousEvent): Promise<void> {
   current = {
     ...current,
-    lastEvent: { event, receivedAt: Date.now() },
+    lastEvent: { event: journalCopy(event), receivedAt: Date.now() },
     eventCount: current.eventCount + 1,
   }
   await persist()

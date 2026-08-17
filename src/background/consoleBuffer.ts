@@ -81,16 +81,27 @@ function pushCaptured(tabId: number, entry: ConsoleEntry): void {
   push(tabId, entry)
 }
 
+/** `limit` is the newest N entries; OMIT it for everything, 0 returns none. */
 export function read(tabId: number, opts: { only_errors?: boolean; limit?: number }): ConsoleEntry[] {
   const buf = buffers.get(tabId) ?? []
   let out = buf
   if (opts.only_errors) {
     out = out.filter((e) => e.level === 'error' || e.level === 'exception')
   }
-  if (typeof opts.limit === 'number' && opts.limit > 0 && out.length > opts.limit) {
-    out = out.slice(out.length - opts.limit)
-  }
+  out = applyLimit(out, opts.limit)
   return out.slice()
+}
+
+/**
+ * `limit: 0` means ZERO, in both buffers. It used to fall through a `> 0`
+ * guard and return everything, so the one spelling that unambiguously asks
+ * for nothing returned the most the tool can give, and the same argument
+ * meant opposite things in the two sibling readers.
+ */
+function applyLimit(entries: ConsoleEntry[], limit: number | undefined): ConsoleEntry[] {
+  if (typeof limit !== 'number') return entries
+  const wanted = Math.max(0, Math.trunc(limit))
+  return entries.length > wanted ? entries.slice(entries.length - wanted) : entries
 }
 
 /**
@@ -104,10 +115,7 @@ export function readSince(
   opts: { only_errors?: boolean; limit?: number } = {},
 ): ConsoleEntry[] {
   const out = read(tabId, { only_errors: opts.only_errors }).filter((e) => e.ts >= sinceTs)
-  if (typeof opts.limit === 'number' && opts.limit > 0 && out.length > opts.limit) {
-    return out.slice(out.length - opts.limit)
-  }
-  return out
+  return applyLimit(out, opts.limit)
 }
 
 export function clear(tabId: number): void {

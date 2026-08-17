@@ -168,6 +168,19 @@ describe('console capture', () => {
     expect(entries[199].text).toBe('line 204')
   })
 
+  it('reads limit 0 as none, the same way the network buffer does', () => {
+    // The two readers back sibling tools, so the same argument must not mean
+    // opposite things: `limit: 0` used to return EVERYTHING here.
+    const emit = wireCapture()
+    consoleCall(emit, 'first')
+    consoleCall(emit, 'second')
+
+    expect(read(TAB, { limit: 0 })).toEqual([])
+    expect(read(TAB, { limit: 1 }).map((e) => e.text)).toEqual(['second'])
+    expect(read(TAB, {})).toHaveLength(2)
+    expect(readSince(TAB, 0, { limit: 0 })).toEqual([])
+  })
+
   it('collapses a replayed backlog delivery instead of duplicating it', () => {
     const emit = wireCapture()
     const ts = Date.now()
