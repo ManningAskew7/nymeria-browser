@@ -602,20 +602,42 @@ export interface LocalFrame {
 }
 
 interface FrameTreeNode {
-  frame?: { id?: string; url?: string }
+  /** `parentId` is the frame that EMBEDS this one, in the same token space
+   *  as every other frame id here. On the root node of an OOPIF session's
+   *  own tree it names the embedding frame in the OTHER process, which is
+   *  the only place that relationship is on the wire: the OOPIF is absent
+   *  from the root session's tree, and `Target.attachedToTarget` carries no
+   *  parent-frame field. */
+  frame?: { id?: string; url?: string; parentId?: string }
   childFrames?: FrameTreeNode[]
+}
+
+/** One session's frame tree: the session's OWN root frame, plus its
+ *  same-process descendants. Both halves come from the one
+ *  `Page.getFrameTree` call, so the nesting answer costs nothing extra. */
+export interface LocalFrameTree {
+  /** The session's own root frame. `parentId` is set for an OOPIF session
+   *  (the frame embedding it, which is in ANOTHER process and so appears in
+   *  no tree this session can read) and absent for the page's main frame.
+   *  The url is deliberately not carried: an OOPIF session already has one
+   *  on its `FrameSession`, and a second copy would be a second thing to
+   *  keep true. */
+  root: { frameId?: string; parentId?: string }
+  frames: LocalFrame[]
 }
 
 /**
  * The SAME-PROCESS child frames of a session's document, in document order,
- * from `Page.getFrameTree`. The session's own root frame is excluded (the
- * caller already has that document), and so is any frame that owns a live
- * OOPIF session: `getFrameTree` should already skip those, but the guard is
- * cheap and rendering one frame under two identities would mint two refs for
- * every element in it. Soft-fails to an empty list: same-process frame reach
- * degrades, the command does not.
+ * from `Page.getFrameTree`, plus that session's own root frame.
+ *
+ * Children exclude the session's own root frame (the caller already has that
+ * document) and any frame that owns a live OOPIF session: `getFrameTree`
+ * should already skip those, but the guard is cheap and rendering one frame
+ * under two identities would mint two refs for every element in it.
+ * Soft-fails to an empty tree: same-process frame reach degrades, the
+ * command does not.
  */
-export async function localFrames(target: Cdp): Promise<LocalFrame[]> {
+export async function localFrameTree(target: Cdp): Promise<LocalFrameTree> {
   try {
     const tree = await sendCommand<{ frameTree?: FrameTreeNode }>(target, 'Page.getFrameTree', {})
     // Sampled AFTER the call: a cold attach announces existing OOPIFs while
@@ -633,11 +655,24 @@ export async function localFrames(target: Cdp): Promise<LocalFrame[]> {
       for (const child of node.childFrames ?? []) walk(child, false, chain)
     }
     walk(tree.frameTree, true, [])
-    return out
+    const rootFrame = tree.frameTree?.frame
+    return {
+      root: {
+        frameId: rootFrame?.id,
+        ...(rootFrame?.parentId ? { parentId: rootFrame.parentId } : {}),
+      },
+      frames: out,
+    }
   } catch (e) {
     logger.warn(`Page.getFrameTree failed (tab=${tabOf(target)}):`, e)
-    return []
+    return { root: {}, frames: [] }
   }
+}
+
+/** The children half of `localFrameTree`, for the callers that only route by
+ *  frame id and never ask about nesting. */
+export async function localFrames(target: Cdp): Promise<LocalFrame[]> {
+  return (await localFrameTree(target)).frames
 }
 
 /**

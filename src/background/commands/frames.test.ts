@@ -443,6 +443,489 @@ describe('keyboard follows focus across the frame boundary', () => {
     expect(arm?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
   })
 
+  it('a ref-less type into a focused SAME-ORIGIN frame verifies in that frame, not "unknown"', async () => {
+    // The residual: the focus expression descends a same-origin chain
+    // in-expression, so the routing gate saw `tag: "input"` and armed the
+    // probe at the ROOT. The keys landed in the frame, the root counted
+    // zero, and the verdict was a permanent "unknown". Dispatch does not
+    // move (root-session input DOES reach a same-process frame); only the
+    // probe's document does.
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    const FRAME_WORLD = 55
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string; frameId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree' && !target.sessionId) {
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [
+              // Two frames, ONE url: the everyday ad/widget shape, and the
+              // reason the URL cannot be the answer on its own. The decoy
+              // comes first, so a lookup that trusts the URL alone arms the
+              // wrong document.
+              { frame: { id: 'DECOY', url: 'https://example.com/widget' } },
+              { frame: { id: 'LOCAL-1', url: 'https://example.com/widget' } },
+            ],
+          },
+        }
+      }
+      if (method === 'Page.createIsolatedWorld') {
+        return { executionContextId: params.frameId === 'LOCAL-1' ? FRAME_WORLD : 88 }
+      }
+      if (method === 'DOM.getFrameOwner') {
+        return { backendNodeId: params.frameId === 'LOCAL-1' ? 777 : 666 }
+      }
+      if (method === 'DOM.resolveNode') {
+        return { object: { objectId: `owner-${params.backendNodeId}` } }
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const fn = String(params.functionDeclaration ?? '')
+        if (fn.includes('document.activeElement === this')) {
+          return { result: { value: params.objectId === 'owner-777' } }
+        }
+      }
+      if (method === 'Runtime.evaluate') {
+        const expression = String(params.expression ?? '')
+        if (expression.includes('activeElement')) {
+          // Focus already descended into the same-origin frame, which is
+          // exactly why the old gate could not tell.
+          return {
+            result: { value: { tag: 'input', label: 'CVC', frame_url: 'https://example.com/widget' } },
+          }
+        }
+        if (expression.includes('addEventListener')) return { result: { value: true } }
+        if (expression.includes('__nymDelivery')) {
+          // Only the FRAME's world saw the keystrokes. A root-armed probe
+          // counts nothing, which is the shape this test pins against.
+          return { result: { value: params.contextId === FRAME_WORLD ? { n: 2 } : { n: 0 } } }
+        }
+        if (expression.includes("querySelectorAll('iframe,frame')")) {
+          return { result: { value: params.contextId === FRAME_WORLD } }
+        }
+      }
+      return base(...args)
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    // A same-process frame has no session of its own, so "which document"
+    // is carried by the WORLD the probe armed in, not by the addressee.
+    const arm = send.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression ?? '').includes('addEventListener'),
+    )
+    expect((arm?.[2] as { contextId?: number }).contextId, 'armed in the focused frame').toBe(
+      FRAME_WORLD,
+    )
+    expect(
+      send.mock.calls.some(
+        (c) =>
+          c[1] === 'Page.createIsolatedWorld' &&
+          (c[2] as { frameId?: string; worldName?: string }).frameId === 'LOCAL-1' &&
+          (c[2] as { worldName?: string }).worldName === 'nymeria_delivery_probe',
+      ),
+    ).toBe(true)
+    // Dispatch is unchanged: a same-process frame receives the root
+    // session's input, and re-routing it would break what already worked.
+    const keyEvents = cdp.mock.calls.filter((c) => c[1] === 'Input.dispatchKeyEvent')
+    expect(keyEvents.length).toBeGreaterThan(0)
+    for (const call of keyEvents) expect(call[0]).toEqual({ tabId: TAB })
+  })
+
+  /**
+   * A same-origin frame CHAIN (page -> wrapper -> inner) with the focus read
+   * already descended into it, which is the shape the URL alone cannot
+   * resolve. Every frame's owner element answers "I have focus" here, because
+   * `document.activeElement` in each document IS the next frame's owner: that
+   * is the browser's real behaviour, and the reason a first-true-wins sweep
+   * picks the wrong document.
+   */
+  function installFocusChainMock(opts: {
+    wrapperUrl: string
+    innerUrl: string
+    focusUrl: string
+    focusedFrameId: 'WRAPPER' | 'INNER'
+    extraSiblings?: number
+  }) {
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    const worldOf: Record<string, number> = { INNER: 61, WRAPPER: 62 }
+    const ownerOf: Record<string, number> = { INNER: 771, WRAPPER: 772 }
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree' && !target.sessionId) {
+        const siblings = Array.from({ length: opts.extraSiblings ?? 0 }, (_, i) => ({
+          frame: { id: `AD-${i}`, url: `https://ads.example/${i}` },
+        }))
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [
+              ...siblings,
+              {
+                frame: { id: 'WRAPPER', url: opts.wrapperUrl },
+                childFrames: [{ frame: { id: 'INNER', url: opts.innerUrl } }],
+              },
+            ],
+          },
+        }
+      }
+      if (method === 'Page.createIsolatedWorld') {
+        return { executionContextId: worldOf[String(params.frameId)] ?? 88 }
+      }
+      if (method === 'DOM.getFrameOwner') {
+        return { backendNodeId: ownerOf[String(params.frameId)] ?? 666 }
+      }
+      if (method === 'DOM.resolveNode') {
+        return { object: { objectId: `owner-${params.backendNodeId}` } }
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const fn = String(params.functionDeclaration ?? '')
+        if (fn.includes('document.activeElement === this')) {
+          // True for every frame in the chain, false for the ad frames.
+          const owner = String(params.objectId)
+          return { result: { value: owner === 'owner-771' || owner === 'owner-772' } }
+        }
+      }
+      if (method === 'Runtime.evaluate') {
+        const expression = String(params.expression ?? '')
+        if (expression.includes('activeElement')) {
+          return {
+            result: { value: { tag: 'input', label: 'CVC', frame_url: opts.focusUrl } },
+          }
+        }
+        if (expression.includes('addEventListener')) return { result: { value: true } }
+        if (expression.includes('__nymDelivery')) {
+          // Only the document the caret is really in saw the keystrokes.
+          const want = worldOf[opts.focusedFrameId]
+          return { result: { value: params.contextId === want ? { n: 2 } : { n: 0 } } }
+        }
+        if (expression.includes("querySelectorAll('iframe,frame')")) {
+          return { result: { value: opts.focusedFrameId === 'INNER' } }
+        }
+      }
+      return base(...args)
+    })
+    return send
+  }
+
+  const armedWorld = (send: ReturnType<typeof vi.fn>): number | undefined => {
+    const arm = send.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression ?? '').includes('addEventListener'),
+    )
+    return (arm?.[2] as { contextId?: number } | undefined)?.contextId
+  }
+
+  it('arms the probe in the INNERMOST frame of a focus chain, not the outermost', async () => {
+    // `document.activeElement` is the frame OWNER in every ancestor of the
+    // focused document, so the owner test answers true all the way up and a
+    // document-order sweep stops at the wrapper: keystrokes land two levels
+    // down and the probe counts nothing. Both frames share a URL here (the
+    // everyday widget-in-widget shape), so only the depth rule can decide.
+    installCdpMock()
+    const send = installFocusChainMock({
+      wrapperUrl: 'https://example.com/widget',
+      innerUrl: 'https://example.com/widget',
+      focusUrl: 'https://example.com/widget',
+      focusedFrameId: 'INNER',
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    expect(armedWorld(send), 'the innermost frame of the chain').toBe(61)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+  })
+
+  it('matches the focused frame whose URL carries a fragment', async () => {
+    // Two different shapes of the same URL: the focus read takes
+    // `location.href`, which INCLUDES the fragment, while the frame tree's
+    // url is defined without one. Compared raw, every frame at a #hash URL
+    // matched nothing, and the lookup fell into the unfiltered sweep, whose
+    // probe cap (8) is reached before a frame this far down a frame farm is
+    // ever asked: the verdict silently went back to "unknown".
+    installCdpMock()
+    const send = installFocusChainMock({
+      wrapperUrl: 'https://example.com/widget',
+      innerUrl: 'https://example.com/inner',
+      focusUrl: 'https://example.com/widget#tab2',
+      focusedFrameId: 'WRAPPER',
+      extraSiblings: 10,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    expect(armedWorld(send), 'the frame the fragment URL names').toBe(62)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    const asked = send.mock.calls
+      .filter((c) => c[1] === 'DOM.getFrameOwner')
+      .map((c) => (c[2] as { frameId?: string }).frameId)
+    expect(asked, 'the URL narrowed a frame farm to one candidate').toEqual(['WRAPPER'])
+  })
+
+  it('keeps sweeping when one frame cannot answer', async () => {
+    // One unanswerable frame must not veto the others (matchFrameOwner's
+    // rule): a single try around the whole loop let a frame that threw
+    // decide the verdict for the page.
+    installCdpMock()
+    const send = installFocusChainMock({
+      wrapperUrl: 'https://example.com/widget',
+      innerUrl: 'https://example.com/widget',
+      focusUrl: 'https://example.com/widget',
+      focusedFrameId: 'WRAPPER',
+    })
+    const chain = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const params = (args[2] ?? {}) as { frameId?: string }
+      if (args[1] === 'DOM.getFrameOwner' && params.frameId === 'INNER') {
+        throw new Error('frame detached mid-probe')
+      }
+      return chain(...args)
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    expect(armedWorld(send), 'the frame after the one that threw').toBe(62)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+  })
+
+  it('follows focus into a cross-origin frame nested inside a same-origin wrapper', async () => {
+    // The residual this closes: an OOPIF one level down has its owner
+    // element in the WRAPPER's document, and a handle for it can only be
+    // minted in the wrapper's own world. Asked in the root world the owner
+    // simply does not resolve, which read as "no frame matched", so
+    // keystrokes stayed on the root session and never arrived. The frame's
+    // own session is what knows where it hangs (its root frame node carries
+    // the parent id).
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    const WRAPPER_WORLD = 71
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree') {
+        if (target.sessionId === FRAME_SESSION) {
+          // The cross-origin frame's own tree: this is the only place its
+          // parent is on the wire.
+          return { frameTree: { frame: { id: FRAME_TARGET, url: 'https://pay.example/card', parentId: 'WRAPPER' } } }
+        }
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [{ frame: { id: 'WRAPPER', url: 'https://example.com/wrapper' } }],
+          },
+        }
+      }
+      if (method === 'Page.createIsolatedWorld') {
+        return { executionContextId: params.frameId === 'WRAPPER' ? WRAPPER_WORLD : 88 }
+      }
+      if (method === 'DOM.getFrameOwner') {
+        return { backendNodeId: params.frameId === FRAME_TARGET ? 991 : 992 }
+      }
+      if (method === 'DOM.resolveNode') {
+        // World-scoped, as the browser is: a node in the wrapper's document
+        // has no handle in the page's world, and the page's own iframe
+        // element has none in the wrapper's.
+        if (params.backendNodeId === 991 && params.executionContextId !== WRAPPER_WORLD) return {}
+        if (params.backendNodeId === 992 && params.executionContextId === WRAPPER_WORLD) return {}
+        return { object: { objectId: `owner-${params.backendNodeId}` } }
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const fn = String(params.functionDeclaration ?? '')
+        if (fn.includes('document.activeElement === this')) {
+          // TRUE for both owners, which is what a real focus chain reports:
+          // the page's activeElement is the wrapper's iframe, and the
+          // wrapper's is the payment frame's iframe.
+          const owner = String(params.objectId)
+          return { result: { value: owner === 'owner-991' || owner === 'owner-992' } }
+        }
+      }
+      if (method === 'Runtime.evaluate') {
+        const expression = String(params.expression ?? '')
+        if (expression.includes('activeElement')) {
+          // Focus stops at a frame OWNER: the cross-origin document is a
+          // wall the expression cannot descend. It DOES descend the
+          // same-origin wrapper first, so it names that document.
+          return target.sessionId
+            ? { result: { value: { tag: 'input', label: 'CVC' } } }
+            : {
+                result: {
+                  value: {
+                    tag: 'iframe',
+                    label: '',
+                    frame_url: 'https://example.com/wrapper',
+                  },
+                },
+              }
+        }
+        if (expression.includes('addEventListener')) return { result: { value: true } }
+        if (expression.includes('__nymDelivery')) {
+          return { result: { value: target.sessionId ? { n: 2 } : { n: 0 } } }
+        }
+      }
+      return base(...args)
+    })
+    await attachFrame()
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    const keyEvents = cdp.mock.calls.filter((c) => c[1] === 'Input.dispatchKeyEvent')
+    expect(keyEvents.length).toBeGreaterThan(0)
+    for (const call of keyEvents) expect(call[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+  })
+
+  it('does not follow a STALE focus record in an unrelated wrapper', async () => {
+    // The uniqueness trap. Asking each cross-origin frame's own parent
+    // document turns one question into N independent ones, and
+    // `document.activeElement` is a per-document record that survives its
+    // document leaving the focus chain: a wrapper whose payment frame held
+    // focus earlier still answers yes forever. Trusted keystrokes would
+    // follow the first yes into the wrong origin's frame. The focus read
+    // NAMES the document to ask in, so only that one is asked.
+    const cdp = installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    const W1_WORLD = 71
+    const W2_WORLD = 72
+    const P1_SESSION = 'SESSION-P1'
+    const P2_SESSION = 'SESSION-P2'
+    const worldOf: Record<string, number> = { W1: W1_WORLD, W2: W2_WORLD }
+    const ownerOf: Record<string, number> = { W1: 901, W2: 902, 'PAY-1': 911, 'PAY-2': 912 }
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree') {
+        if (target.sessionId === P1_SESSION) {
+          return { frameTree: { frame: { id: 'PAY-1', url: 'https://pay.example/1', parentId: 'W1' } } }
+        }
+        if (target.sessionId === P2_SESSION) {
+          return { frameTree: { frame: { id: 'PAY-2', url: 'https://pay.example/2', parentId: 'W2' } } }
+        }
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [
+              { frame: { id: 'W1', url: 'https://example.com/w1' } },
+              { frame: { id: 'W2', url: 'https://example.com/w2' } },
+            ],
+          },
+        }
+      }
+      if (method === 'Page.createIsolatedWorld') {
+        return { executionContextId: worldOf[String(params.frameId)] ?? 88 }
+      }
+      if (method === 'DOM.getFrameOwner') return { backendNodeId: ownerOf[String(params.frameId)] ?? 0 }
+      if (method === 'DOM.resolveNode') {
+        // Each owner element has a handle only in the world of the document
+        // that contains it.
+        const want: Record<number, number> = { 901: 88, 902: 88, 911: W1_WORLD, 912: W2_WORLD }
+        if (want[params.backendNodeId as number] !== params.executionContextId) return {}
+        return { object: { objectId: `owner-${params.backendNodeId}` } }
+      }
+      if (method === 'Runtime.callFunctionOn') {
+        const fn = String(params.functionDeclaration ?? '')
+        if (fn.includes('document.activeElement === this')) {
+          // Focus is in PAY-1. W2 still REMEMBERS focusing PAY-2, which is
+          // the stale yes.
+          const owner = String(params.objectId)
+          return { result: { value: owner === 'owner-901' || owner === 'owner-911' || owner === 'owner-912' } }
+        }
+      }
+      if (method === 'Runtime.evaluate') {
+        const expression = String(params.expression ?? '')
+        if (expression.includes('activeElement')) {
+          return target.sessionId
+            ? { result: { value: { tag: 'input', label: 'Card' } } }
+            : { result: { value: { tag: 'iframe', label: '', frame_url: 'https://example.com/w1' } } }
+        }
+        if (expression.includes('addEventListener')) return { result: { value: true } }
+        if (expression.includes('__nymDelivery')) {
+          return { result: { value: target.sessionId === P1_SESSION ? { n: 2 } : { n: 0 } } }
+        }
+      }
+      return base(...args)
+    })
+    await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
+    // The STALE frame attaches first, so a first-yes-wins sweep meets it
+    // before the right one.
+    for (const [sessionId, targetId, url] of [
+      [P2_SESSION, 'PAY-2', 'https://pay.example/2'],
+      [P1_SESSION, 'PAY-1', 'https://pay.example/1'],
+    ]) {
+      cdpEmitter()({ tabId: TAB }, 'Target.attachedToTarget', {
+        sessionId,
+        targetInfo: { targetId, type: 'iframe', url },
+      })
+    }
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    const keyEvents = cdp.mock.calls.filter((c) => c[1] === 'Input.dispatchKeyEvent')
+    expect(keyEvents.length).toBeGreaterThan(0)
+    for (const call of keyEvents) {
+      expect(call[0], 'the frame the focus chain actually runs through').toEqual({
+        tabId: TAB,
+        sessionId: P1_SESSION,
+      })
+    }
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+  })
+
+  it('leaves ref-less typing at the root when focus never left the top document', async () => {
+    // The gate is the frame_url the focus read reports; without one nothing
+    // may pay for a frame lookup, and the probe stays where it was.
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (args[1] === 'Page.getFrameTree' && !target.sessionId) {
+        // The page HAS a same-origin frame: the gate is the focus answer,
+        // not the absence of anything to find.
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [{ frame: { id: 'LOCAL-1', url: 'https://example.com/widget' } }],
+          },
+        }
+      }
+      if (args[1] === 'Runtime.evaluate' && String(params.expression ?? '').includes('activeElement')) {
+        return { result: { value: { tag: 'input', label: 'Email' } } }
+      }
+      if (args[1] === 'Runtime.evaluate' && String(params.expression ?? '').includes('addEventListener')) {
+        return { result: { value: true } }
+      }
+      return base(...args)
+    })
+
+    await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(
+      send.mock.calls.some((c) => c[1] === 'DOM.getFrameOwner'),
+      'no frame lookup on an ordinary top-document caret',
+    ).toBe(false)
+  })
+
   it("the focused payload descends into the frame instead of stopping at tag 'iframe'", async () => {
     // Live QA misread `focused: {tag: "iframe"}` twice as a failed click;
     // the payload now names the frame's own focused element and its frame.
@@ -1341,6 +1824,175 @@ describe('same-process frame refs (reads-honesty pass)', () => {
   })
 })
 
+describe('OOPIF sections carry their nesting depth', () => {
+  /** Root tree with one same-origin wrapper; the OOPIF's OWN tree names that
+   *  wrapper as its parent, which is the only place that relationship is on
+   *  the wire (the OOPIF is absent from the root session's tree). */
+  function withNesting(
+    parentId: string | undefined,
+    siblings: { id: string; url: string }[] = [],
+    siblingsFirst = false,
+  ) {
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as { frameId?: string }
+      if (method === 'Page.getFrameTree') {
+        if (target.sessionId === FRAME_SESSION) {
+          return {
+            frameTree: {
+              frame: {
+                id: FRAME_TARGET,
+                url: 'https://pay.example/card',
+                ...(parentId ? { parentId } : {}),
+              },
+            },
+          }
+        }
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: siblingsFirst
+              ? [
+                  ...siblings.map((sib) => ({ frame: { id: sib.id, url: sib.url } })),
+                  { frame: { id: 'WRAPPER', url: 'https://example.com/wrapper' } },
+                ]
+              : [
+                  { frame: { id: 'WRAPPER', url: 'https://example.com/wrapper' } },
+                  ...siblings.map((sib) => ({ frame: { id: sib.id, url: sib.url } })),
+                ],
+          },
+        }
+      }
+      if (method === 'Accessibility.getFullAXTree') {
+        const name = target.sessionId
+          ? 'pay'
+          : params.frameId
+            ? String(params.frameId).toLowerCase()
+            : 'page'
+        return {
+          nodes: [
+            {
+              nodeId: `n-${name}`,
+              backendDOMNodeId: 7,
+              role: { value: 'button' },
+              name: { value: name },
+              childIds: [],
+            },
+          ],
+        }
+      }
+      return base(...args)
+    })
+    return send
+  }
+
+  it('indents a cross-origin frame under the same-origin frame that embeds it', async () => {
+    // Before this, an OOPIF rendered at the margin whatever embedded it, as
+    // a sibling of the page itself, and its own same-process children then
+    // rendered one level in, as if their parent were the document.
+    withNesting('WRAPPER')
+    await attachFrame()
+
+    const result = await execSnapshot({ tab_id: TAB })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as {
+      tree: string
+      frames_nested?: number
+      frames_oopif: number
+      frames_same_process: number
+    }
+    expect(data.tree).toMatch(/^- iframe "https:\/\/example\.com\/wrapper"/m)
+    expect(data.tree).toMatch(/\n {2}- iframe "https:\/\/pay\.example\/card"/)
+    expect(data.frames_nested, 'the note must count what the tree shows').toBe(1)
+    expect(data.frames_oopif).toBe(1)
+    expect(data.frames_same_process).toBe(1)
+    // Order matters as much as indentation: a section indented under a
+    // parent that has not rendered yet reads as a child of whatever came
+    // before it.
+    expect(data.tree.indexOf('wrapper')).toBeLessThan(data.tree.indexOf('pay.example'))
+  })
+
+  it("emits the cross-origin section between its own parent and that parent's sibling", async () => {
+    // The ambiguity an indent alone cannot resolve. With every local frame
+    // rendered first and the OOPIFs after them, an indented section reads as
+    // a child of the LAST frame printed, which here is one it has nothing to
+    // do with: the reader is told the payment frame lives inside the sibling
+    // widget. Emission order has to interleave the two classes.
+    withNesting('WRAPPER', [{ id: 'SIBLING', url: 'https://example.com/sibling' }])
+    await attachFrame()
+
+    const result = await execSnapshot({ tab_id: TAB })
+
+    const tree = (result.data as { tree: string }).tree
+    const wrapper = tree.indexOf('example.com/wrapper')
+    const pay = tree.indexOf('pay.example/card')
+    const sibling = tree.indexOf('example.com/sibling')
+    expect(wrapper, 'the embedding frame renders').toBeGreaterThanOrEqual(0)
+    expect(sibling, 'the unrelated sibling renders').toBeGreaterThanOrEqual(0)
+    expect(pay).toBeGreaterThan(wrapper)
+    expect(pay, 'an indented section belongs to the frame directly above it').toBeLessThan(sibling)
+    expect(tree).toMatch(/\n {2}- iframe "https:\/\/pay\.example\/card"/)
+  })
+
+  it('says so in words when the frame that embeds it was never read', async () => {
+    // The frame cap and the indent meeting badly: the embedding frame sat
+    // past the cap, so no section exists to indent under, and an indented
+    // section would read as a child of the line above it, which is the cap
+    // note. At the margin with the containment SPELLED OUT, nothing is
+    // claimed by position.
+    withNesting(
+      'WRAPPER',
+      Array.from({ length: 9 }, (_, i) => ({ id: `AD-${i}`, url: `https://example.com/ad${i}` })),
+      true,
+    )
+    await attachFrame()
+
+    const result = await execSnapshot({ tab_id: TAB })
+
+    const tree = (result.data as { tree: string }).tree
+    expect(tree, 'the cap bit').toMatch(/- \[2 more frame\(s\) not read: frame cap reached\]/)
+    expect(tree).toMatch(
+      /^- iframe "https:\/\/pay\.example\/card" \[inside a frame that was not read\]/m,
+    )
+    expect(tree).not.toMatch(/\n {2}- iframe "https:\/\/pay\.example\/card"/)
+    // And the payload's nesting count stays in step with the tree: nothing
+    // was rendered nested, so nothing is counted nested.
+    expect((result.data as { frames_nested?: number }).frames_nested).toBeUndefined()
+  })
+
+  it('leaves a top-level cross-origin frame at the margin, and uncounted', async () => {
+    // The regression pin: nesting is reported only where it exists, so the
+    // ordinary payment-iframe page reads exactly as it did.
+    withNesting('frame-root')
+    await attachFrame()
+
+    const result = await execSnapshot({ tab_id: TAB })
+
+    const data = result.data as { tree: string; frames_nested?: number }
+    expect(data.tree).toMatch(/^- iframe "https:\/\/pay\.example\/card"/m)
+    expect(data.frames_nested).toBeUndefined()
+  })
+
+  it('renders flat rather than guessing when the parent frame is unknown', async () => {
+    // Fail-open: a parentId naming a frame from neither tree (a Chrome that
+    // reports it differently, a frame that left mid-read) must render as it
+    // always did, never at an invented depth.
+    withNesting('NOT-A-FRAME-WE-SAW')
+    await attachFrame()
+
+    const result = await execSnapshot({ tab_id: TAB })
+
+    const data = result.data as { tree: string; frames_nested?: number }
+    expect(data.tree).toMatch(/^- iframe "https:\/\/pay\.example\/card"/m)
+    expect(data.frames_nested).toBeUndefined()
+  })
+})
+
 describe('QA round 1 fix round: nested-frame acts and frame-aware waits', () => {
   const OUTER = 'LOCAL-OUTER'
   const INNER = 'LOCAL-INNER'
@@ -1463,7 +2115,7 @@ describe('QA round 1 fix round: nested-frame acts and frame-aware waits', () => 
     })
 
     const seen = await actTest.performWait(TAB, { text: 'frame-needle' }, 500)
-    expect(seen).toEqual({ found: true, condition: 'text:frame-needle' })
+    expect(seen).toEqual({ found: true, condition: 'text:frame-needle', alreadyTrue: true })
 
     // Negative control: the mock executes the real expression, so an absent
     // needle times out honestly (this is what proves the scan has teeth).
@@ -1494,7 +2146,7 @@ describe('QA round 1 fix round: nested-frame acts and frame-aware waits', () => 
     })
 
     const seen = await actTest.performWait(TAB, { text: 'oopif-needle' }, 500)
-    expect(seen).toEqual({ found: true, condition: 'text:oopif-needle' })
+    expect(seen).toEqual({ found: true, condition: 'text:oopif-needle', alreadyTrue: true })
   })
 
   it('a gate-time tree walk that answers nothing SKIPS the occlusion gate instead of refusing', async () => {
@@ -1700,7 +2352,7 @@ describe('same-process frame refs: review-round defenses', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/covered in the EMBEDDING document by div#cookie-banner/)
-    expect((result.data as { occluded_in?: string }).occluded_in).toBe('parent-document')
+    expect((result.data as { occluded_in?: string }).occluded_in).toBe('embedding-document')
     expect(cdp.mock.calls.some((c) => c[1] === 'Input.dispatchMouseEvent')).toBe(false)
   })
 

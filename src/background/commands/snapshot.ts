@@ -1,5 +1,14 @@
 import type { CommandResult } from '../../shared/types'
-import { frameIdOf, frameSessions, localFrames, locateFrame, sendCommand, type Cdp } from '../debuggerSession'
+import {
+  frameIdOf,
+  frameSessions,
+  localFrameTree,
+  locateFrame,
+  sendCommand,
+  type Cdp,
+  type LocalFrame,
+  type LocalFrameTree,
+} from '../debuggerSession'
 import { sameDocumentUrl } from '../urlMatch'
 import { evaluateInProbeWorld, withProbeWorld } from '../worlds'
 import {
@@ -299,6 +308,89 @@ const VIEW_STATE_EXPRESSION = `(function(){
   return { modal_dialog: q('dialog:modal'), aria_modal: am, fullscreen: fs };
 })()`
 
+/** One attached cross-origin frame, with its own session's frame tree. */
+interface DiscoveredOopif {
+  targetId: string
+  tree: LocalFrameTree
+}
+
+/**
+ * Where every frame section belongs in the tree, before anything renders.
+ *
+ * The problem this solves: an OOPIF is absent from the root session's frame
+ * tree, so the sweep that renders it has no idea whether it sits directly in
+ * the page or three frames deep inside a same-origin wrapper. It rendered at
+ * the margin either way, as a sibling of the page itself, and its own
+ * same-process children then rendered one level in, as if their parent were
+ * the document. `Page.Frame.parentId` on the OOPIF's OWN root node answers
+ * it, and that call is already being made for the children.
+ *
+ * Depth is "number of frame ancestors", so a frame embedded directly in the
+ * page is 0 and the main frame is -1, which makes both rules one addition.
+ * Resolution is a fixpoint rather than a single pass because an OOPIF's
+ * depth can depend on another OOPIF's (a cross-origin frame inside a
+ * cross-origin frame). A parent that never resolves (a frame id from
+ * neither tree, a cycle) renders at 0 exactly as before: an unknown nesting
+ * is reported as no nesting, never guessed.
+ *
+ * `childrenOf` is what makes the ORDER honest, and it is keyed by the parent
+ * FRAME rather than by the parent OOPIF: sections indent, so an OOPIF
+ * emitted after an unrelated frame at a shallower depth reads as that
+ * frame's child. The renderer walks it, emitting each cross-origin section
+ * immediately after the section of the frame that embeds it. `unanchored`
+ * holds the ones with no usable parent, which render flat at the end
+ * exactly as every OOPIF did before this.
+ */
+function planFrameSections<T extends DiscoveredOopif>(
+  rootTree: LocalFrameTree,
+  oopifs: T[],
+): { depth: Map<string, number>; childrenOf: Map<string, T[]>; unanchored: T[] } {
+  const depth = new Map<string, number>()
+  if (rootTree.root.frameId) depth.set(rootTree.root.frameId, -1)
+  for (const f of rootTree.frames) depth.set(f.frameId, f.path.length - 1)
+  const childrenOf = new Map<string, T[]>()
+  const unanchored: T[] = []
+  const place = (o: T, at: number, parentId: string | null): void => {
+    depth.set(o.targetId, at)
+    // The OOPIF's OWN root frame id, so a cross-origin frame nested directly
+    // inside another one anchors to it (Chrome makes the two ids equal, but
+    // the plan does not depend on that).
+    if (o.tree.root.frameId) depth.set(o.tree.root.frameId, at)
+    for (const f of o.tree.frames) depth.set(f.frameId, at + f.path.length)
+    if (parentId === null) {
+      unanchored.push(o)
+      return
+    }
+    const list = childrenOf.get(parentId)
+    if (list) list.push(o)
+    else childrenOf.set(parentId, [o])
+  }
+  let pending = oopifs.slice()
+  for (;;) {
+    const stuck: T[] = []
+    for (const o of pending) {
+      const parentId = o.tree.root.parentId
+      // `undefined`, not falsy: the main frame's depth is -1 and a top-level
+      // frame's is 0, both of which a truthiness test would throw away.
+      const anchor = parentId === undefined ? undefined : depth.get(parentId)
+      if (parentId !== undefined && anchor === undefined) {
+        stuck.push(o)
+        continue
+      }
+      if (anchor === undefined) place(o, 0, null)
+      else place(o, anchor + 1, parentId as string)
+    }
+    if (!stuck.length) break
+    if (stuck.length === pending.length) {
+      // No progress: every remaining parent is unknowable. Render flat.
+      for (const o of stuck) place(o, 0, null)
+      break
+    }
+    pending = stuck
+  }
+  return { depth, childrenOf, unanchored }
+}
+
 /** Resolve a scope ref or selector to a backendNodeId to re-root the tree at. */
 async function resolveScopeNode(
   tabId: number,
@@ -329,11 +421,15 @@ async function resolveScopeNode(
   // `querySelector` override could steer what the model believes the page
   // says. Fail-closed: no world, no main-world fallback.
   const evald = await withProbeWorld(tabId, (contextId) =>
-    sendCommand<{ result?: { objectId?: string; subtype?: string } }>(tabId, 'Runtime.evaluate', {
-      expression: `document.querySelector(${JSON.stringify(scopeSelector)})`,
-      returnByValue: false,
-      contextId,
-    }),
+    sendCommand<{ result?: { objectId?: string; subtype?: string }; exceptionDetails?: unknown }>(
+      tabId,
+      'Runtime.evaluate',
+      {
+        expression: `document.querySelector(${JSON.stringify(scopeSelector)})`,
+        returnByValue: false,
+        contextId,
+      },
+    ),
   )
   if (evald === null) {
     return {
@@ -342,6 +438,13 @@ async function resolveScopeNode(
         'the scope selector could not run in this tab\'s isolated inspection context ' +
         '(the tab is likely mid-navigation); retry, or read without a scope',
     }
+  }
+  // A malformed selector THROWS, and a thrown expression still returns a
+  // `result`: the Error object, with an objectId that passes every check
+  // below. Named as the syntax error it is rather than reported three lines
+  // later as "could not resolve the scope element" (review round).
+  if (evald.exceptionDetails) {
+    return { backendNodeId: null, error: `not a valid CSS selector: ${scopeSelector}` }
   }
   if (!evald.result?.objectId || evald.result.subtype === 'null') {
     return { backendNodeId: null, error: `scope selector matched no element: ${scopeSelector}` }
@@ -483,6 +586,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
       frameToken: string,
       frameUrl: string,
       depth = 0,
+      label = '',
     ): Promise<boolean> => {
       const pad = '  '.repeat(depth)
       try {
@@ -501,35 +605,49 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
           .split('\n')
           .map((line) => `${pad}  ${line}`)
           .join('\n')
-        sections.push(`${pad}- iframe "${frameUrl}"\n${indented}`)
+        sections.push(`${pad}- iframe "${frameUrl}"${label}\n${indented}`)
         return true
       } catch {
         // One unreadable frame must not cost the whole page read. Visible in
         // the tree, but NOT counted as read.
-        sections.push(`${pad}- iframe "${frameUrl}" [unreadable]`)
+        sections.push(`${pad}- iframe "${frameUrl}"${label} [unreadable]`)
         return false
       }
     }
 
     let framesOopifRendered = 0
     let framesLocalRendered = 0
+    let framesNested = 0
     let framesSkipped = 0
     /** Same-process child frames of one session's document, in document
-     *  order (deterministic ref numbering), capped with an honest tail.
-     *  `baseDepth` nests a session's local frames under the section that
-     *  introduced the session (1 for an OOPIF's children). */
-    const renderLocalFrames = async (sessionTarget: Cdp, baseDepth = 0): Promise<void> => {
-      const local = await localFrames(sessionTarget)
+     *  order (deterministic ref numbering), capped with an honest tail. Each
+     *  section's depth comes from the ONE plan every section is placed by
+     *  (`planFrameSections`); `noteDepth` is the base indent of the document
+     *  being listed, which is where the frame-cap tail belongs. `onFrame`
+     *  runs right after each section, which is how a cross-origin child gets
+     *  emitted under the frame that embeds it rather than after some
+     *  unrelated frame. */
+    const renderLocalFrames = async (
+      sessionTarget: Cdp,
+      local: LocalFrame[],
+      depths: Map<string, number>,
+      noteDepth = 0,
+      onFrame?: (frameId: string) => Promise<void>,
+    ): Promise<void> => {
       const toRead = local.slice(0, MAX_LOCAL_FRAMES)
       for (const f of toRead) {
         const tabId = a.tab_id
         const sessionId = typeof sessionTarget === 'number' ? undefined : sessionTarget.sessionId
-        const depth = baseDepth + (f.path.length - 1)
+        const depth = depths.get(f.frameId) ?? noteDepth
         if (
           await renderFrameSection({ tabId, sessionId, frameId: f.frameId }, f.frameId, f.url, depth)
         ) {
           framesLocalRendered += 1
+          if (depth > 0) framesNested += 1
         }
+        // Unconditional: an unreadable frame still HAS its cross-origin
+        // children, and dropping them would lose whole documents.
+        if (onFrame) await onFrame(f.frameId)
       }
       if (local.length > toRead.length) {
         const skipped = local.length - toRead.length
@@ -537,7 +655,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
         // Padded with the section's own base indent: unpadded under an OOPIF
         // this rendered at the margin as a page-level claim (review round).
         sections.push(
-          `${'  '.repeat(baseDepth)}- [${skipped} more frame(s) in this document not read: frame cap reached]`,
+          `${'  '.repeat(noteDepth)}- [${skipped} more frame(s) not read: frame cap reached]`,
         )
       }
     }
@@ -550,20 +668,66 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     // own flattened sessions, each followed by ITS same-process children (a
     // same-origin frame nested inside a payment iframe). A scoped read
     // stays in its scope.
+    //
+    // DISCOVER, then render (see `planFrameSections`): every tree is read
+    // first, because an OOPIF's indentation depends on a parent that may be
+    // another OOPIF, and a section cannot indent under one that has not
+    // rendered yet. No extra CDP calls: these are the same `getFrameTree`
+    // reads the local sweep always made.
     if (scopeNodeId == null) {
-      await renderLocalFrames(a.tab_id)
-      for (const frame of frameSessions(a.tab_id)) {
-        if (
-          await renderFrameSection(
-            { tabId: a.tab_id, sessionId: frame.sessionId },
-            frame.targetId,
-            frame.url,
-          )
-        ) {
-          framesOopifRendered += 1
-        }
-        await renderLocalFrames({ tabId: a.tab_id, sessionId: frame.sessionId }, 1)
+      const rootTree = await localFrameTree(a.tab_id)
+      const sessions = frameSessions(a.tab_id)
+      const discovered: (DiscoveredOopif & { sessionId: string; url: string })[] = []
+      for (const frame of sessions) {
+        discovered.push({
+          targetId: frame.targetId,
+          sessionId: frame.sessionId,
+          url: frame.url,
+          tree: await localFrameTree({ tabId: a.tab_id, sessionId: frame.sessionId }),
+        })
       }
+      const plan = planFrameSections(rootTree, discovered)
+      type Discovered = (typeof discovered)[number]
+      const done = new Set<string>()
+
+      /** One cross-origin section, then everything nested inside it. The
+       *  `done` set is both the no-duplicates guard and the cycle guard: a
+       *  frame tree that claims its own ancestor as a child stops here. */
+      async function renderOopif(o: Discovered, orphan = false): Promise<void> {
+        if (done.has(o.targetId)) return
+        done.add(o.targetId)
+        const target: Cdp = { tabId: a.tab_id, sessionId: o.sessionId }
+        // An ORPHAN is a frame whose embedding section was never rendered
+        // (its parent frame sat past the frame cap). Indentation is the only
+        // containment signal this tree has, so indenting it here would put it
+        // under whatever line precedes it, which is the cap note. It goes at
+        // the margin with the containment stated in words instead.
+        const depth = orphan ? 0 : (plan.depth.get(o.targetId) ?? 0)
+        const label = orphan ? ' [inside a frame that was not read]' : ''
+        if (await renderFrameSection(target, o.targetId, o.url, depth, label)) {
+          framesOopifRendered += 1
+          if (depth > 0) framesNested += 1
+        }
+        await renderLocalFrames(target, o.tree.frames, plan.depth, depth + 1, renderOopifsUnder)
+        await renderOopifsUnder(o.tree.root.frameId)
+        await renderOopifsUnder(o.targetId)
+      }
+
+      /** The cross-origin frames embedded directly in one document. */
+      async function renderOopifsUnder(frameId?: string): Promise<void> {
+        if (!frameId) return
+        for (const child of plan.childrenOf.get(frameId) ?? []) await renderOopif(child)
+      }
+
+      await renderLocalFrames(a.tab_id, rootTree.frames, plan.depth, 0, renderOopifsUnder)
+      await renderOopifsUnder(rootTree.root.frameId)
+      // Whatever the walk could not reach. An UNANCHORED frame's parent was
+      // never resolvable, which the plan already reports as depth 0 (an
+      // unknown nesting is reported as no nesting, never guessed); anything
+      // still left is anchored to a frame that was not rendered, and says so
+      // rather than indenting under a line it has nothing to do with.
+      for (const o of plan.unanchored) await renderOopif(o)
+      for (const o of discovered) await renderOopif(o, true)
     }
 
     const tab = await chrome.tabs.get(a.tab_id).catch(() => null)
@@ -587,6 +751,10 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
           ? {
               frames_oopif: framesOopifRendered,
               frames_same_process: framesLocalRendered,
+              // Sections rendered INSIDE another frame rather than in the
+              // page, both classes counted: without it the note read flat
+              // while the tree it describes was indented.
+              ...(framesNested ? { frames_nested: framesNested } : {}),
               ...(framesSkipped ? { frames_skipped: framesSkipped } : {}),
             }
           : {}),
@@ -597,4 +765,4 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   })
 }
 
-export const __test = { formatTree, isInteractive, strVal, rootsOf }
+export const __test = { formatTree, isInteractive, strVal, rootsOf, planFrameSections }

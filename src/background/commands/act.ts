@@ -5,12 +5,14 @@ import {
   frameIdOf,
   frameSessions,
   localFrames,
+  localFrameTree,
   locateFrame,
   sendCommand,
   sessionOf,
   tabOf,
   TabUnusable,
   type Cdp,
+  type LocalFrame,
 } from '../debuggerSession'
 import { absenceIsConclusive, armDelivery, type DeliveryOutcome } from '../delivery'
 import {
@@ -38,6 +40,7 @@ import {
   sameProcessDispatchPoint,
   scrollIntoView,
   selectAllIn,
+  selectorFactsOf,
   trustedClick,
   trustedDrag,
   trustedHover,
@@ -48,6 +51,7 @@ import {
   type Point,
 } from '../input'
 import { commitSeq, commitSince, navigationPending, waitForNavSignal } from '../navWatch'
+import { cssResolveExpression, SELECTOR_INVALID, SELECTOR_MISS } from '../shadowWalk'
 import {
   evaluateInProbeWorld,
   probeWorldUnavailableError,
@@ -131,6 +135,15 @@ interface ActArgs {
 
 const DEFAULT_WAIT_MS = 5_000
 const WAIT_POLL_MS = 100
+/** How often a `wait_for.ref` of `css=` pays the open-shadow-root walk:
+ *  every poll would run a whole-DOM traversal ten times a second for the
+ *  entire wait (the condition is absent by definition until it fires), so
+ *  the walk runs on the first poll and every fifth after it, ~500ms. */
+const SHADOW_WALK_EVERY_N_POLLS = 5
+
+/** Lead-in shared by both invalid-selector refusals, so the wait loop can
+ *  recognise a condition that can never come true without parsing prose. */
+const INVALID_SELECTOR_PREFIX = 'not a valid '
 const MAX_CONSOLE_IN_RESULT = 5
 /**
  * How long verification waits for a STARTED navigation to commit before
@@ -347,9 +360,9 @@ const INVISIBLE_ANNOTATES: ReadonlySet<ActionName> = new Set<ActionName>([
  * The wording hedges on the cause deliberately. Suppression is the likeliest
  * explanation but a swallowed event produces the same reading, and asserting a
  * dialog that is not there would send the agent hunting for nothing. The
- * hedge no longer names "disabled" first: a `@` ref on a disabled control is
- * refused before dispatch now, so the residue this copy still covers is
- * coordinates, `css=`/`xpath=` targets and the unprobed verbs.
+ * hedge no longer names "disabled" first: any target with an ELEMENT behind
+ * it (a ref or a selector) is refused before dispatch now, so the residue
+ * this copy still covers is coordinates and the unprobed verbs.
  */
 function undeliveredError(action: ActionName): string {
   return (
@@ -362,8 +375,8 @@ function undeliveredError(action: ActionName): string {
     'delivered after that, close the tab and redo the work in a fresh one, which ' +
     'always clears it. Reloading does not help, and never dismiss browser security ' +
     'UI yourself. If the page is fine, the target may instead be swallowing the ' +
-    'event, or be a control that cannot take one (which a @ref act checks and ' +
-    'refuses up front, but a coordinate or css= target does not).'
+    'event, or be a control that cannot take one (which a ref or selector act ' +
+    'checks and refuses up front, but a bare coordinate cannot).'
   )
 }
 
@@ -624,28 +637,99 @@ async function describePoint(tabId: number, point: Point | null): Promise<PointT
 }
 
 /**
+ * Ask a question ABOUT a frame's `<iframe>` owner element, in the document
+ * that actually contains it.
+ *
+ * The three callers below (which cross-origin frame is at a point, which
+ * holds focus, is a same-process frame's owner covered, which same-process
+ * frame holds focus) differ only in where their candidates come from; the
+ * question itself is always these three calls: name the owner node, mint a
+ * handle for it IN THE PROBE WORLD so a page cannot forge an answer that
+ * gates a refusal, then run the predicate on it.
+ *
+ * `host` is the addressee whose document holds the owner: the root session
+ * for a directly-embedded frame, the parent frame's own world for a nested
+ * one. Null means the owner could not be asked about (no owner node, no
+ * probe world); errors PROPAGATE so each caller keeps its own policy for a
+ * session-layer failure, which is not the same thing as a "no".
+ */
+async function askFrameOwner<T>(
+  host: Cdp,
+  frameId: string,
+  predicate: string,
+  args: unknown[] = [],
+): Promise<T | null> {
+  const owner = await sendCommand<{ backendNodeId?: number }>(host, 'DOM.getFrameOwner', { frameId })
+  if (!owner.backendNodeId) return null
+  const resolved = await resolveNodeInProbeWorld(host, owner.backendNodeId)
+  if (!resolved.ok) return null
+  return await callOn<T>(host, resolved.objectId, predicate, args)
+}
+
+/** Which frame EMBEDS this cross-origin frame: its own session's root node
+ *  is the only place that relationship is on the wire. Undefined when it
+ *  cannot be read, which no caller may treat as "the page". */
+async function embeddingFrameId(tabId: number, sessionId: string): Promise<string | undefined> {
+  const tree = await localFrameTree({ tabId, sessionId })
+  return tree.root.parentId
+}
+
+/**
  * Which ATTACHED cross-origin frame satisfies `ownerPredicate` about its
- * `<iframe>` owner element in the ROOT document, or null (a frame owner that
- * matches no attached session is same-process, whose input still rides the
- * root). Owner handles are minted in the root PROBE world, so a page cannot
- * forge the answer that gates a refusal. `ownerPredicate` receives the extra
- * args after the owner element as `this`.
+ * `<iframe>` owner element, or null (a frame owner that matches no attached
+ * session is same-process, whose input still rides the root).
+ * `ownerPredicate` receives the extra args after the owner element as `this`.
+ *
+ * `ownerDocument` names the document the owner element is expected to live
+ * in, and doing that is what keeps the answer UNIQUE. Left out (the point
+ * predicates), the question is asked in the root, where only one element can
+ * be `document.activeElement` and only a directly-embedded frame's owner
+ * resolves at all: root coordinates also mean nothing in a wrapper's own
+ * space, so those callers deliberately keep the root-only reach.
+ *
+ * Given (the focus predicates, which pass the frame the focus read named),
+ * candidates are FILTERED to the frames that document actually embeds before
+ * anything is asked. Asking each cross-origin frame's own parent document
+ * instead was a silent wrong-target bug: `document.activeElement` is a
+ * per-document record that survives the document leaving the focus chain, so
+ * a wrapper whose payment frame held focus five minutes ago still answers
+ * yes, and trusted keystrokes would follow that answer into the wrong
+ * origin's frame (review round).
  */
 async function matchFrameOwner(
   tabId: number,
   ownerPredicate: string,
   args: unknown[] = [],
+  ownerDocument?: Cdp,
 ): Promise<{ sessionId: string; targetId: string; url: string } | null> {
-  for (const frame of frameSessions(tabId)) {
+  const sessions = frameSessions(tabId)
+  if (!sessions.length) return null
+  const host = ownerDocument ?? tabId
+  // Which frame id the host document IS, so a candidate's parent can be
+  // compared against it. The page's own frame id is read only when the host
+  // is the page itself; a failure there costs the filter, not the lookup.
+  let hostFrameId = ownerDocument ? frameIdOf(ownerDocument) : undefined
+  if (ownerDocument && !hostFrameId) {
     try {
-      const owner = await sendCommand<{ backendNodeId?: number }>(tabId, 'DOM.getFrameOwner', {
-        frameId: frame.targetId,
-      })
-      if (!owner.backendNodeId) continue
-      const resolved = await resolveNodeInProbeWorld(tabId, owner.backendNodeId)
-      if (!resolved.ok) continue
-      const hit = await callOn<boolean>(tabId, resolved.objectId, ownerPredicate, args)
-      if (hit === true) return frame
+      hostFrameId = (await localFrameTree(tabId)).root.frameId
+    } catch (e) {
+      if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
+    }
+  }
+  for (const frame of sessions) {
+    try {
+      if (ownerDocument && hostFrameId) {
+        const parentId = await embeddingFrameId(tabId, frame.sessionId)
+        // Only a POSITIVE mismatch excludes a frame. An unreadable parent
+        // falls through to the owner question, which answers null for a
+        // frame the host document does not embed anyway, so a Chrome that
+        // stopped reporting `parentId` would cost precision here, never the
+        // whole capability.
+        if (parentId !== undefined && parentId !== hostFrameId) continue
+      }
+      if ((await askFrameOwner<boolean>(host, frame.targetId, ownerPredicate, args)) === true) {
+        return frame
+      }
     } catch (e) {
       // Session-layer failures rethrow like everywhere else in this file: a
       // timed-out or unusable tab answering NO frame checks is not "no frame
@@ -1287,8 +1371,46 @@ type TargetResolution =
       backendNodeId?: number
       mintRole?: string
       mintName?: string
+      /** The rule this target came from, for the selector-only half of the
+       *  pre-dispatch probe (`SELECTOR_FACTS_FN`). Absent for `@` refs, which
+       *  have a mint fingerprint instead. */
+      selector?: { query: string; kind: 'css' | 'xpath' }
     }
   | { ok: false; error: string; stale?: StaleReason }
+
+/**
+ * What to tell an agent whose `css=` selector matched nothing anywhere.
+ *
+ * "matched no element" alone reads as "the element is not on the page",
+ * which is exactly the wrong conclusion on a web-component page. The counts
+ * come from the walk itself, so the claim about what was searched is
+ * measured rather than assumed.
+ */
+function selectorMissError(query: string, marker: string): string {
+  const base = `css selector matched no element: ${query}`
+  const parsed = new RegExp(`^${SELECTOR_MISS}(\\d+),(\\d+),(\\d+)$`).exec(marker)
+  if (!parsed) return base
+  const open = Number(parsed[1])
+  const hosts = Number(parsed[2])
+  const capped = parsed[3] === '1'
+  // The exit: a closed root is the one place a selector can never look, and
+  // a page read CAN (refs ride the AX tree, not the DOM tree), so the
+  // refusal routes rather than dead-ends. One sentence, two lead-ins.
+  const refExit = "read the page and use the element's @ref, which reaches inside closed roots."
+  let detail: string
+  if (open > 0) {
+    detail = ` (searched the document and ${open} open shadow root(s)). If it is in a CLOSED root, ${refExit}`
+  } else if (hosts > 0) {
+    // Deliberately soft. All this measures is dashed tag names, and
+    // `el.shadowRoot === null` cannot tell a closed root from no root at
+    // all, so a framework page with no shadow DOM anywhere would otherwise
+    // be told its typo was an encapsulation problem (review round).
+    detail = `. This page uses custom elements, which MAY hold closed shadow roots: ${refExit}`
+  } else {
+    return base
+  }
+  return base + detail + (capped ? ' The search hit its budget, so it was not exhaustive.' : '')
+}
 
 async function currentUrl(tabId: number): Promise<string | null> {
   try {
@@ -1307,7 +1429,8 @@ async function currentUrl(tabId: number): Promise<string | null> {
  * Resolve a target to a CDP Runtime objectId, minted IN the probe world.
  *
  * `@e5`      -> snapshot ref, validated against the URL it was minted on
- * `css=...`  -> document.querySelector, evaluated in the probe world
+ * `css=...`  -> the document, then OPEN shadow roots on a miss
+ *               (`cssResolveExpression`), evaluated in the probe world
  * `xpath=...`-> document.evaluate, evaluated in the probe world
  *
  * The world is the point (#160): every later read AND mutation runs through
@@ -1315,11 +1438,17 @@ async function currentUrl(tabId: number): Promise<string | null> {
  * world gives the whole act pristine primitives a hostile page cannot
  * override. A stale ref returns a typed error naming the fix rather than
  * resolving a backendNodeId that now points into a different document.
+ *
+ * `skipShadowWalk` is for the WAIT loop only: the same resolution without
+ * the open-root walk, which a poll running ten times a second cannot afford
+ * every time (see `SHADOW_WALK_EVERY_N_POLLS`). An act NEVER passes it: a
+ * one-shot resolution pays the walk and finds the element.
  */
 async function resolveTarget(
   tabId: number,
   target: string,
   url: string | null,
+  opts: { skipShadowWalk?: boolean } = {},
 ): Promise<TargetResolution> {
   if (target.startsWith('@')) {
     const resolution = resolveRef(tabId, target, url)
@@ -1412,23 +1541,57 @@ async function resolveTarget(
   if (target.startsWith('css=') || target.startsWith('xpath=')) {
     const isCss = target.startsWith('css=')
     const query = isCss ? target.slice(4) : target.slice(6)
+    // Only CSS descends: XPath is defined over ONE document's node tree and
+    // has no way to express a shadow boundary, so piercing it would mean
+    // silently redefining what an absolute expression like /html/body/...
+    // means. Documented in chrome_act's docstring, which steers to css=.
     const expression = isCss
-      ? `document.querySelector(${JSON.stringify(query)})`
+      ? opts.skipShadowWalk
+        ? `document.querySelector(${JSON.stringify(query)})`
+        : cssResolveExpression(query)
       : `document.evaluate(${JSON.stringify(query)}, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue`
     const evald = await withProbeWorld(tabId, (contextId) =>
-      sendCommand<{ result: { objectId?: string; subtype?: string } }>(tabId, 'Runtime.evaluate', {
-        expression,
-        returnByValue: false,
-        contextId,
-      }),
+      sendCommand<{
+        result: { objectId?: string; subtype?: string; type?: string; value?: unknown }
+        exceptionDetails?: unknown
+      }>(tabId, 'Runtime.evaluate', { expression, returnByValue: false, contextId }),
     )
     if (evald === null) {
       return { ok: false, error: probeWorldUnavailableError(`the ${isCss ? 'css' : 'xpath'} lookup`) }
     }
+    // A THROWN expression still returns `result`, holding the Error object
+    // with a perfectly good objectId, so without this check a malformed
+    // xpath resolved to the Error and the act proceeded to click a
+    // JavaScript exception (review round). The css branch reports its own
+    // invalid-selector marker, so this is the xpath spelling's twin.
+    if (evald.exceptionDetails) {
+      return {
+        ok: false,
+        error: `${INVALID_SELECTOR_PREFIX}${isCss ? 'CSS selector' : 'XPath expression'}: ${query}`,
+      }
+    }
+    // A STRING result is the css walk reporting a miss (see SELECTOR_MISS):
+    // it rides the same round trip, so the honest "what was searched" answer
+    // costs nothing. Keyed on the remote object's TYPE, not just on the
+    // value, so a string can never fall through to the node branch and hand
+    // the act a target that is not an element.
+    if (evald.result.type === 'string') {
+      const marker = typeof evald.result.value === 'string' ? evald.result.value : ''
+      if (marker.startsWith(SELECTOR_INVALID)) {
+        return { ok: false, error: `${INVALID_SELECTOR_PREFIX}CSS selector: ${query}` }
+      }
+      // An unreadable marker degrades to the plain miss, never to a node.
+      return { ok: false, error: selectorMissError(query, marker) }
+    }
     if (!evald.result.objectId || evald.result.subtype === 'null') {
       return { ok: false, error: `${isCss ? 'css selector' : 'xpath'} matched no element: ${query}` }
     }
-    return { ok: true, objectId: evald.result.objectId, session: tabId }
+    return {
+      ok: true,
+      objectId: evald.result.objectId,
+      session: tabId,
+      selector: { query, kind: isCss ? 'css' : 'xpath' },
+    }
   }
   return {
     ok: false,
@@ -1498,13 +1661,7 @@ async function frameOwnerAtPoint(session: Cdp, point: Point): Promise<HitTest | 
     // gate was fixed for (review round). Fail-open is this probe's contract;
     // the delivery verification backstops.
     if (!chain) return null
-    const owner = await sendCommand<{ backendNodeId?: number }>(host, 'DOM.getFrameOwner', {
-      frameId: chain.path[0],
-    })
-    if (!owner.backendNodeId) return null
-    const resolved = await resolveNodeInProbeWorld(host, owner.backendNodeId)
-    if (!resolved.ok) return null
-    return await callOn<HitTest>(host, resolved.objectId, HIT_TEST_FN, [point.x, point.y])
+    return await askFrameOwner<HitTest>(host, chain.path[0], HIT_TEST_FN, [point.x, point.y])
   } catch (e) {
     if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
     return null
@@ -1579,8 +1736,15 @@ async function describeFocused(tabId: number): Promise<FocusedDescription | null
     // Focus rests on a frame owner: descend ONE level when it is an attached
     // cross-origin frame, so the payload names the element that actually
     // holds focus instead of the wall in front of it. (A SAME-ORIGIN frame
-    // never reaches here: the expression itself descends its chain.)
-    const frame = await matchFrameOwner(tabId, OWNER_HAS_FOCUS_FN)
+    // never reaches here: the expression itself descends its chain.) The
+    // owner element lives in the document the read NAMED, which is the page
+    // unless the focus chain ran through a same-origin wrapper first.
+    const frame = await matchFrameOwner(
+      tabId,
+      OWNER_HAS_FOCUS_FN,
+      [],
+      top.frame_url ? await localFrameHoldingFocus(tabId, top.frame_url) : tabId,
+    )
     if (!frame) return top
     const innerValue = await evaluateInProbeWorld<FocusedDescription | null>(
       { tabId, sessionId: frame.sessionId },
@@ -1592,6 +1756,89 @@ async function describeFocused(tabId: number): Promise<FocusedDescription | null
   } catch {
     return null
   }
+}
+
+/**
+ * How many same-process frames the focused-frame lookup may interrogate.
+ *
+ * Bounded like every other frame walk here: the URL filter picks the right
+ * frame on any ordinary page, and the fallback sweep exists only for the
+ * duplicate-URL case (ad and widget stacks), where paying three CDP calls
+ * per frame across a frame farm would cost more than the verdict is worth.
+ */
+const MAX_FOCUS_FRAME_PROBES = 8
+
+/**
+ * Do the focus expression's URL and a frame tree's URL name the same document?
+ *
+ * Two shapes have to be reconciled, and a plain equality on them silently
+ * matched nothing for any frame carrying a fragment (review round, which
+ * dropped every such lookup into the unfiltered sweep): the expression reads
+ * `location.href`, which INCLUDES the fragment and is sliced to 200 chars,
+ * while `Page.Frame.url` is defined without one. So compare fragment-free,
+ * and treat a sliced-to-the-limit reading as the prefix it is.
+ */
+function sameFocusFrameUrl(frameTreeUrl: string, focusUrl: string): boolean {
+  const bare = (u: string): string => {
+    const hash = u.indexOf('#')
+    return hash === -1 ? u : u.slice(0, hash)
+  }
+  const want = bare(focusUrl)
+  const have = bare(frameTreeUrl)
+  return focusUrl.length >= 200 ? have.startsWith(want) : have === want
+}
+
+/**
+ * WHICH same-process frame holds the page's focus, addressed so the delivery
+ * probe can arm inside it.
+ *
+ * Only called when `DESCRIBE_FOCUSED_EXPRESSION` already descended into a
+ * same-origin frame (it reports that frame's URL), so the common case pays
+ * nothing. The URL narrows the candidates and the OWNER test decides, because
+ * two frames on one page routinely share a URL and arming the wrong frame's
+ * probe would be a NEW silent-wrong, worse than the honest unknown this
+ * replaces. The owner element lives in the frame's PARENT document, so the
+ * question is asked in the parent's own world (the root's world cannot see a
+ * nested frame's owner, which is what makes the doubly-nested case work).
+ *
+ * Returns a `frameId`-carrying root target: `debuggee()` ignores `frameId`,
+ * so trusted keystrokes keep riding the shared session exactly as before and
+ * ONLY the probe's document moves.
+ */
+async function localFrameHoldingFocus(tabId: number, frameUrl: string): Promise<Cdp> {
+  let locals: LocalFrame[]
+  try {
+    locals = await localFrames(tabId)
+  } catch (e) {
+    // Session-layer failures rethrow like every other pre-dispatch probe;
+    // anything else leaves the keystrokes where they already were going.
+    if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
+    return tabId
+  }
+  const byUrl = locals.filter((f) => sameFocusFrameUrl(f.url, frameUrl))
+  // DEEPEST FIRST. `document.activeElement` is the frame OWNER in every
+  // ancestor of the focused frame, so the owner predicate answers true all
+  // the way UP the chain, and taking the first true in document order armed
+  // the probe in the outermost frame of a nested widget (review round). The
+  // innermost true answer is the document the caret is actually in. The sort
+  // is stable, so same-depth candidates keep document order.
+  const candidates = byUrl.length ? byUrl : locals
+  for (const f of [...candidates]
+    .sort((x, y) => y.path.length - x.path.length)
+    .slice(0, MAX_FOCUS_FRAME_PROBES)) {
+    const parentFrameId = f.path.length > 1 ? f.path[f.path.length - 2] : undefined
+    const host: Cdp = parentFrameId ? { tabId, frameId: parentFrameId } : tabId
+    try {
+      if ((await askFrameOwner<boolean>(host, f.frameId, OWNER_HAS_FOCUS_FN)) === true) {
+        return { tabId, frameId: f.frameId }
+      }
+    } catch (e) {
+      if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
+      // One unanswerable frame must not veto the others (matchFrameOwner's
+      // rule: a whole-loop try let a single bad frame decide the verdict).
+    }
+  }
+  return tabId
 }
 
 /** Where ref-less keystrokes go: the frame holding focus, else the root.
@@ -1606,8 +1853,9 @@ async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
   // calls per attached frame. In the PROBE world (review round): this gate
   // routes TRUSTED keystrokes, and `withProbeWorld` keeps the session-layer
   // rethrow the main-world try/catch used to carry.
+  let top: FocusedDescription | null
   try {
-    const top = await withProbeWorld(tabId, async (contextId) => {
+    top = await withProbeWorld(tabId, async (contextId) => {
       const resp = await sendCommand<{
         result?: { value?: FocusedDescription | null }
         exceptionDetails?: unknown
@@ -1619,13 +1867,29 @@ async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
       if (resp.exceptionDetails) return null
       return resp.result?.value ?? null
     })
-    if (!top || (top.tag !== 'iframe' && top.tag !== 'frame')) return tabId
   } catch (e) {
     if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
     // An unanswerable gate keeps the pre-frames behavior: type at the root.
     return tabId
   }
-  const frame = await matchFrameOwner(tabId, OWNER_HAS_FOCUS_FN)
+  if (!top) return tabId
+  if (top.tag !== 'iframe' && top.tag !== 'frame') {
+    // The expression descended a SAME-ORIGIN frame chain itself, so a
+    // non-frame tag with a `frame_url` means the caret is inside a
+    // same-process frame. Dispatch does not change (root-session input
+    // reaches those frames), but the DELIVERY PROBE must arm in the frame's
+    // own world: armed at the root it counted nothing and the verdict was a
+    // permanent "unknown", which is the residual this closes.
+    return top.frame_url ? await localFrameHoldingFocus(tabId, top.frame_url) : tabId
+  }
+  // Same as `describeFocused`: the owner element lives in the document the
+  // focus read named, and naming it is what keeps the answer unique.
+  const frame = await matchFrameOwner(
+    tabId,
+    OWNER_HAS_FOCUS_FN,
+    [],
+    top.frame_url ? await localFrameHoldingFocus(tabId, top.frame_url) : tabId,
+  )
   return frame ? { tabId, sessionId: frame.sessionId } : tabId
 }
 
@@ -1652,11 +1916,16 @@ async function stillConnected(session: Cdp, objectId: string | null): Promise<bo
  *
  * The actionability facts ride the SAME call (`ACTIONABILITY_FN`), which is
  * the whole reason they are affordable: this probe already runs on the
- * already-minted probe-world handle before every ref act, so disabled,
- * readonly, text-entry, visibility and pointer-events cost zero extra round
- * trips (the text-entry answer even SAVES the covered-click path its own
- * call). Only `@` refs reach here (see the call site); a `css=`/`xpath=`
- * target would need a NEW call and keeps its previous behaviour.
+ * already-minted probe-world handle before every act, so disabled, readonly,
+ * text-entry, visibility and pointer-events cost zero extra round trips (the
+ * text-entry answer even SAVES the covered-click path its own call).
+ *
+ * `selector` switches to the composed body that adds the two selector-only
+ * facts. It is the one call a `css=`/`xpath=` act spends that a ref act
+ * spends too: before this, selector targets skipped the probe entirely and
+ * dispatched into disabled controls, so the same click refused by name
+ * through `@e12` came back as an undelivered-input failure blaming a healthy
+ * page.
  *
  * A null return, or an individual field left absent, means NOT KNOWN, and
  * every caller refuses only on an explicit answer.
@@ -1664,9 +1933,12 @@ async function stillConnected(session: Cdp, objectId: string | null): Promise<bo
 async function actionabilityBeforeActing(
   session: Cdp,
   objectId: string,
+  selector?: { query: string; kind: 'css' | 'xpath' },
 ): Promise<Actionability | null> {
   try {
-    const value = await actionabilityOf(session, objectId)
+    const value = selector
+      ? await selectorFactsOf(session, objectId, selector.query, selector.kind)
+      : await actionabilityOf(session, objectId)
     // A malformed answer (a page cannot produce one here, but a protocol
     // change or a returnByValue failure can) is "not known", never a
     // refusal: same fail-open side the occlusion gate picks.
@@ -1830,11 +2102,25 @@ function waitTextExpression(text: string): string {
   })()`
 }
 
+/**
+ * Poll until a condition holds, or the window runs out.
+ *
+ * `alreadyTrue` is the honesty half: the loop checks every condition BEFORE
+ * its first sleep, so a condition that was already satisfied returns in ~0ms,
+ * which in the payload was indistinguishable from one that appeared inside
+ * the first poll interval. Those are opposite answers to the question a BARE
+ * wait exists to settle ("is this already true?"), so the first pass is
+ * marked and the key is omitted otherwise (absent means no news). The
+ * bare-settle branch has no such notion and must never grow the flag, and
+ * neither does a FUSED wait: it runs after the action has settled, so
+ * "already true at the first check" is the normal shape of success there and
+ * the flag would be furniture on nearly every payload (review round).
+ */
 async function performWait(
   tabId: number,
   waitFor: WaitFor | undefined,
   timeoutMs: number,
-): Promise<{ found: boolean; condition: string }> {
+): Promise<{ found: boolean; condition: string; alreadyTrue?: boolean; unwatchable?: string }> {
   const deadline = Date.now() + timeoutMs
   // Conditions are OR'd: the first to hold wins and is the one NAMED, so a
   // `found: true` is never a claim about a condition that was not met. Only
@@ -1849,12 +2135,18 @@ async function performWait(
     return { found: result.settled, condition: 'settle' }
   }
   const allConditions = parts.join(' | ')
+  let polls = 0
+  const firstPass = (): { alreadyTrue?: true } => (polls === 0 ? { alreadyTrue: true } : {})
 
   for (;;) {
     if (waitFor.url_contains) {
       const url = await currentUrl(tabId)
       if (url && url.includes(waitFor.url_contains)) {
-        return { found: true, condition: `url_contains:${waitFor.url_contains}` }
+        return {
+          found: true,
+          condition: `url_contains:${waitFor.url_contains}`,
+          ...firstPass(),
+        }
       }
     }
     if (waitFor.text) {
@@ -1875,15 +2167,36 @@ async function performWait(
           if (seen === true) break
         }
       }
-      if (seen === true) return { found: true, condition: `text:${waitFor.text}` }
+      if (seen === true) {
+        return { found: true, condition: `text:${waitFor.text}`, ...firstPass() }
+      }
     }
     if (waitFor.ref) {
       try {
         const url = await currentUrl(tabId)
-        const target = await resolveTarget(tabId, waitFor.ref, url)
+        // Cheap first (review round). A `css=` condition is absent for the
+        // whole wait by definition, which is exactly the case that pays the
+        // open-root walk in full on EVERY poll: up to 2000 nodes scanned
+        // synchronously, fifty times over a 5s wait. The light document
+        // query is what a selector resolved with before the walk existed;
+        // the walk itself still runs on the first poll and every fifth
+        // after it, so a wait can still find an element inside a shadow
+        // root, at most half a second later than the poll that saw it.
+        const target = await resolveTarget(tabId, waitFor.ref, url, {
+          skipShadowWalk: polls % SHADOW_WALK_EVERY_N_POLLS !== 0,
+        })
+        // A MALFORMED condition can never come true, so polling it to the
+        // deadline spends the whole window (up to 64s) to report "timed
+        // out", which reads as the page never producing the element. Stop
+        // at once and name the real problem (review round).
+        if (!target.ok && target.error.startsWith(INVALID_SELECTOR_PREFIX)) {
+          return { found: false, condition: `ref:${waitFor.ref}`, unwatchable: target.error }
+        }
         if (target.ok) {
           const connected = await stillConnected(target.session, target.objectId)
-          if (connected !== false) return { found: true, condition: `ref:${waitFor.ref}` }
+          if (connected !== false) {
+            return { found: true, condition: `ref:${waitFor.ref}`, ...firstPass() }
+          }
         }
       } catch {
         // Same class as the text branch, and it matters more here: a `css=`
@@ -1895,6 +2208,7 @@ async function performWait(
     }
     if (Date.now() >= deadline) return { found: false, condition: allConditions }
     await new Promise((r) => setTimeout(r, WAIT_POLL_MS))
+    polls += 1
   }
 }
 
@@ -1986,6 +2300,11 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     // evaluates would otherwise queue behind the suspended renderer and burn
     // the whole timeout learning nothing, when the cause is known by name
     // the moment it opens.
+    // Sampled here, not from `startedAt`: the dialog check, the liveness
+    // probe and the url read all precede this, and counting them made
+    // `waited_ms` a number about the whole command rather than about the
+    // wait it names.
+    const waitStart = Date.now()
     const raced = await raceStandingDialog(tabId, performWait(tabId, a.wait_for, waitWindowMs))
     if (raced.kind === 'dialog') {
       const d = raced.dialog
@@ -2002,7 +2321,18 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         },
       }
     }
-    const { found, condition } = raced.value
+    const { found, condition, alreadyTrue, unwatchable } = raced.value
+    // A condition that can never come true is a caller error, not a page
+    // outcome, and it is reported the moment the resolver says so rather
+    // than after the window it would otherwise have burned.
+    if (unwatchable) {
+      return {
+        ok: false,
+        status: 'error',
+        error: `the wait condition cannot be watched: ${unwatchable}`,
+        data: { action: 'wait', condition, found: false, url: urlBefore, input: 'none' },
+      }
+    }
     const waitClamped = waitWindowMs < askedWaitMs
     const data = await buildVerification({
       action: 'wait',
@@ -2019,7 +2349,8 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       extra: {
         condition,
         found,
-        waited_ms: Date.now() - startedAt,
+        waited_ms: Date.now() - waitStart,
+        ...(alreadyTrue ? { condition_met_before_wait: true } : {}),
         ...(waitClamped && !found ? { budget_clamped: true } : {}),
       },
     })
@@ -2048,11 +2379,19 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   let elementFrameTargetId: string | undefined
   /** For the same-process dispatch-point read; refs only. */
   let elementBackendNodeId: number | undefined
-  /** The widened pre-dispatch probe's answer for the main `@` ref target
-   *  (null when it could not be asked). Read by the refusals below, by the
-   *  `target_invisible` annotation, and by the pointer-events copy inside
-   *  the click and check branches. */
+  /** The widened pre-dispatch probe's answer for the main target, ref or
+   *  selector (null when it could not be asked). Read by the refusals below,
+   *  by the `target_invisible` annotation, by the selector honesty fields,
+   *  and by the pointer-events copy inside the click and check branches. */
   let actionability: Actionability | null = null
+  /** The selector-target honesty pair (how many elements the rule matched,
+   *  whether the match came from a shadow root), declared HERE because they
+   *  ride every exit from here on, refusals included: a `css=.btn` that
+   *  matched 14 and then refused because the first one is disabled needs the
+   *  other 13 named exactly as much as a success does (review round). A count
+   *  of ONE is not news and is left out, so the fields only ever appear when
+   *  there is something to say (the refusal notes' rule). */
+  const selectorFacts: Record<string, unknown> = {}
   /** What a bare coordinate landed on, for the verification payload. */
   let pointTarget: PointTarget | null = null
   if (NEEDS_TARGET.has(a.action) || (OPTIONAL_TARGET.has(a.action) && target)) {
@@ -2070,20 +2409,38 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           data: resolution.stale ? { stale_refs: true, reason: resolution.stale } : undefined,
         }
       }
+      // The widened pre-dispatch probe, for BOTH target classes. A selector
+      // target pays exactly the one `callFunctionOn` a ref pays, and gets the
+      // same six facts plus the two only a selector has (how many elements
+      // the rule matched, whether the match came from a shadow root): the
+      // fingerprint's selector-native analogue, since a selector names a rule
+      // and has no mint to compare against.
+      actionability = await actionabilityBeforeActing(
+        resolution.session,
+        resolution.objectId,
+        resolution.selector,
+      )
+      // A count of ONE is not news, EXCEPT when a bound cut the search: then
+      // the one is a floor, and silence would read as "unambiguous", which is
+      // the one thing a cut search cannot establish (review round).
+      const capped = actionability?.matchCountCapped === true
+      if (
+        typeof actionability?.matchCount === 'number' &&
+        (actionability.matchCount > 1 || capped)
+      ) {
+        selectorFacts.selector_matches = actionability.matchCount
+      }
+      if (capped) selectorFacts.selector_matches_capped = true
+      if (actionability?.shadowMatch === true) selectorFacts.matched_in = 'shadow-root'
       // BEFORE anything is sent: a resolvable ref is not a live one. See
       // `detachedRefError`. `null` (the context went away) is unknowable, not
       // a refusal, and falls through to the action's own honest failure.
-      // Only for `@` refs: `css=`/`xpath=` go through `querySelector`, which
-      // returns connected nodes by construction, so the check would spend a
-      // round trip to say what the resolution already proved, and its
-      // "use a fresh ref" advice names something the caller never used. The
-      // actionability facts ride this same call and are therefore scoped the
-      // same way; a css= target keeps its previous behaviour rather than
-      // paying a round trip the ref path gets for free.
-      if (target.startsWith('@')) {
-        actionability = await actionabilityBeforeActing(resolution.session, resolution.objectId)
-      }
-      if (actionability?.connected === false) {
+      // Only for `@` refs: both selector spellings resolve by walking DOWN
+      // from `document`, so every node they can return is attached by
+      // construction (the shadow walk descends through connected hosts
+      // only), and the refusal's "use a fresh ref" advice names something the
+      // caller never used.
+      if (target.startsWith('@') && actionability?.connected === false) {
         return {
           ok: false,
           status: 'error',
@@ -2093,8 +2450,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       }
       // The mint-fingerprint re-check, for the verbs that dispatch input into
       // the element the agent chose by meaning. Only refs minted WITH a
-      // fingerprint are checked (css=/xpath= targets have none to compare),
-      // and only before dispatch, where refusing still honestly means
+      // fingerprint are checked: a selector names a RULE and has no mint to
+      // compare against, so its analogue is the match count the same probe
+      // just read. Only before dispatch, where refusing still honestly means
       // nothing was sent.
       if (FINGERPRINT_VERBS.has(a.action)) {
         const refusal = await fingerprintRefusal(resolution, a.action, target, target)
@@ -2111,7 +2469,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           ok: false,
           status: 'error',
           error: disabledTargetError(a.action, target),
-          data: { action: a.action, target, refused: 'disabled', input: 'none' },
+          data: { action: a.action, target, ...selectorFacts, refused: 'disabled', input: 'none' },
         }
       }
       // (The readonly refusal is NOT here: `readonly` is routinely removed by
@@ -2181,6 +2539,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           data: {
             action: a.action,
             target,
+            ...selectorFacts,
             refused: 'file_input',
             ...(pointTarget ? { hit: pointTarget.description } : {}),
           },
@@ -2213,6 +2572,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   if (actionability?.visible === false && INVISIBLE_ANNOTATES.has(a.action)) {
     extra.target_invisible = true
   }
+  // The selector honesty fields join the bag every later exit carries. The
+  // exits that build their own `data` (the refusals above and below, and the
+  // three post-dispatch ones) spread `selectorFacts` directly: a rule that
+  // matched fourteen elements is at its most useful in a failure, which is
+  // exactly where the payload used to drop it (review round).
+  Object.assign(extra, selectorFacts)
 
   // #162: the last pre-dispatch checkpoint. Pre-flight (attach, liveness,
   // resolution, geometry) spends against the same wall clock as everything
@@ -2226,6 +2591,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       data: {
         action: a.action,
         ...(target ? { target } : {}),
+        ...selectorFacts,
         url: urlBefore,
         budget_exhausted: true,
         input: 'none',
@@ -2294,8 +2660,8 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               // deliberate click-through instead of dead-ending.
               // The widened pre-dispatch probe already classified the target
               // with this same function body on this same handle, so the
-              // covered path spends a call only where that probe does not
-              // run (a css=/xpath= target).
+              // covered path spends a call only where that probe could not
+              // answer at all (a world failure, a malformed reply).
               const textEntry =
                 actionability?.textEntry ?? (await textEntryTarget(elementSession, objectId))
               if (!textEntry) {
@@ -2317,6 +2683,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                     data: {
                       action: a.action,
                       target,
+                      ...selectorFacts,
                       refused: 'pointer_events_none',
                       intercepted_by: ht.blocker ?? null,
                       ...(teachPoint
@@ -2331,6 +2698,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                   status: 'error',
                   error: coveredPointError(a.action, target, ht.blocker, teachPoint),
                   data: {
+                    ...selectorFacts,
                     intercepted_by: ht.blocker ?? null,
                     // A frame-local coordinate is useless to the agent (bare
                     // coordinates are root-space), so an OOPIF target gets
@@ -2368,8 +2736,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                   status: 'error',
                   error: frameOccludedError(a.action, target, ownerHit.blocker),
                   data: {
+                    ...selectorFacts,
                     intercepted_by: ownerHit.blocker ?? null,
-                    occluded_in: 'parent-document',
+                    occluded_in: 'embedding-document',
                     input: 'none',
                   },
                 }
@@ -2408,7 +2777,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                     `the ${a.action} was delivered, but the page changed before its ` +
                     'outcome could be verified (a navigation or re-render). Re-read ' +
                     `the page to see what happened before repeating the ${a.action}.`,
-                  data: { intercepted_by: ht.blocker ?? null, click_delivered: true },
+                  data: { ...selectorFacts, intercepted_by: ht.blocker ?? null, click_delivered: true },
                 }
               }
               if (!landed) {
@@ -2421,7 +2790,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                     ht.blocker,
                     ht.via === 'ancestor',
                   ),
-                  data: { intercepted_by: ht.blocker ?? null, click_delivered: true },
+                  data: { ...selectorFacts, intercepted_by: ht.blocker ?? null, click_delivered: true },
                 }
               }
               extra.clicked_through = clickThrough
@@ -2483,7 +2852,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             ok: false,
             status: 'error',
             error: readonlyTargetError(a.action, target),
-            data: { action: a.action, target, refused: 'readonly', input: 'none' },
+            data: { action: a.action, target, ...selectorFacts, refused: 'readonly', input: 'none' },
           }
         }
         await selectAllIn(elementSession, objectId)
@@ -2505,7 +2874,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               ok: false,
               status: 'error',
               error: readonlyTargetError(a.action, target),
-              data: { action: a.action, target, refused: 'readonly', input: 'none' },
+              data: { action: a.action, target, ...selectorFacts, refused: 'readonly', input: 'none' },
             }
           }
           previousValue = await readValue(elementSession, objectId)
@@ -2556,6 +2925,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             ok: false,
             status: 'error',
             error: `no option matching "${a.value}" (matched on value, then on visible label)`,
+            data: { action: a.action, target, ...selectorFacts, input: 'none' },
           }
         }
         inputMode = 'synthetic'
@@ -2594,6 +2964,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                   data: {
                     action: a.action,
                     target,
+                    ...selectorFacts,
                     refused: 'pointer_events_none',
                     intercepted_by: ht.blocker ?? null,
                     ...(teachPoint
@@ -2612,6 +2983,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                 status: 'error',
                 error: coveredPointError(a.action, target, ht.blocker, teachPoint),
                 data: {
+                  ...selectorFacts,
                   intercepted_by: ht.blocker ?? null,
                   ...(teachPoint
                     ? { click_point: [Math.round(teachPoint.x), Math.round(teachPoint.y)] }
@@ -2629,8 +3001,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                   status: 'error',
                   error: frameOccludedError(a.action, target, ownerHit.blocker),
                   data: {
+                    ...selectorFacts,
                     intercepted_by: ownerHit.blocker ?? null,
-                    occluded_in: 'parent-document',
+                    occluded_in: 'embedding-document',
                     input: 'none',
                   },
                 }
@@ -3122,6 +3495,15 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     extra.condition = raced.value.condition
     extra.found = raced.value.found
     extra.waited_ms = Date.now() - waitStart
+    // The action itself went in, so this cannot fail the call; it says why
+    // the condition was never watchable instead of leaving a bare
+    // `found: false` to read as the page's answer.
+    if (raced.value.unwatchable) extra.condition_error = raced.value.unwatchable
+    // No `condition_met_before_wait` here, deliberately. The fused wait opens
+    // AFTER the action has been dispatched and settled, so a condition the
+    // action produced is already true at the first check: the flag would ride
+    // nearly every successful fused act while saying nothing the caller can
+    // act on (review round). `waited_ms` still reports the real cost.
     if (!raced.value.found && fusedWindowMs < fusedAskedMs) {
       extra.budget_clamped = true
     }
@@ -3212,7 +3594,9 @@ export const __test = {
   resolveTarget,
   performWait,
   buildVerification,
+  cssResolveExpression,
   NEEDS_TARGET,
   OPENS_FILE_CHOOSER,
   DESCRIBE_ELEMENT,
+  SELECTOR_MISS,
 }

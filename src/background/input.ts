@@ -1,5 +1,6 @@
 import { budgetSpent } from './budget'
 import { sendCommand, type Cdp } from './debuggerSession'
+import { cssMatchCountExpression } from './shadowWalk'
 
 /**
  * Trusted input primitives.
@@ -335,18 +336,38 @@ export interface HitTest {
 }
 
 /** In-page body of `hitTest`, exported so its containment logic is testable
- *  as executed code rather than an unexercised string. */
+ *  as executed code rather than an unexercised string.
+ *
+ *  The point is tested in the TARGET'S OWN ROOT (`getRootNode()`, the
+ *  `FOCUS_LANDED_FN` precedent), because `document.elementFromPoint`
+ *  RETARGETS a shadow-DOM hit to the shadow HOST while `Node.contains` walks
+ *  the node tree and never crosses that boundary: all three checks then fail
+ *  and a button inside an open shadow root refuses as "covered by" its own
+ *  host. A `ShadowRoot` and a `Document` both implement `elementFromPoint`,
+ *  so one expression covers both; a detached node's root implements neither
+ *  and falls back to the document, where the answer is a miss either way.
+ *  An overlay in the light DOM still reads as a miss from inside a shadow
+ *  root (retargeting leaves a document-tree element alone), so the refusal
+ *  this exists for is untouched. */
 export const HIT_TEST_FN = `function(x, y){
-  const top = document.elementFromPoint(x, y);
+  const root = typeof this.getRootNode === 'function' ? this.getRootNode() : document;
+  const scope = root && typeof root.elementFromPoint === 'function' ? root : document;
+  const top = scope.elementFromPoint(x, y);
   if (!top) return { hit: false, blocker: 'nothing at point (offscreen?)' };
   const id = top.id ? '#' + top.id : '';
   const cls = typeof top.className === 'string' && top.className
     ? '.' + top.className.trim().split(/\\s+/).slice(0, 2).join('.')
     : '';
   const name = top.tagName.toLowerCase() + id + cls;
+  // Guarded like getRootNode above and for the same reason: <form> with a
+  // control NAMED contains shadows Node.prototype.contains with an element,
+  // and calling it throws out of a probe whose answer gates a refusal.
+  const holds = function(a, b){
+    try { return typeof a.contains === 'function' && a.contains(b) === true; } catch (e) { return false; }
+  };
   if (top === this) return { hit: true, via: 'self' };
-  if (this.contains(top)) return { hit: true, via: 'descendant' };
-  if (top.contains(this)) return { hit: true, via: 'ancestor', blocker: name };
+  if (holds(this, top)) return { hit: true, via: 'descendant' };
+  if (holds(top, this)) return { hit: true, via: 'ancestor', blocker: name };
   return { hit: false, blocker: name };
 }`
 
@@ -418,6 +439,18 @@ export interface Actionability {
   visible?: boolean
   /** The element's computed `pointer-events` is `none`. */
   pointerEventsNone?: boolean
+  /** SELECTOR targets only (see `SELECTOR_FACTS_FN`): how many elements the
+   *  same selector matches across the scopes the resolution searched. The
+   *  selector-native analogue of a ref's mint fingerprint: a selector names a
+   *  RULE, and the rule quietly matching fourteen buttons is its real failure
+   *  mode. */
+  matchCount?: number
+  /** SELECTOR targets only: a bound cut the count short, so `matchCount` is a
+   *  floor rather than a total. */
+  matchCountCapped?: boolean
+  /** SELECTOR targets only: the match came from inside a shadow root, so the
+   *  document-level query missed and the walk found it. */
+  shadowMatch?: boolean
 }
 
 /**
@@ -467,11 +500,65 @@ export async function actionabilityOf(target: Cdp, objectId: string): Promise<Ac
   return callOn<Actionability>(target, objectId, ACTIONABILITY_FN)
 }
 
+/**
+ * The same probe for a `css=` / `xpath=` target, plus the two facts only a
+ * selector has.
+ *
+ * Composed from `ACTIONABILITY_FN` rather than duplicating it (the way that
+ * function composes `TEXT_ENTRY_FN`), so a selector target gets the SAME six
+ * pre-dispatch facts a `@ref` gets from the same one round trip, and the
+ * extras ride along for free: the element already knows which root it came
+ * from, and re-running the rule in that root counts what else it matched.
+ *
+ * `kind` decides how to count, because the two spellings have no shared
+ * counting call: CSS counts over the scopes the RESOLUTION searched
+ * (`cssMatchCountExpression`, the document plus, on a document miss, the
+ * open shadow roots), XPath takes a snapshot of the document, which is the
+ * only tree it can address and which no shadow boundary can be expressed in,
+ * so an xpath target never reports a shadow match.
+ *
+ * The provenance comes from that same call rather than from the element's
+ * `getRootNode()`: the document query is what the RESOLUTION branched on, and
+ * a page cannot shadow it the way it can shadow a named DOM property (a
+ * `<form>` with a control named `getRootNode` made the fact silently absent,
+ * which the backend then rendered as a definite light-DOM match, review
+ * round).
+ */
+export const SELECTOR_FACTS_FN = `function(query, kind){
+  const out = (${ACTIONABILITY_FN}).call(this);
+  try {
+    if (kind === 'css') {
+      const counted = ${cssMatchCountExpression('query')};
+      out.matchCount = counted.n;
+      // A bound cut the search, so the count is a FLOOR. Said out loud, or
+      // the number reads as measured.
+      if (counted.capped) out.matchCountCapped = true;
+      if (counted.shadow) out.shadowMatch = true;
+    } else {
+      out.matchCount = document.evaluate(
+        query, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null
+      ).snapshotLength;
+    }
+  } catch (e) {}
+  return out;
+}`
+
+/** Ask the selector variant of the pre-dispatch probe. Same error policy as
+ *  `actionabilityOf`: the caller owns it. */
+export async function selectorFactsOf(
+  target: Cdp,
+  objectId: string,
+  query: string,
+  kind: 'css' | 'xpath',
+): Promise<Actionability> {
+  return callOn<Actionability>(target, objectId, SELECTOR_FACTS_FN, [query, kind])
+}
+
 /** In-page body of `focusLandedIn`: did focus end up on, inside, or wrapping
  *  this element? `getRootNode()` first so a target inside a shadow root reads
  *  its own root's activeElement (document.activeElement stops at the host). */
 export const FOCUS_LANDED_FN = `function(){
-  const root = this.getRootNode ? this.getRootNode() : document;
+  const root = typeof this.getRootNode === 'function' ? this.getRootNode() : document;
   const a = (root && root.activeElement) || document.activeElement;
   if (!a || a === document.body || a === document.documentElement) return false;
   return a === this || this.contains(a) || a.contains(this);

@@ -8,6 +8,7 @@ import {
   InputDispatchStalled,
   insertText,
   modifierMask,
+  SELECTOR_FACTS_FN,
   TEXT_ENTRY_FN,
   trustedClick,
   trustedDrag,
@@ -461,6 +462,89 @@ describe('hitTest containment (executed in-page fn)', () => {
     expect(out.hit).toBe(false)
     expect(out.blocker).toMatch(/offscreen/)
   })
+
+  it('tests the point in a shadow target\'s OWN root, not the document', () => {
+    // The document retargets a shadow-DOM hit to the HOST, and `contains`
+    // never crosses that boundary, so every containment check failed and a
+    // click on a button inside an open shadow root refused as "covered by"
+    // the component wrapping it.
+    //
+    // MOCK HONESTY: happy-dom ships no `ShadowRoot.elementFromPoint`, so the
+    // retargeting itself is stubbed here rather than exercised. What these
+    // two tests pin is the probe's WIRING (which scope it asks, and that it
+    // still names a light-DOM overlay); the retargeting behaviour they
+    // assume is the CSSOM-View algorithm, verified against the spec, not
+    // against this suite.
+    document.body.innerHTML = '<div id="host"></div>'
+    const host = document.getElementById('host') as Element
+    const root = host.attachShadow({ mode: 'open' })
+    root.innerHTML = '<button id="inner">Pay</button>'
+    const inner = root.querySelector('#inner') as Element
+    domWithTopmost(host)
+    ;(root as unknown as { elementFromPoint: () => Element | null }).elementFromPoint = () => inner
+
+    expect(hitTestFn.call(inner, 1, 1)).toEqual({ hit: true, via: 'self' })
+  })
+
+  it('still refuses when a light-DOM overlay covers a shadow target', () => {
+    // The other half: crossing the boundary must not blanket-accept. An
+    // element from the document tree is not retargeted when the root asks,
+    // so the real overlay still reads as a miss and is still named.
+    document.body.innerHTML = '<div id="host"></div><div id="cookie-wall"></div>'
+    const host = document.getElementById('host') as Element
+    const overlay = document.getElementById('cookie-wall') as Element
+    const root = host.attachShadow({ mode: 'open' })
+    root.innerHTML = '<button id="inner">Pay</button>'
+    const inner = root.querySelector('#inner') as Element
+    ;(root as unknown as { elementFromPoint: () => Element | null }).elementFromPoint = () => overlay
+
+    expect(hitTestFn.call(inner, 1, 1)).toEqual({ hit: false, blocker: 'div#cookie-wall' })
+  })
+
+  it('is not tricked by a property shadowing getRootNode', () => {
+    // The named-form-control trap (worlds.ts): `this.getRootNode` can be an
+    // ELEMENT, truthy, and calling it throws a TypeError that costs the
+    // whole hit test, whose result gates a refusal. happy-dom does not
+    // implement that named-property lookup, so the shadowing is modelled
+    // directly here; the `typeof === 'function'` guard is what makes it
+    // harmless in a real page.
+    document.body.innerHTML = '<button id="btn"></button>'
+    const btn = document.getElementById('btn') as Element
+    Object.defineProperty(btn, 'getRootNode', { configurable: true, value: btn })
+    domWithTopmost(btn)
+
+    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true, via: 'self' })
+  })
+
+  it('is not tricked by a property shadowing contains either', () => {
+    // The same trap two lines further down: `<form><input name="contains">`
+    // makes `this.contains` an element, and calling it threw out of a probe
+    // whose answer gates a refusal, taking the whole act with it (review
+    // round). A shadowed containment test answers "not contained", which is
+    // the safe direction: the point is named as a blocker instead.
+    document.body.innerHTML = '<div id="wrap"><button id="btn"></button></div>'
+    const btn = document.getElementById('btn') as Element
+    const wrap = document.getElementById('wrap') as Element
+    Object.defineProperty(btn, 'contains', { configurable: true, value: btn })
+    domWithTopmost(wrap)
+
+    expect(hitTestFn.call(btn, 1, 1)).toEqual({ hit: true, via: 'ancestor', blocker: 'div#wrap' })
+  })
+
+  it('falls back to the document when the root cannot answer the point', () => {
+    // A DETACHED node's root is a plain element, which has no
+    // elementFromPoint at all: the probe must still answer (a miss, here)
+    // rather than throw on the way to a refusal.
+    const detached = document.createElement('div')
+    detached.innerHTML = '<button id="gone"></button>'
+    const btn = detached.querySelector('#gone') as Element
+    expect(btn.getRootNode(), 'the premise: the root is not a document').toBe(detached)
+    domWithTopmost(null)
+
+    const out = hitTestFn.call(btn, 1, 1)
+    expect(out.hit).toBe(false)
+    expect(out.blocker).toMatch(/offscreen/)
+  })
 })
 
 describe('text-entry classification (executed in-page fn)', () => {
@@ -608,6 +692,163 @@ describe('actionability probe (executed in-page fn)', () => {
     expect('readonly' in out).toBe(false)
     expect('disabled' in out).toBe(false)
     expect(out.connected).toBe(true)
+  })
+})
+
+describe('selector facts probe (executed in-page fn)', () => {
+  const facts = pageFn<Record<string, unknown>>(SELECTOR_FACTS_FN)
+
+  beforeEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  it('carries the six actionability facts through, so a selector act gates like a ref act', () => {
+    document.body.innerHTML = '<button class="go" disabled>Pay</button>'
+    const node = document.querySelector('.go') as Element
+
+    const out = facts.call(node, '.go', 'css')
+
+    expect(out.disabled, 'the composed body must not drop the refusal facts').toBe(true)
+    expect(out.connected).toBe(true)
+    expect(out.visible).toBe(true)
+  })
+
+  it('counts what else the same rule matched, and says nothing about a shadow root', () => {
+    document.body.innerHTML = '<a class="row"></a><a class="row"></a><a class="row"></a>'
+    const first = document.querySelector('.row') as Element
+
+    const out = facts.call(first, '.row', 'css')
+
+    expect(out.matchCount).toBe(3)
+    expect('shadowMatch' in out, 'a light-DOM match has no provenance to report').toBe(false)
+  })
+
+  it('reports a shadow-root match and counts across EVERY root the walk searched', () => {
+    // Measured in review: counting inside the matched element's own root
+    // reported 1 for three matches spread over two roots, which retires the
+    // ambiguity warning exactly where it is needed. The count has to cover
+    // the same scopes the resolution searched, or it is worse than no count.
+    document.body.innerHTML = '<div id="a"></div><div id="b"></div>'
+    const rootA = (document.getElementById('a') as Element).attachShadow({ mode: 'open' })
+    rootA.innerHTML = '<button class="go"></button><button class="go"></button>'
+    const rootB = (document.getElementById('b') as Element).attachShadow({ mode: 'open' })
+    rootB.innerHTML = '<button class="go"></button>'
+    const inner = rootA.querySelector('.go') as Element
+
+    const out = facts.call(inner, '.go', 'css')
+
+    expect(out.shadowMatch).toBe(true)
+    expect(out.matchCount).toBe(3)
+  })
+
+  it('counts the DOCUMENT alone when the document matched, the way the resolution resolves', () => {
+    // Light DOM wins in the resolution, so the count must not walk past it
+    // and add shadow matches to a number describing a light-DOM target.
+    document.body.innerHTML = '<a class="row"></a><div id="host"></div>'
+    const root = (document.getElementById('host') as Element).attachShadow({ mode: 'open' })
+    root.innerHTML = '<a class="row"></a><a class="row"></a>'
+    const light = document.querySelector('.row') as Element
+
+    expect(facts.call(light, '.row', 'css').matchCount).toBe(1)
+  })
+
+  it('answers about an element whose named properties shadow DOM methods', () => {
+    // Probe-body discipline (worlds.ts): named DOM properties follow you
+    // across isolated worlds, so a `<form>` holding controls named after DOM
+    // methods answers ELEMENTS for them. Nothing in this body may call one
+    // blind. happy-dom does not implement that named-property lookup, so the
+    // shadowing is modelled directly.
+    document.body.innerHTML = '<button class="go"></button>'
+    const node = document.querySelector('.go') as Element
+    Object.defineProperty(node, 'getRootNode', { configurable: true, value: node })
+    Object.defineProperty(node, 'contains', { configurable: true, value: node })
+
+    const out = facts.call(node, '.go', 'css')
+
+    expect(out.connected, 'the actionability facts survive').toBe(true)
+    expect(out.matchCount, 'and so does the count').toBe(1)
+    expect('shadowMatch' in out, 'a light-DOM match has no provenance to report').toBe(false)
+  })
+
+  it('says when a bound cut the count short, instead of passing a floor off as a total', () => {
+    // 60 hosts, one match each, against a 50-root budget. The count that
+    // comes back is 50: rendered bare, that is a measured-sounding claim
+    // about a page with sixty matches (measured in review).
+    for (let i = 0; i < 60; i += 1) {
+      const host = document.createElement('div')
+      document.body.appendChild(host)
+      host.attachShadow({ mode: 'open' }).innerHTML = '<button class="go"></button>'
+    }
+
+    const out = facts.call(document.querySelector('div')!.shadowRoot!.querySelector('.go')!, '.go', 'css')
+
+    expect(out.matchCount).toBe(50)
+    expect(out.matchCountCapped, 'the number is a floor and says so').toBe(true)
+    expect(out.shadowMatch).toBe(true)
+  })
+
+  it('leaves the capped flag off a search that finished', () => {
+    document.body.innerHTML = '<div id="host"></div>'
+    const root = (document.getElementById('host') as Element).attachShadow({ mode: 'open' })
+    root.innerHTML = '<button class="go"></button>'
+
+    const out = facts.call(root.querySelector('.go') as Element, '.go', 'css')
+
+    expect(out.matchCount).toBe(1)
+    expect('matchCountCapped' in out, 'no furniture on the ordinary case').toBe(false)
+  })
+
+  it('takes the shadow verdict from the DOCUMENT query, not from the element', () => {
+    // Authoritative provenance: the document query is what the resolution
+    // branched on, and unlike `getRootNode()` a page cannot shadow it with a
+    // named form control. Asked of the element, this fact went ABSENT on
+    // such a page and the backend then rendered the absence as a definite
+    // light-DOM match (review round).
+    document.body.innerHTML = '<div id="host"></div>'
+    const root = (document.getElementById('host') as Element).attachShadow({ mode: 'open' })
+    root.innerHTML = '<button class="go"></button>'
+    const inner = root.querySelector('.go') as Element
+    Object.defineProperty(inner, 'getRootNode', { configurable: true, value: inner })
+
+    expect(facts.call(inner, '.go', 'css').shadowMatch).toBe(true)
+  })
+
+  it('counts an xpath through a document snapshot, the only tree it can address', () => {
+    // happy-dom ships no XPath engine, so the call itself is stubbed; what
+    // this pins is the wiring the probe cannot get wrong silently (the
+    // ORDERED_NODE_SNAPSHOT result type, and reading snapshotLength).
+    document.body.innerHTML = '<p id="p"></p>'
+    const node = document.getElementById('p') as Element
+    const seen: unknown[] = []
+    const g = globalThis as unknown as Record<string, unknown>
+    g.XPathResult = { ORDERED_NODE_SNAPSHOT_TYPE: 7 }
+    ;(document as unknown as { evaluate: unknown }).evaluate = (...args: unknown[]) => {
+      seen.push(args)
+      return { snapshotLength: 4 }
+    }
+    try {
+      const out = facts.call(node, '//p', 'xpath')
+
+      expect(out.matchCount).toBe(4)
+      expect((seen[0] as unknown[])[0]).toBe('//p')
+      expect((seen[0] as unknown[])[3], 'a snapshot type, not the first-node one').toBe(7)
+    } finally {
+      delete g.XPathResult
+      delete (document as unknown as { evaluate?: unknown }).evaluate
+    }
+  })
+
+  it('keeps the actionability facts when the count cannot be computed', () => {
+    // An unanswerable extra must not cost the facts that refuse a dead act:
+    // the selector half is wrapped separately for exactly this.
+    document.body.innerHTML = '<input readonly>'
+    const node = document.querySelector('input') as Element
+
+    const out = facts.call(node, 'input:::not-a-selector', 'css')
+
+    expect(out.readonly).toBe(true)
+    expect(out.textEntry).toBe(true)
+    expect('matchCount' in out, 'an invalid rule counts nothing rather than lying').toBe(false)
   })
 })
 

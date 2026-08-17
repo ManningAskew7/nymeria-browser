@@ -177,6 +177,30 @@ describe('monotonic minting at the exec level (#160)', () => {
     expect((result.data as { tree: string }).tree).toMatch(/\[ref=@e3\]/)
   })
 
+  it('names a malformed scope selector instead of resolving the Error it threw', async () => {
+    // A thrown expression still returns a `result`: the Error OBJECT, with a
+    // perfectly usable objectId. It reached `DOM.describeNode`, produced no
+    // backendNodeId, and surfaced three lines later as "could not resolve
+    // the scope element", which reads as a page problem rather than as the
+    // syntax error it is.
+    chrome.debugger.sendCommand = (async (_t: unknown, method: string) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-root' } } }
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: 5 }
+      if (method === 'Runtime.evaluate') {
+        return {
+          result: { objectId: 'error-obj', subtype: 'error', className: 'SyntaxError' },
+          exceptionDetails: { text: 'Uncaught', exceptionId: 1 },
+        }
+      }
+      return { nodes: interactiveNodes }
+    }) as unknown as typeof chrome.debugger.sendCommand
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: 'div:::broken' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toBe('not a valid CSS selector: div:::broken')
+  })
+
   it('a scoped read merges its refs instead of discarding the full-page map', async () => {
     installTreeMock()
     await execSnapshot({ tab_id: 1, detail: 'interactive' })
@@ -359,7 +383,12 @@ describe('same-process frame reads (reads-honesty pass)', () => {
     expect(tree).toMatch(/\n- iframe "https:\/\/example\.com\/outer"/)
     expect(tree).toMatch(/\n {2}- iframe "https:\/\/example\.com\/inner"/)
     expect(tree).toMatch(/\n {6}- textbox "Name"/)
-    expect((result.data as { frames_same_process: number }).frames_same_process).toBe(2)
+    const data = result.data as { frames_same_process: number; frames_nested?: number }
+    expect(data.frames_same_process).toBe(2)
+    // The note counts nesting the same way the tree renders it: one of the
+    // two sections lives inside the other, and a flat count beside an
+    // indented tree is the disagreement this closes.
+    expect(data.frames_nested).toBe(1)
   })
 
   it('caps the frames read and says how many were skipped, never silence', async () => {
@@ -387,7 +416,9 @@ describe('same-process frame reads (reads-honesty pass)', () => {
     const tree = data.tree as string
     expect(tree).toMatch(/iframe "https:\/\/example\.com\/f7"/)
     expect(tree).not.toMatch(/iframe "https:\/\/example\.com\/f8"/)
-    expect(tree).toMatch(/2 more frame\(s\) in this document not read/)
+    // Not "in this document": the sweep is a flattened walk of every
+    // same-process descendant, so the skipped frames need not be siblings.
+    expect(tree).toMatch(/2 more frame\(s\) not read: frame cap reached/)
     // The count is frames RENDERED, never frames discovered: 8 read + 2
     // skipped, and the two must not double-count (review round: "10
     // included, 2 more not read" claimed twelve frames on a ten-frame page).
@@ -495,5 +526,88 @@ describe('scoped reads make no frame claims (review round)', () => {
     expect(data.frames_oopif).toBeUndefined()
     expect(data.frames_same_process).toBeUndefined()
     expect(data.tree as string).not.toMatch(/iframe "https/)
+  })
+})
+
+describe('frame section planning (OOPIF nesting depth)', () => {
+  const { planFrameSections } = __test
+  const ids = (frames?: { targetId: string }[]) => (frames ?? []).map((o) => o.targetId)
+  const tree = (
+    rootFrameId: string | undefined,
+    frames: { frameId: string; path: string[] }[] = [],
+    parentId?: string,
+  ) => ({
+    root: { frameId: rootFrameId, ...(parentId ? { parentId } : {}) },
+    frames: frames.map((f) => ({ ...f, url: '' })),
+  })
+
+  it('places an OOPIF one level below the frame that embeds it', () => {
+    const plan = planFrameSections(tree('ROOT', [{ frameId: 'WRAP', path: ['WRAP'] }]), [
+      { targetId: 'PAY', tree: tree('PAY', [], 'WRAP') },
+    ])
+
+    expect(plan.depth.get('WRAP')).toBe(0)
+    expect(plan.depth.get('PAY')).toBe(1)
+    // Filed under the FRAME that embeds it, which is what lets the renderer
+    // emit the section immediately after that frame's own.
+    expect(ids(plan.childrenOf.get('WRAP'))).toEqual(['PAY'])
+    expect(plan.unanchored).toEqual([])
+  })
+
+  it('resolves an OOPIF whose parent is another OOPIF, whatever order they arrive in', () => {
+    // The fixpoint: the inner frame's depth is unknowable until the outer
+    // one has been placed, and attach order is not document order.
+    const plan = planFrameSections(tree('ROOT'), [
+      {
+        targetId: 'INNER',
+        tree: tree('INNER', [{ frameId: 'INNER-CHILD', path: ['INNER-CHILD'] }], 'OUTER-CHILD'),
+      },
+      { targetId: 'OUTER', tree: tree('OUTER', [{ frameId: 'OUTER-CHILD', path: ['OUTER-CHILD'] }]) },
+    ])
+
+    expect(plan.depth.get('OUTER')).toBe(0)
+    expect(plan.depth.get('OUTER-CHILD'), 'a local frame inside an OOPIF').toBe(1)
+    expect(plan.depth.get('INNER')).toBe(2)
+    // A local frame inside a NESTED OOPIF is the case a per-session depth
+    // cannot reach: its section belongs three levels in, not one.
+    expect(plan.depth.get('INNER-CHILD')).toBe(3)
+    // Filed under the OOPIF-local frame that embeds it, not at the margin:
+    // the parent's section must render before the child's, or the indent
+    // reads as containment by whatever section happened to precede it.
+    expect(ids(plan.childrenOf.get('OUTER-CHILD'))).toEqual(['INNER'])
+    expect(ids(plan.unanchored)).toEqual(['OUTER'])
+  })
+
+  it('keeps sibling subtrees together so an indent cannot claim the wrong parent', () => {
+    const plan = planFrameSections(tree('ROOT'), [
+      { targetId: 'A', tree: tree('A', [], 'ROOT') },
+      { targetId: 'B', tree: tree('B', [], 'ROOT') },
+      { targetId: 'A-CHILD', tree: tree('A-CHILD', [], 'A') },
+    ])
+
+    expect(ids(plan.childrenOf.get('ROOT'))).toEqual(['A', 'B'])
+    expect(ids(plan.childrenOf.get('A'))).toEqual(['A-CHILD'])
+    expect(plan.depth.get('A-CHILD')).toBe(1)
+  })
+
+  it('renders an unresolvable parent flat rather than guessing a depth', () => {
+    const plan = planFrameSections(tree('ROOT'), [
+      { targetId: 'ORPHAN', tree: tree('ORPHAN', [], 'A-FRAME-NOBODY-SAW') },
+    ])
+
+    expect(plan.depth.get('ORPHAN')).toBe(0)
+    expect(ids(plan.unanchored)).toEqual(['ORPHAN'])
+    expect(plan.childrenOf.size).toBe(0)
+  })
+
+  it('survives a parent cycle instead of recursing forever', () => {
+    const plan = planFrameSections(tree('ROOT'), [
+      { targetId: 'X', tree: tree('X', [], 'Y') },
+      { targetId: 'Y', tree: tree('Y', [], 'X') },
+    ])
+
+    expect(ids(plan.unanchored).sort()).toEqual(['X', 'Y'])
+    expect(plan.depth.get('X')).toBe(0)
+    expect(plan.depth.get('Y')).toBe(0)
   })
 })

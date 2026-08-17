@@ -149,6 +149,22 @@ interface MockOptions {
   pageHasFrames?: boolean
   /** false models a target inside an iframe the probe never watched. */
   targetInTopDocument?: boolean
+  /**
+   * What the css resolution answers instead of a node handle: the walk
+   * reports a MISS (and what it searched) as a plain string, which comes
+   * back by value on the same round trip.
+   */
+  selectorResult?: string
+  /** Selector-only probe facts. Answered ONLY to the composed selector body,
+   *  the way the real probe does, so a ref act cannot accidentally carry
+   *  them. */
+  matchCount?: number
+  /** A search bound cut the count short, so it is a floor. */
+  matchCountCapped?: boolean
+  shadowMatch?: boolean
+  /** The selector expression THREW (a malformed xpath, a broken query). CDP
+   *  still returns a `result`: the Error object, with an objectId. */
+  selectorThrows?: boolean
 }
 
 /**
@@ -195,6 +211,11 @@ function installCdpMock(opts: MockOptions = {}) {
     textEntry = false,
     focusLanded = true,
     focusReadThrows,
+    selectorResult,
+    matchCount,
+    matchCountCapped,
+    shadowMatch,
+    selectorThrows,
   } = opts
   // Two worlds, two context ids: the delivery probe's (its counter state) and
   // the trust probes' (geometry, hit tests, selectors). Distinct so a test can
@@ -251,6 +272,16 @@ function installCdpMock(opts: MockOptions = {}) {
         }
         if (actionabilityThrows) throw new Error(actionabilityThrows)
         if (actionabilityRaw !== undefined) return { result: { value: actionabilityRaw } }
+        // The SELECTOR variant composes the same body and adds two fields.
+        // Answered only to that body (`shadowMatch` is unique to it), so a
+        // ref probe can never carry a selector-only fact.
+        const selectorOnly = fn.includes('shadowMatch')
+          ? {
+              ...(matchCount === undefined ? {} : { matchCount }),
+              ...(matchCountCapped ? { matchCountCapped: true } : {}),
+              ...(shadowMatch ? { shadowMatch: true } : {}),
+            }
+          : {}
         return {
           result: {
             value: {
@@ -260,6 +291,7 @@ function installCdpMock(opts: MockOptions = {}) {
               ...(disabled ? { disabled: true } : {}),
               ...(readonly ? { readonly: true } : {}),
               ...(pointerEventsNone ? { pointerEventsNone: true } : {}),
+              ...selectorOnly,
             },
           },
         }
@@ -375,6 +407,19 @@ function installCdpMock(opts: MockOptions = {}) {
         return { result: { value: bodyText.includes(JSON.parse(m[1]) as string) } }
       }
       if (expression.includes('querySelector') || expression.includes('document.evaluate')) {
+        // A string result is the css walk's miss report, which rides home by
+        // value on this same evaluate (primitives need no objectId).
+        if (selectorResult !== undefined) {
+          return { result: { type: 'string', value: selectorResult } }
+        }
+        // What Chrome really answers for a throw: the exception details
+        // ALONGSIDE a usable handle on the Error object itself.
+        if (selectorThrows) {
+          return {
+            result: { objectId: 'error-obj', subtype: 'error', className: 'SyntaxError' },
+            exceptionDetails: { text: 'Uncaught', exceptionId: 1 },
+          }
+        }
         return { result: { objectId: 'css-obj' } }
       }
       return { result: { value: undefined } }
@@ -998,6 +1043,232 @@ describe('verification payload', () => {
     } finally {
       vi.useRealTimers()
     }
+  })
+
+  it('marks a condition that was ALREADY true when the wait opened', async () => {
+    // ~0ms is two opposite answers in one number: the condition held before
+    // the wait, or it appeared inside the first poll interval. For an agent
+    // asking "did what I just did produce this?", only one of those is
+    // evidence.
+    installCdpMock({ bodyText: 'Order confirmed' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'wait',
+      wait_for: { text: 'Order confirmed' },
+      timeout_ms: 500,
+    })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { found?: boolean; condition_met_before_wait?: boolean }
+    expect(data.found).toBe(true)
+    expect(data.condition_met_before_wait).toBe(true)
+  })
+
+  it('leaves the flag off a condition that arrived DURING the wait', async () => {
+    vi.useFakeTimers()
+    try {
+      installCdpMock()
+      let body = 'still loading'
+      const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+      const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+      send.mockImplementation(async (...args: unknown[]) => {
+        const e = (args[2] as { expression?: string } | undefined)?.expression
+        if (e?.includes('innerText.includes')) {
+          const m = e.match(/var NEEDLE = (".*");/)
+          if (!m) throw new Error('wait text needle not found in expression')
+          return { result: { value: body.includes(JSON.parse(m[1]) as string) } }
+        }
+        return original(...args)
+      })
+      setTimeout(() => {
+        body = 'Order confirmed'
+      }, 400)
+
+      const pending = execAct({
+        tab_id: TAB,
+        action: 'wait',
+        wait_for: { text: 'Order confirmed' },
+        timeout_ms: 10_000,
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+      const result = await pending
+
+      const data = result.data as { found?: boolean; condition_met_before_wait?: boolean }
+      expect(data.found).toBe(true)
+      expect(data.condition_met_before_wait).toBeUndefined()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('measures waited_ms over the WAIT, not over the whole command', async () => {
+    // The dialog check, the liveness probe and the url read all precede the
+    // wait; counting them made the number about the command instead of
+    // about the thing it names.
+    vi.useFakeTimers()
+    try {
+      installCdpMock({ bodyText: 'Order confirmed' })
+      const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+      const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+      send.mockImplementation(async (...args: unknown[]) => {
+        // Every pre-wait renderer round trip costs a second here.
+        if (args[1] === 'Runtime.evaluate') vi.setSystemTime(Date.now() + 1_000)
+        return original(...args)
+      })
+
+      const pending = execAct({
+        tab_id: TAB,
+        action: 'wait',
+        wait_for: { text: 'Order confirmed' },
+        timeout_ms: 5_000,
+      })
+      await vi.advanceTimersByTimeAsync(1_000)
+      const result = await pending
+
+      const data = result.data as { found?: boolean; waited_ms?: number }
+      expect(data.found).toBe(true)
+      // The scan itself costs one of those seconds; the pre-flight probes
+      // before it must not be in the total.
+      expect(data.waited_ms).toBeLessThanOrEqual(1_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('measures a FUSED wait the same way, over the wait and not the act', async () => {
+    // The twin of the bare-wait pin: a fused wait opens after dispatch and
+    // settle, so counting from the command's start would report the click's
+    // cost as time spent waiting for the condition.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+      installCdpMock({ bodyText: 'Order confirmed' })
+      const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+      const original = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+      send.mockImplementation(async (...args: unknown[]) => {
+        if (args[1] === 'Runtime.evaluate') vi.setSystemTime(Date.now() + 1_000)
+        return original(...args)
+      })
+
+      const pending = execAct({
+        tab_id: TAB,
+        action: 'click',
+        ref: '@e1',
+        wait_for: { text: 'Order confirmed' },
+        timeout_ms: 5_000,
+      })
+      await vi.advanceTimersByTimeAsync(2_000)
+      const result = await pending
+
+      const data = result.data as { found?: boolean; waited_ms?: number }
+      expect(data.found).toBe(true)
+      // One scan inside the wait; every pre-wait evaluate of the click is
+      // outside it, and there are several.
+      expect(data.waited_ms).toBeLessThanOrEqual(1_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('refuses a wait on a malformed selector at once instead of burning the window', async () => {
+    // A condition that can never come true was polled to the deadline and
+    // then reported as "wait timed out on ref:css=...", which reads as the
+    // page never producing the element. With a 60s ask that is a minute
+    // spent proving a typo (review round).
+    vi.useFakeTimers()
+    try {
+      const cdp = installCdpMock({ selectorResult: 'nym-invalid' })
+
+      const pending = execAct({
+        tab_id: TAB,
+        action: 'wait',
+        wait_for: { ref: 'css=div:::broken' },
+        timeout_ms: 30_000,
+      })
+      await vi.advanceTimersByTimeAsync(30_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(result.error).toMatch(/cannot be watched/)
+      expect(result.error, 'and names the actual problem').toMatch(/not a valid CSS selector/)
+      const polls = cdp.mock.calls.filter(
+        (c) =>
+          c[1] === 'Runtime.evaluate' &&
+          String((c[2] as { expression?: string }).expression ?? '').includes('div:::broken'),
+      )
+      expect(polls.length, 'asked once, not for thirty seconds').toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('pays the shadow walk on a fraction of the polls, not on every one', async () => {
+    // A `css=` condition is absent for the whole wait by definition, which
+    // is exactly the shape that would run a whole-DOM traversal ten times a
+    // second for the entire window. The first poll still walks, so a
+    // condition already true inside a shadow root is found at once.
+    vi.useFakeTimers()
+    try {
+      const cdp = installCdpMock({ selectorResult: `${__test.SELECTOR_MISS}0,0,0` })
+
+      const pending = execAct({
+        tab_id: TAB,
+        action: 'wait',
+        wait_for: { ref: 'css=.late' },
+        timeout_ms: 1_000,
+      })
+      await vi.advanceTimersByTimeAsync(1_500)
+      await pending
+
+      const resolves = cdp.mock.calls
+        .filter((c) => c[1] === 'Runtime.evaluate')
+        .map((c) => String((c[2] as { expression?: string }).expression))
+        .filter((e) => e.includes('.late'))
+      const walks = resolves.filter((e) => e.includes('shadowRoot'))
+      expect(resolves.length, 'the wait polled repeatedly').toBeGreaterThanOrEqual(8)
+      expect(walks.length, 'the first poll walks, so an already-there element is found').toBe(
+        Math.ceil(resolves.length / 5),
+      )
+      expect(walks[0], 'and it is the FIRST poll that pays it').toBe(resolves[0])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('leaves the flag OFF on a fused wait, where already-true is the ordinary shape of success', async () => {
+    // A fused wait opens after the action has been dispatched and settled,
+    // so a condition the action produced is true at the first check almost
+    // every time: the flag would ride nearly every successful act while
+    // saying nothing the caller can act on. `waited_ms` still reports the
+    // real cost of the wait.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ bodyText: 'Order confirmed' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'click',
+      ref: '@e1',
+      wait_for: { text: 'Order confirmed' },
+      timeout_ms: 500,
+    })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect(data.found).toBe(true)
+    expect('condition_met_before_wait' in data).toBe(false)
+    expect(typeof data.waited_ms, 'the cost is still reported').toBe('number')
+  })
+
+  it('never grows the flag on a bare settle, which has no condition to be true', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'wait', timeout_ms: 200 })
+
+    const data = result.data as Record<string, unknown>
+    expect(data.condition).toBe('settle')
+    expect('condition_met_before_wait' in data).toBe(false)
   })
 
   it('an unmet condition on a delivered click succeeds with found: false, not an error', async () => {
@@ -2761,18 +3032,19 @@ describe('actionability gates', () => {
     ).toBe(false)
   })
 
-  it('leaves css= targets alone: they are not probed, so they behave as before', async () => {
-    // The probe rides the connectedness call, which only `@` refs make. A
-    // css= target would need a NEW round trip, so it keeps its previous
-    // behaviour rather than paying for one, and nothing may quietly start
-    // refusing it on a fact nobody asked for.
-    const cdp = installCdpMock({ disabled: true, readonly: true, textEntry: true })
+  it('gates a css= target exactly like a ref: same probe, same refusal', async () => {
+    // Was the deliberate lock on the OLD behaviour (selector targets were
+    // not probed at all, so the same disabled control that refused by name
+    // through @e12 dispatched through css= and came back as an
+    // undelivered-input failure blaming a healthy page).
+    const cdp = installCdpMock({ disabled: true })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=.btn' })
 
-    expect(result.ok).toBe(true)
-    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
-    expect(probeCalls(cdp), 'no widened probe is spent on a css= target').toHaveLength(0)
+    expect(result.ok).toBe(false)
+    expect((result.data as { refused?: string }).refused).toBe('disabled')
+    expect(inputEventTypes(cdp), 'nothing may be dispatched at a disabled control').toEqual([])
+    expect(probeCalls(cdp), 'one probe, the same one a ref pays for').toHaveLength(1)
   })
 
   it('asks all of it in ONE round trip, which is why the checks are affordable', async () => {
@@ -2795,6 +3067,391 @@ describe('actionability gates', () => {
     // the only other isConnected body is the POST-action `stillConnected`.
     const connectednessCalls = bodies(cdp).filter((fn) => fn.includes('isConnected'))
     expect(connectednessCalls).toHaveLength(2)
+  })
+})
+
+/**
+ * The shadow walk EXECUTED, for the same reason the file-chooser predicate
+ * and the coordinate description are: the mock fabricates exactly the value
+ * this logic computes, so a mocked-only test would pass with the walk
+ * deleted.
+ */
+describe('the css shadow walk (executed in-page)', () => {
+  const walk = (query: string): unknown =>
+    new Function(`return ${__test.cssResolveExpression(query)}`)()
+
+  beforeEach(() => {
+    document.body.innerHTML = ''
+  })
+
+  /** A host with an open root holding `html`, returned for assertions. */
+  const openHost = (id: string, html: string): ShadowRoot => {
+    const host = document.createElement('div')
+    host.id = id
+    document.body.appendChild(host)
+    const root = host.attachShadow({ mode: 'open' })
+    root.innerHTML = html
+    return root
+  }
+
+  it('finds an element inside an open shadow root the document cannot see', () => {
+    const root = openHost('host', '<button id="pay" class="go">Pay</button>')
+
+    expect(document.querySelector('.go'), 'the premise: the document itself misses').toBe(null)
+    expect(walk('.go')).toBe(root.querySelector('#pay'))
+  })
+
+  it('gives the LIGHT DOM the match when both have one', () => {
+    // Backwards compatibility in the only direction that matters: a
+    // selector that resolved before must resolve to the same element now.
+    document.body.innerHTML = '<button id="light" class="dup">Pay</button>'
+    openHost('host', '<button id="shadowed" class="dup">Pay</button>')
+
+    expect(walk('.dup')).toBe(document.getElementById('light'))
+  })
+
+  it('descends a shadow root nested inside a shadow root', () => {
+    const outer = openHost('host', '<div id="inner-host"></div>')
+    const innerHost = outer.querySelector('#inner-host') as Element
+    const inner = innerHost.attachShadow({ mode: 'open' })
+    inner.innerHTML = '<button id="deep" class="go"></button>'
+
+    expect(walk('.go')).toBe(inner.querySelector('#deep'))
+  })
+
+  it('cannot see into a CLOSED root, and says the page has components', () => {
+    // The honest half: no JS world can reach a closed root, so the miss has
+    // to route the agent to the ref path rather than claim absence.
+    const host = document.createElement('qa-closed')
+    document.body.appendChild(host)
+    host.attachShadow({ mode: 'closed' }).innerHTML = '<button class="go"></button>'
+
+    expect(walk('.go')).toBe(`${__test.SELECTOR_MISS}0,1,0`)
+  })
+
+  it('reports a plain miss on a page with no shadow content at all', () => {
+    document.body.innerHTML = '<button id="other"></button>'
+
+    expect(walk('.go')).toBe(`${__test.SELECTOR_MISS}0,0,0`)
+  })
+
+  it('marks an invalid selector as invalid rather than as a miss', () => {
+    expect(walk('.go:::broken')).toBe('nym-invalid')
+  })
+
+  it('stops at its root budget and SAYS the search was not exhaustive', () => {
+    // A bound that is hit silently is a false "not there"; the flag is what
+    // turns it into "not found in what I could search".
+    for (let i = 0; i < 60; i += 1) openHost(`h${i}`, '<span></span>')
+
+    const out = walk('.go') as string
+    expect(out.startsWith(__test.SELECTOR_MISS)).toBe(true)
+    expect(out.endsWith(',1'), `capped flag missing in ${out}`).toBe(true)
+  })
+
+  it('stops at its depth bound and says so, like the other two bounds', () => {
+    // The bound that is easiest to hit silently: the roots at the last
+    // allowed level ARE queried, but their children are never collected, so
+    // reporting an exhaustive search there would be the same false "not
+    // there" the whole walk exists to remove.
+    let root = openHost('deep', '<div id="l0"></div>')
+    for (let i = 0; i < 7; i += 1) {
+      const host = root.querySelector(`#l${i}`) as Element
+      const next = host.attachShadow({ mode: 'open' })
+      next.innerHTML = `<div id="l${i + 1}"></div>`
+      root = next
+    }
+
+    const out = walk('.go') as string
+    expect(out.startsWith(__test.SELECTOR_MISS)).toBe(true)
+    expect(out.endsWith(',1'), `capped flag missing in ${out}`).toBe(true)
+  })
+
+  it('counts its root budget over the WHOLE walk, not per level', () => {
+    // A per-level cap made the real bound depth x cap (250 roots), which no
+    // docstring said and no payload could have been read against. 30 roots
+    // at the first level, one nested inside each: under a per-level cap of
+    // 50 nothing is ever capped, under the whole-walk one the sixtieth root
+    // is refused and the miss says the search was not exhaustive.
+    for (let i = 0; i < 30; i += 1) {
+      const root = openHost(`h${i}`, `<div id="n${i}"></div>`)
+      const nestedHost = root.querySelector(`#n${i}`) as Element
+      nestedHost.attachShadow({ mode: 'open' }).innerHTML = '<span></span>'
+    }
+
+    const out = walk('.go') as string
+    expect(out.startsWith(__test.SELECTOR_MISS)).toBe(true)
+    expect(out.endsWith(',1'), `capped flag missing in ${out}`).toBe(true)
+    // 50 searched, not the 60 that exist: the count is what the flag
+    // qualifies, so it has to be the measured one.
+    expect(out).toBe(`${__test.SELECTOR_MISS}50,0,1`)
+  })
+
+  it('does NOT claim a cut search on a page that simply ends at the bound', () => {
+    // The other side of the depth bound. "Roots still in hand" was read as a
+    // level left uncollected, so a page nested exactly to the limit and no
+    // deeper was told its exhaustive search was "not exhaustive" (review
+    // round). The walk now measures one level past the last it searches.
+    let root = openHost('deep', '<div id="l0"></div>')
+    for (let i = 0; i < 4; i += 1) {
+      const host = root.querySelector(`#l${i}`) as Element
+      const next = host.attachShadow({ mode: 'open' })
+      next.innerHTML = `<div id="l${i + 1}"></div>`
+      root = next
+    }
+
+    // Five levels of open root, nothing below the last one.
+    expect(walk('.go')).toBe(`${__test.SELECTOR_MISS}5,0,0`)
+  })
+
+  it('stops at its node budget too, on a page with no roots to descend', () => {
+    document.body.innerHTML = Array.from({ length: 2_100 }, () => '<div></div>').join('')
+
+    expect(walk('.go')).toBe(`${__test.SELECTOR_MISS}0,0,1`)
+  })
+})
+
+describe('selector targets are first class', () => {
+  const probeCalls = (mock: ReturnType<typeof installCdpMock>) =>
+    mock.mock.calls.filter(
+      (c) =>
+        c[1] === 'Runtime.callFunctionOn' &&
+        String((c[2] as { functionDeclaration?: string }).functionDeclaration).includes(
+          'checkVisibility',
+        ),
+    )
+
+  it('routes a css= miss to the ref path instead of claiming the element is absent', async () => {
+    installCdpMock({ selectorResult: `${__test.SELECTOR_MISS}3,0,0` })
+
+    const resolution = await __test.resolveTarget(TAB, 'css=.pay', TAB_URL)
+
+    expect(resolution.ok).toBe(false)
+    if (resolution.ok) return
+    expect(resolution.error).toMatch(/searched the document and 3 open shadow root\(s\)/)
+    expect(resolution.error, 'the exit that actually works').toMatch(/@ref/)
+    expect(resolution.error).toMatch(/CLOSED root/)
+  })
+
+  it('names web components when the only candidates were closed roots', async () => {
+    installCdpMock({ selectorResult: `${__test.SELECTOR_MISS}0,2,0` })
+
+    const resolution = await __test.resolveTarget(TAB, 'css=.pay', TAB_URL)
+
+    expect(resolution.ok).toBe(false)
+    // Soft on purpose: dashed tag names are all the walk can measure, and
+    // `el.shadowRoot === null` reads the same for a closed root and for no
+    // root at all, so a framework page with no shadow DOM anywhere must not
+    // be told its typo was an encapsulation problem.
+    if (!resolution.ok) {
+      expect(resolution.error).toMatch(/custom elements, which MAY hold closed shadow roots/)
+      expect(resolution.error, 'no certainty it does not have').not.toMatch(/uses closed/)
+    }
+  })
+
+  it('says nothing about shadow roots on a page that has none', async () => {
+    // The no-furniture rule: a plain typo must not grow a paragraph about a
+    // mechanism this page does not use.
+    installCdpMock({ selectorResult: `${__test.SELECTOR_MISS}0,0,0` })
+
+    const resolution = await __test.resolveTarget(TAB, 'css=.pay', TAB_URL)
+
+    expect(resolution.ok).toBe(false)
+    if (!resolution.ok) {
+      expect(resolution.error).toBe('css selector matched no element: .pay')
+    }
+  })
+
+  it('admits when a bound cut the search short', async () => {
+    installCdpMock({ selectorResult: `${__test.SELECTOR_MISS}50,0,1` })
+
+    const resolution = await __test.resolveTarget(TAB, 'css=.pay', TAB_URL)
+
+    expect(resolution.ok).toBe(false)
+    if (!resolution.ok) expect(resolution.error).toMatch(/not exhaustive/)
+  })
+
+  it('calls an invalid selector invalid, where "matched no element" read as absent', async () => {
+    installCdpMock({ selectorResult: 'nym-invalid' })
+
+    const resolution = await __test.resolveTarget(TAB, 'css=div:::x', TAB_URL)
+
+    expect(resolution.ok).toBe(false)
+    if (!resolution.ok) expect(resolution.error).toMatch(/not a valid CSS selector/)
+  })
+
+  it('carries the shadow provenance into the payload when the match came from a root', async () => {
+    const cdp = installCdpMock({ shadowMatch: true, matchCount: 1 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=#pay' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { matched_in?: string }).matched_in).toBe('shadow-root')
+    // And the probe was told WHICH rule to re-run: the count is about the
+    // selector, not about the element.
+    const args = (probeCalls(cdp)[0][2] as { arguments?: { value?: unknown }[] }).arguments
+    expect(args?.map((v) => v.value)).toEqual(['#pay', 'css'])
+  })
+
+  it('says how many elements an ambiguous selector matched, and acts once', async () => {
+    // MOCK LIMIT: the resolution returns one objectId whatever the count is,
+    // so "the FIRST match" is the in-page walk's contract (exercised against
+    // real DOM in the shadow-walk describe: the document query's [0], then
+    // roots breadth-first), not something this test can prove. What it does
+    // prove is that a count of many still produces exactly ONE gesture.
+    const cdp = installCdpMock({ matchCount: 14 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=.btn' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { selector_matches?: number }).selector_matches).toBe(14)
+    expect(inputEventTypes(cdp), 'one click, not fourteen').toEqual([
+      'mouseMoved',
+      'mousePressed',
+      'mouseReleased',
+    ])
+  })
+
+  it('carries the selector facts out through a REFUSAL, where they matter most', async () => {
+    // The advice is at its most useful exactly here: `.btn` matched 14, the
+    // first one is disabled, and without the count the agent reads "that
+    // element is disabled" as a fact about the button it meant.
+    installCdpMock({ matchCount: 14, shadowMatch: true, disabled: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=.btn' })
+
+    expect(result.ok).toBe(false)
+    const data = result.data as Record<string, unknown>
+    expect(data.refused).toBe('disabled')
+    expect(data.selector_matches).toBe(14)
+    expect(data.matched_in).toBe('shadow-root')
+  })
+
+  it('carries them through a readonly refusal too, which returns from another branch', async () => {
+    installCdpMock({ readonly: true, textEntry: true, matchCount: 3 })
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: 'css=.field', value: 'x' })
+
+    expect(result.ok).toBe(false)
+    const data = result.data as Record<string, unknown>
+    expect(data.refused).toBe('readonly')
+    expect(data.selector_matches).toBe(3)
+  })
+
+  it('reports a count of ONE when a bound cut the search, where silence would read as unambiguous', async () => {
+    // The floor case: the walk stopped early, so "1" is what it could see,
+    // not what the page holds. The ordinary count-of-one rule (say nothing)
+    // would turn that into a claim of uniqueness.
+    installCdpMock({ matchCount: 1, matchCountCapped: true, shadowMatch: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=.row' })
+
+    const data = result.data as Record<string, unknown>
+    expect(data.selector_matches).toBe(1)
+    expect(data.selector_matches_capped).toBe(true)
+  })
+
+  it('carries the capped flag beside an ambiguous count too', async () => {
+    installCdpMock({ matchCount: 50, matchCountCapped: true, shadowMatch: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=.row' })
+
+    const data = result.data as Record<string, unknown>
+    expect(data.selector_matches).toBe(50)
+    expect(data.selector_matches_capped).toBe(true)
+  })
+
+  it('carries the selector facts through the select refusal, which builds its own payload', async () => {
+    // One of the three post-dispatch exits that had no `data` at all or
+    // dropped the fields: a `css=` naming several selects, refused because
+    // the option is missing, needs the count as much as any other refusal.
+    installCdpMock({ matchCount: 4, selectMatches: false })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'select',
+      ref: 'css=select.qty',
+      value: 'Nope',
+    })
+
+    expect(result.ok).toBe(false)
+    const data = result.data as Record<string, unknown>
+    expect(data.selector_matches).toBe(4)
+    expect(data.input).toBe('none')
+  })
+
+  it('keeps both selector fields off an unambiguous light-DOM match', async () => {
+    installCdpMock({ matchCount: 1 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=#pay' })
+
+    const data = result.data as Record<string, unknown>
+    expect('selector_matches' in data, 'a count of one is not news').toBe(false)
+    expect('matched_in' in data).toBe(false)
+  })
+
+  it('keeps the selector-only fields off a @ref act, which has a fingerprint instead', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ matchCount: 9, shadowMatch: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as Record<string, unknown>
+    expect('selector_matches' in data).toBe(false)
+    expect('matched_in' in data).toBe(false)
+    const body = String((probeCalls(cdp)[0][2] as { functionDeclaration: string }).functionDeclaration)
+    expect(body.includes('shadowMatch'), 'a ref never runs the selector body').toBe(false)
+  })
+
+  it('probes an xpath target too, telling it which counting call to make', async () => {
+    const cdp = installCdpMock({ matchCount: 2 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'xpath=//button' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { selector_matches?: number }).selector_matches).toBe(2)
+    const args = (probeCalls(cdp)[0][2] as { arguments?: { value?: unknown }[] }).arguments
+    expect(args?.map((v) => v.value)).toEqual(['//button', 'xpath'])
+  })
+
+  it('refuses a readonly css= field before any text is sent', async () => {
+    // The other half of parity: the fill path re-asks after focus, and a
+    // selector target now reaches that gate at all.
+    const cdp = installCdpMock({ readonly: true, textEntry: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: 'css=#code', value: 'x' })
+
+    expect(result.ok).toBe(false)
+    expect((result.data as { refused?: string }).refused).toBe('readonly')
+    expect(
+      methodsOf(cdp).includes('Input.insertText'),
+      'no text may go into a field that cannot take it',
+    ).toBe(false)
+  })
+
+  it('refuses a malformed xpath instead of acting on the Error it threw', async () => {
+    // A thrown expression still returns a `result`: the Error OBJECT, with a
+    // perfectly good objectId that passed every check, so the act went on to
+    // click a JavaScript exception. The css spelling reported its own
+    // invalid-selector marker; xpath had nothing until this.
+    installCdpMock({ selectorThrows: true })
+
+    const resolution = await __test.resolveTarget(TAB, 'xpath=//[[bad', TAB_URL)
+
+    expect(resolution.ok).toBe(false)
+    if (!resolution.ok) expect(resolution.error).toMatch(/not a valid XPath expression/)
+  })
+
+  it('does not treat a selector match as a detached ref, whatever the probe says', async () => {
+    // A selector resolves by walking down from the document, so its match is
+    // attached by construction; the detached refusal's copy ("use a fresh
+    // ref") names something a css= caller never used.
+    installCdpMock({ targetConnected: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: 'css=.btn' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { stale_refs?: boolean }).stale_refs).toBeUndefined()
   })
 })
 
