@@ -484,17 +484,32 @@ function localDiagnostics(
  * Distinct from `stalledError` in the one way that matters: the input WAS
  * dispatched, so the action may well have taken effect. Telling the agent
  * nothing was sent would invite a retry that double-submits.
+ *
+ * THREE causes, not two. The third was measured live 2026-08-17, the first
+ * time a 9MB upload could actually run (the v0.9.0 journal fix; before it,
+ * uploads that big never dispatched at all, so nobody ever saw this): a
+ * submit that carries a large upload leaves the old document unloading for
+ * tens of seconds, and every verification probe is bound to that document.
+ * The message enumerated dialog and blocked-handler only, so the operator
+ * read a routine big upload as an anomaly and went looking for a dialog that
+ * did not exist. An enumeration that omits the case actually happening is
+ * the investigation-starting failure this copy exists to prevent, so the
+ * cause is NAMED. It is still not ASSERTED: telling the three apart needs
+ * navigation state this path does not have, which is filed rather than
+ * guessed at here.
  */
 function dispatchedThenStalledError(action: ActionName): string {
   return (
     `the ${action} was sent, and the page then stopped running scripts, so what it ` +
-    'did could not be verified. Two things do that, and this does not say which: the ' +
-    'action raised a dialog (a "Leave site?" on a form with unsaved changes, or a ' +
-    "confirm() in the page's own handler), or its own handler is still running and " +
-    'has blocked the page for several seconds. DO NOT simply retry either way: the ' +
-    'action may already have taken effect, and repeating it could submit twice. Read ' +
-    'the tab to see what happened, in a fresh one if this one stays stuck, or ask the ' +
-    'user what is on their screen.'
+    'did could not be verified. Three things do that, and this does not say which: the ' +
+    'action started a navigation that is still in flight (a form submit, and one ' +
+    'carrying a large upload is the ORDINARY case, since the request can take tens of ' +
+    'seconds), the action raised a dialog (a "Leave site?" on a form with unsaved ' +
+    "changes, or a confirm() in the page's own handler), or its own handler is still " +
+    'running and has blocked the page for several seconds. DO NOT simply retry in any ' +
+    'of those cases: the action may already have taken effect, and repeating it could ' +
+    'submit twice. Read the tab to see what happened, in a fresh one if this one stays ' +
+    'stuck, or ask the user what is on their screen.'
   )
 }
 

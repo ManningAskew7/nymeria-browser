@@ -1754,6 +1754,35 @@ describe('input delivery', () => {
     }
   })
 
+  it('names the in-flight navigation among the causes of a post-dispatch stall', async () => {
+    // Measured live 2026-08-17, the first round in which a 9MB upload could
+    // run at all: the submit left the old document unloading for ~20s, every
+    // verification probe is bound to that document, and the message offered
+    // only "a dialog" or "a blocked handler". The operator went looking for a
+    // dialog that did not exist. An enumeration that omits the case actually
+    // happening is worse than no enumeration, because it directs the search.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+      installCdpMock({ rendererHangsAfterDispatch: true })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const error = String((await pending).error)
+
+      expect(error).toMatch(/navigation/i)
+      expect(error).toMatch(/upload/i)
+      // The other two survive: this adds a cause, it does not trade one away.
+      expect(error).toMatch(/dialog/i)
+      expect(error).toMatch(/handler is still running|blocked the page/i)
+      // Still no verdict. Naming a cause it cannot prove would be the same
+      // defect pointed the other way.
+      expect(error).toMatch(/does not say which/i)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('fails fast when the dispatch ack itself never returns, and says the input LANDED', async () => {
     // The synchronous twin of the case above, and the commonest shape of it:
     // Chrome acks `Input.dispatch*` only after the renderer has PROCESSED the
