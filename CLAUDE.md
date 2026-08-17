@@ -136,9 +136,16 @@ POSTs results. Consequences:
   its second is `...-deep-child-8.html` holding
   `...-deep-grand-8.html#tab2`, so a cross-origin section printed after
   both local ones reads as the second one's child, and the grandchild gives
-  a two-deep focus target whose frame URL carries a fragment). TRAP, measured 2026-08-16 and
-  corrected same day by #177's live capture: an in-frame link to iana.org
-  NEVER navigates. The operative blocker is MIXED CONTENT
+  a two-deep focus target whose frame URL carries a fragment), and
+  `...-worldsteer-fixture-7.html` (transport pass: four MAIN-world lies for
+  any read that claims isolation, an `innerText` override, a
+  `document.title` override, a `querySelector` redirect to `#decoy`, and an
+  `<img name="body">` clobber; honest answers all contain REAL or TARGET,
+  every lie contains STEERED or DECOY, and the decoy legitimately appears in
+  an UNSCOPED read, so it is a failure only from a scoped `#target` read).
+  TRAP, measured 2026-08-16 and corrected same day by #177's live capture:
+  an in-frame link to iana.org NEVER navigates. The operative blocker is
+  MIXED CONTENT
   (`https://www.iana.org/domains/example` 301s to `http://...`, blocked
   from an HTTPS page before the fetch), with `X-Frame-Options: DENY` on
   the chain behind it; a curl -L follows past where the browser stops.
@@ -320,6 +327,39 @@ POSTs results. Consequences:
     rounds were spent suspecting the tool over this; the pattern generalizes,
     an agent's own pre-capture control is the thing to doubt first.
 
+- Transport traps (v0.9.x, measured): the SSE journal is BOOKKEEPING and must
+  never sit in front of a dispatch. Journalling first cost the extension every
+  upload over ~7.5MB (`chrome.storage.local` is capped at 10MB, an over-quota
+  `set()` REJECTS, and the rejection ate the command), and it surfaced as a
+  backend transport timeout blaming a suspended page, so the symptom pointed
+  nowhere near the cause. `connection.ts` dispatches first and journals after,
+  fire-and-forget with its own log line; `state.ts` redacts long strings and
+  `persist()` swallows its own failures, because one oversized entry left in
+  `current` would otherwise reject the status writes `connectOnce` awaits and
+  take the stream down with the bookkeeping. Capture honesty answers from the
+  SESSION layer, never the buffer: `everAttached` (set in `doAttach`, dropped
+  on tab close) splits "never watched" from "watching lapsed", and keying it
+  on buffer contents instead would call a cleared tab, or a driven tab that
+  made no requests, tabs nobody ever watched. `limit: 0` means ZERO in both
+  buffers now, and because it does, a cut read must report `matched_total`
+  (counted AFTER the filters) or truncation reads as absence. Note composers
+  on the backend read their flags as identities (`is True`), never for
+  truthiness: the payload is extension-supplied and a stray string must not
+  switch on a claim that renders outside the untrusted fence.
+- `chrome_read_text` reads in the isolated probe world (v0.9.0). A world alone
+  is not enough there: named DOM properties are real DOM and follow the read
+  into it, and both `Document` and `HTMLFormElement` let a named element
+  SHADOW a built-in, so `<img name="body">` clobbers `document.body` in any
+  world. Every accessor goes through its prototype descriptor, and a non-HTML
+  root reads `textContent` (`innerText` is not on its prototype). The QA gist
+  carries `nymeria-qa-worldsteer-fixture-7.html` for this: four steering
+  attempts (innerText, title, querySelector redirect, body clobber) whose
+  honest answers all contain REAL or TARGET. STOPGAP living in three places
+  until the selector-alignment pass lands: the selector-miss error, the
+  `extract_text.ts` module docstring, and the `chrome_read_text` row in
+  `tools.md` all say that `css=` acts walk open shadow roots while this read
+  does not. Remove them together.
+
 ## Check commands
 
 Extension (from this repo root):
@@ -341,7 +381,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 13-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `9da56b61` / extension `b55b068` (v0.8.0,
+live code at backend commit `51f0ece6` / extension `6a9ce86` (v0.9.2,
 2026-08-17).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):

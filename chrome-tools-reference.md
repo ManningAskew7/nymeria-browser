@@ -272,6 +272,8 @@ Read the visible text of a Chrome tab. Cheaper than a screenshot for prose.
         the page and returns only that, which keeps a long page out of your
         context entirely. Best for big pages where you need a few facts.
 
+    Reads the ROOT document only: iframe text is chrome_read_page's job. A
+    read that FAILED says so rather than reporting a page with no text.
     Use chrome_read_page instead when you intend to ACT: this returns text, not
     the refs you need to click things. Page text is fenced as untrusted data.
 ````
@@ -999,18 +1001,23 @@ Read the network requests a Chrome tab made, with status codes.
 
     url_pattern: substring filter, e.g. "/api/".
     only_failures: just the 4xx, 5xx and transport failures.
+    limit: newest N requests; 0 returns none. At most 200 are buffered per
+        tab, and an answer the limit cut says how many it cut.
 
-    Capture runs from the moment the tab is first driven, so this is history,
-    not a recording you have to start. Use it when a page looks fine but
-    something did not take. Cross-origin iframe requests are captured too,
-    attributed with "frame": "<origin>".
+    Capture runs whenever the tab is being driven, so this is history, not a
+    recording you have to start. Use it when a page looks fine but something
+    did not take. Cross-origin iframe requests are captured too, attributed
+    with "frame": "<origin>".
 
-    One honest gap: a frame's LOAD-TIME requests often precede capture
-    reaching that frame (its session attaches moments after the frame
-    starts loading), so an iframe's early requests being absent is not
-    evidence they never happened. A load-time failure still surfaces in
-    chrome_console as a "browser": true advisory, so check there before
-    concluding anything from absence.
+    It is not continuous, and the gaps are flagged rather than left to look
+    like silence. A first read of a tab attaches it, so nothing was captured
+    before that read; a read after a pause re-attaches it, so what the page
+    did between your commands was not seen. Separately, a frame's LOAD-TIME
+    requests often precede capture reaching that frame (its session attaches
+    moments after the frame starts loading), so an iframe's early requests
+    being absent is not evidence they never happened. A load-time failure
+    still surfaces in chrome_console as a "browser": true advisory, so check
+    there before concluding anything from absence.
 ````
 
 ---
