@@ -22,7 +22,9 @@ import { clear as clearNetwork, read as readNetwork } from '../networkBuffer'
  * and answering from `hasHistory` would have called those cold starts.
  *
  * Without them a bare `count: 0` reads as "this page made no requests", which
- * is a claim about the page rather than about the buffer.
+ * is a claim about the page rather than about the buffer. `matched_total`
+ * closes the third route to that same false read: a `limit` that cut rows
+ * away, which `count` alone reports as absence.
  *
  * There is no settle wait here, unlike console.ts's COLD_ATTACH_REPLAY_MS:
  * Runtime and Log replay their backlog on enable and `Network.enable` replays
@@ -49,6 +51,16 @@ export async function execNetwork(args: unknown): Promise<CommandResult> {
   const wasCapturedBefore = everAttached(a.tab_id)
   await withSession(a.tab_id, async () => undefined)
 
+  // Read the matching set WHOLE first, then again under the limit. The total
+  // is what makes a truncated answer honest: `count` has always meant "rows
+  // returned", so without it a limit that cut 8 entries down to 0 looked
+  // exactly like a buffer that captured nothing, which is the confusion this
+  // whole tool is being taught out of (measured live 2026-08-17 with
+  // limit: 0). Two passes over an in-memory array of at most MAX_PER_TAB.
+  const matched = readNetwork(a.tab_id, {
+    url_pattern: a.url_pattern,
+    only_failures: a.only_failures,
+  })
   const entries = readNetwork(a.tab_id, {
     url_pattern: a.url_pattern,
     only_failures: a.only_failures,
@@ -62,6 +74,9 @@ export async function execNetwork(args: unknown): Promise<CommandResult> {
     data: {
       requests: entries,
       count: entries.length,
+      // Only when the limit actually cut something, so an untruncated answer
+      // keeps its pre-0.9.2 shape and no key becomes always-on furniture.
+      ...(matched.length > entries.length ? { matched_total: matched.length } : {}),
       filtered: Boolean(a.url_pattern || a.only_failures),
       ...(wasAttached
         ? {}

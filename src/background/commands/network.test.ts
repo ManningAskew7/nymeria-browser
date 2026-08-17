@@ -70,6 +70,7 @@ function payload(result: { data?: unknown }) {
     requests: { url: string; status?: number; error?: string }[]
     count: number
     filtered: boolean
+    matched_total?: number
     capture_started_now?: boolean
     capture_resumed?: boolean
   }
@@ -172,6 +173,38 @@ describe('execNetwork', () => {
     expect(none.count).toBe(0)
     expect(none.requests).toEqual([])
     expect(newest.requests.map((r) => r.url)).toEqual(['https://example.com/two'])
+    // And a cut answer says how much it cut: measured live 2026-08-17,
+    // `count: 0` with 8 entries in the buffer was indistinguishable from a
+    // buffer that captured nothing, which is the very read this tool is
+    // being taught out of.
+    expect(none.matched_total).toBe(2)
+    expect(newest.matched_total).toBe(2)
+  })
+
+  it('says nothing about a total when the limit cut nothing', async () => {
+    const emit = wireCapture()
+    await attach()
+    request(emit, 'a', 'https://example.com/one')
+
+    const all = payload(await execNetwork({ tab_id: TAB }))
+
+    expect(all.count).toBe(1)
+    expect(all.matched_total, 'an untruncated answer must not grow furniture').toBeUndefined()
+  })
+
+  it('counts the total AFTER the filters, not the whole buffer', async () => {
+    // A total that ignored url_pattern would tell the agent rows were cut
+    // that never matched in the first place.
+    const emit = wireCapture()
+    await attach()
+    request(emit, 'a', 'https://example.com/api/one')
+    request(emit, 'b', 'https://cdn.example.com/logo.png')
+    request(emit, 'c', 'https://example.com/api/two')
+
+    const data = payload(await execNetwork({ tab_id: TAB, url_pattern: '/api/', limit: 1 }))
+
+    expect(data.count).toBe(1)
+    expect(data.matched_total).toBe(2)
   })
 
   it('clear empties the buffer only after handing back what it held', async () => {
