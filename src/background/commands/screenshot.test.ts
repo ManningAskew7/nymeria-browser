@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { execScreenshot } from './screenshot'
+import { BOX_FN, execScreenshot } from './screenshot'
 import { installCdpEventRouter, resetForTests as resetDebugger, sendCommand } from '../debuggerSession'
 import { resetForTests as resetRefs, set as setRefs, type RefTarget } from '../snapshotRefs'
 
@@ -24,12 +24,16 @@ interface MockOpts {
   noLayoutMetrics?: boolean
   /** Hang the in-page evaluate, leaving only `Page.getLayoutMetrics`. */
   noEvaluate?: boolean
+  /** Box a `css=`/`xpath=` target reports, or null for an element with none. */
+  selectorBox?: { x: number; y: number; width: number; height: number } | null
+  /** Make the probe-world lookup resolve to no element at all. */
+  selectorMisses?: boolean
 }
 
 function installCdpMock(opts: MockOpts = {}) {
   const quad = opts.quad === undefined ? [200, 400, 340, 400, 340, 460, 200, 460] : opts.quad
   const sendCommandMock = vi.fn(
-    async (target: unknown, method: string) => {
+    async (target: unknown, method: string, params: Record<string, unknown> = {}) => {
       if (method === 'Page.captureScreenshot') return { data: 'PNGDATA' }
       if (method === 'Page.getLayoutMetrics') {
         if (opts.noLayoutMetrics) throw new Error('not supported')
@@ -45,6 +49,11 @@ function installCdpMock(opts: MockOpts = {}) {
         }
       }
       if (method === 'Runtime.evaluate') {
+        // The selector lookup is the one that runs in the probe world, so a
+        // contextId is what separates it from the metrics read.
+        if (params.contextId !== undefined) {
+          return opts.selectorMisses ? { result: {} } : { result: { objectId: 'obj-selector' } }
+        }
         if (opts.noEvaluate) return new Promise<never>(() => {})
         // EVERY number here differs from the layout metrics above, so a test
         // can tell which source answered each field. The width gap is the real
@@ -55,6 +64,11 @@ function installCdpMock(opts: MockOpts = {}) {
         if (opts.quadsHang) return new Promise<never>(() => {})
         if (opts.quads) return { quads: opts.quads }
         return quad ? { quads: [quad] } : {}
+      }
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: 88 }
+      if (method === 'Runtime.callFunctionOn') {
+        const box = opts.selectorBox === undefined ? { x: 40, y: 60, width: 220, height: 18 } : opts.selectorBox
+        return { result: { value: box } }
       }
       if (method === 'Page.getFrameTree') {
         const sessionId = (target as { sessionId?: string }).sessionId
@@ -295,35 +309,67 @@ describe('execScreenshot regions', () => {
       height: 60,
       scale: 3,
       clamped: false,
+      beyond_viewport: false,
     })
   })
 
-  it('always rides captureBeyondViewport, so an off-screen box is not silent white', async () => {
-    // Measured live 2026-08-16: without it, a clip over anything not currently
-    // on screen returns a SUCCESSFUL capture of pure white, one colour in every
-    // pixel, no error anywhere. An empty answer wearing a success is the worst
-    // shape this surface can produce.
+  it('reaches past the viewport only for a box that is not entirely on screen', async () => {
+    // Two measured facts pull opposite ways. Without captureBeyondViewport, a
+    // clip over anything off screen returns a SUCCESSFUL capture of pure
+    // white, no error anywhere. With it, Chrome drops the page's scrollbar and
+    // reflows the user's live page, permanently, until the tab navigates. So
+    // it is spent only where it is the difference between real pixels and
+    // none. Viewport in the mock is 1280x720 at scroll (0, 400).
     const mock = installCdpMock()
 
-    await execScreenshot({ tab_id: TAB, region: [0, 0, 100, 50] })
+    await execScreenshot({ tab_id: TAB, region: [10, 10, 100, 50] })
+    await execScreenshot({ tab_id: TAB, region: [10, 700, 100, 200] })
     await execScreenshot({ tab_id: TAB })
 
     const captures = mock.mock.calls.filter((c) => c[1] === 'Page.captureScreenshot')
-    expect(paramsOf(captures[0]).captureBeyondViewport, 'a region must').toBe(true)
-    expect(paramsOf(captures[1]).captureBeyondViewport, 'a plain capture must not').toBe(false)
+    expect(paramsOf(captures[0]).captureBeyondViewport, 'an on-screen box must not').toBe(false)
+    expect(paramsOf(captures[1]).captureBeyondViewport, 'a box past the fold must').toBe(true)
+    expect(paramsOf(captures[2]).captureBeyondViewport, 'a plain capture must not').toBe(false)
   })
 
-  it('defaults the region scale and holds it inside its bounds', async () => {
+  it('tells the backend when a capture reflowed the page', async () => {
+    installCdpMock()
+    const onScreen = await execScreenshot({ tab_id: TAB, region: [10, 10, 100, 50] })
+    const offScreen = await execScreenshot({ tab_id: TAB, region: [10, 700, 100, 200] })
+
+    expect((onScreen.data as { beyond_viewport: boolean }).beyond_viewport).toBe(false)
+    expect((offScreen.data as { beyond_viewport: boolean }).beyond_viewport).toBe(true)
+  })
+
+  it('picks a magnification from the box when none was asked for', async () => {
+    // A region exists because something is too small to read, so a small box
+    // goes to the ceiling; live QA needed scale 4 for 5px text and a flat
+    // default of 2 sent it round again. A large box does not, because pixels
+    // are tokens.
     const mock = installCdpMock()
 
-    await execScreenshot({ tab_id: TAB, region: [0, 0, 100, 100] })
+    await execScreenshot({ tab_id: TAB, region: [0, 0, 66, 15] })
+    await execScreenshot({ tab_id: TAB, region: [0, 0, 900, 300] })
+    await execScreenshot({ tab_id: TAB, region: [0, 0, 66, 15], region_scale: 1 })
+
+    const scales = mock.mock.calls
+      .filter((c) => c[1] === 'Page.captureScreenshot')
+      .map((c) => (paramsOf(c).clip as { scale: number }).scale)
+    expect(scales[0], 'a tiny box magnifies to the ceiling').toBe(4)
+    expect(scales[1], 'a big box is left alone').toBe(2)
+    expect(scales[2], 'an explicit ask still wins').toBe(1)
+  })
+
+  it('holds an explicit region scale inside its bounds', async () => {
+    const mock = installCdpMock()
+
     await execScreenshot({ tab_id: TAB, region: [0, 0, 100, 100], region_scale: 40 })
     await execScreenshot({ tab_id: TAB, region: [0, 0, 100, 100], region_scale: 0 })
 
     const scales = mock.mock.calls
       .filter((c) => c[1] === 'Page.captureScreenshot')
       .map((c) => (paramsOf(c).clip as { scale: number }).scale)
-    expect(scales).toEqual([2, 4, 1])
+    expect(scales).toEqual([4, 1])
   })
 
   it('trims a region that runs past the page and says it did', async () => {
@@ -340,7 +386,7 @@ describe('execScreenshot regions', () => {
       y: 1100,
       width: 80,
       height: 400,
-      scale: 2,
+      scale: 4,
     })
     expect((result.data as { region: { clamped: boolean } }).region.clamped).toBe(true)
   })
@@ -406,7 +452,7 @@ describe('execScreenshot regions', () => {
       y: 800,
       width: 140,
       height: 60,
-      scale: 2,
+      scale: 4,
     })
   })
 
@@ -428,7 +474,7 @@ describe('execScreenshot regions', () => {
       y: 420,
       width: 100,
       height: 40,
-      scale: 2,
+      scale: 4,
     })
   })
 
@@ -456,6 +502,81 @@ describe('execScreenshot regions', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/re-read the page/i)
+    expect(captureOf(mock)).toBeUndefined()
+  })
+
+  it('zooms into a css= selector, the only route to text that mints no ref', async () => {
+    // Found in live QA: @eN refs are minted for what the tree exposes as
+    // actable, so the paragraph an agent most wants magnified has no ref at
+    // all. Without selectors "capture this element" is unreachable for most
+    // of a page.
+    const mock = installCdpMock({ selectorBox: { x: 40, y: 60, width: 220, height: 18 } })
+
+    const result = await execScreenshot({ tab_id: TAB, region_ref: 'css=#tiny-a' })
+
+    expect(result.ok).toBe(true)
+    // Viewport box plus the scroll offset (400), as any other region.
+    expect(paramsOf(captureOf(mock)).clip).toEqual({
+      x: 40,
+      y: 460,
+      width: 220,
+      height: 18,
+      scale: 4,
+    })
+    const lookup = mock.mock.calls.find(
+      (c) => c[1] === 'Runtime.evaluate' && (c[2] as { contextId?: number })?.contextId !== undefined,
+    )
+    expect(lookup, 'the selector must resolve in the probe world, not the page').toBeTruthy()
+    expect(String((lookup?.[2] as { expression: string }).expression)).toContain('querySelector')
+  })
+
+  it('resolves an xpath= selector the same way', async () => {
+    const mock = installCdpMock({ selectorBox: { x: 5, y: 5, width: 50, height: 10 } })
+
+    const result = await execScreenshot({ tab_id: TAB, region_ref: 'xpath=//p[1]' })
+
+    expect(result.ok).toBe(true)
+    const lookup = mock.mock.calls.find(
+      (c) => c[1] === 'Runtime.evaluate' && (c[2] as { contextId?: number })?.contextId !== undefined,
+    )
+    expect(String((lookup?.[2] as { expression: string }).expression)).toContain('document.evaluate')
+  })
+
+  it('refuses a selector that matches nothing, naming the frame limit', async () => {
+    const mock = installCdpMock({ selectorMisses: true })
+
+    const result = await execScreenshot({ tab_id: TAB, region_ref: 'css=#nope' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('nothing in the page matches css=#nope')
+    expect(result.error, 'the frame limit is the likeliest cause').toContain('ROOT document only')
+    expect(captureOf(mock)).toBeUndefined()
+  })
+
+  it('unions an element\'s client rects, so a wrapped line is not the whole box', () => {
+    // Executed, not asserted as a string: a wrapped inline element reports one
+    // rect per line, and framing it by rects[0] would capture the first line
+    // while claiming to have framed the element.
+    const box = new Function(`return (${BOX_FN})`)() as () => unknown
+    const wrapped = {
+      getClientRects: () => [
+        { left: 400, top: 100, right: 600, bottom: 120 },
+        { left: 100, top: 120, right: 300, bottom: 140 },
+      ],
+    }
+    expect(box.call(wrapped)).toEqual({ x: 100, y: 100, width: 500, height: 40 })
+
+    const gone = { getClientRects: () => [] }
+    expect(box.call(gone), 'an element with no rects has no box').toBeNull()
+  })
+
+  it('refuses a selector whose element has no box', async () => {
+    const mock = installCdpMock({ selectorBox: null })
+
+    const result = await execScreenshot({ tab_id: TAB, region_ref: 'css=#hidden' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('no layout box')
     expect(captureOf(mock)).toBeUndefined()
   })
 
@@ -489,7 +610,7 @@ describe('execScreenshot regions', () => {
       y: 500,
       width: 500,
       height: 40,
-      scale: 2,
+      scale: 3,
     })
   })
 
