@@ -195,6 +195,14 @@ const DETACH_CALL_DEADLINE_MS = 5_000
  * `InputDispatchStalled.landed` exists for), so neither may read as "nothing
  * happened". And the remedies must match `assertUsableTab`'s: reload recovers
  * a discarded or frozen tab; closing is for the rest.
+ *
+ * The window-state clause is here for capture specifically. `Page.captureScreenshot`
+ * waits for a composited frame, which a tab nobody is looking at can be slow
+ * to produce; measured 2026-08-16 on the reference machine a backgrounded tab
+ * captured in about 1.3s with correct live pixels, so this is a cause to NAME,
+ * not one to design around. It is listed because the message previously
+ * offered only dialog, frozen and discarded, and an agent whose capture died
+ * on an occluded window would have read every one of those as wrong.
  */
 export class CdpCallTimeout extends Error {
   constructor(method: string, ms: number) {
@@ -203,6 +211,8 @@ export class CdpCallTimeout extends Error {
         'it may be suspended by a page dialog raised before this session was ' +
         'driving the tab (an owned dialog would have been named to you when it ' +
         'opened), frozen or discarded mid-command, or its renderer may be gone. ' +
+        'For a screenshot specifically, a tab in a backgrounded or covered ' +
+        'window can also be slow to produce the frame the capture waits for. ' +
         'Whether the call took effect is unknown, so do not repeat an action ' +
         'that changes state without checking. Reload recovers a discarded or ' +
         'frozen tab; otherwise close it and redo the work in a fresh one.',
