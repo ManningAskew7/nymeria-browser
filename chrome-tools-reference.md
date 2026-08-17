@@ -782,6 +782,13 @@ Capture what the user's Chrome tab looks like, and see it.
     something you spotted in a picture. A region or full_page image is not a
     picture of the viewport at all, so no coordinate can be read off it
     directly.
+
+    Trust that viewport over one you measured yourself a moment earlier.
+    Driving a tab puts Chrome's "being debugged" infobar on it, which shortens
+    the viewport by about 56 CSS px, and the reflow lands a command or two
+    after the first one. So the first measurement anyone takes on a freshly
+    driven tab can be a pre-reflow number, while this line always reports what
+    was true at the shutter.
 ````
 
 ---

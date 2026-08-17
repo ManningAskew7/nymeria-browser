@@ -258,8 +258,19 @@ POSTs results. Consequences:
     through raw CDP. The old "backgrounded tabs capture badly" premise did
     not reproduce on this Chrome.
   - An image over 2000px on either side 400s the whole turn on a many-image
-    request, so a tall `full_page` is a turn-killer until the image-ceiling
-    slice lands (backlog 03, downscale-to-fit).
+    request, and the image stays in the transcript, so every later turn in
+    that thread fails the same way: it BRICKS the thread, not the turn. A
+    tall `full_page` is a turn-killer until the image-ceiling slice lands
+    (backlog 03, downscale-to-fit). Width bites too, and window width varies
+    per window, so a short page is not a safe full page.
+  - Driving a tab shortens its viewport by 56 CSS px, a command or two in.
+    That is Chrome's "being debugged" infobar, measured decisively 2026-08-17
+    on one fresh tab: `getLayoutMetrics` said 981 tall, the capture said 925
+    and its image agreed, and a second `getLayoutMetrics` had moved to 925.
+    So a metrics read taken as the FIRST touch on a freshly driven tab is the
+    stale number, and the capture's own geometry is the current one. Two QA
+    rounds were spent suspecting the tool over this; the pattern generalizes,
+    an agent's own pre-capture control is the thing to doubt first.
 
 ## Check commands
 
@@ -282,8 +293,8 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 13-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `ed1fdbef` / extension `4705dfb` (v0.6.0,
-2026-08-16).
+live code at backend commit `ecbf4719` / extension `b428133` (v0.7.2,
+2026-08-17).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):
 
