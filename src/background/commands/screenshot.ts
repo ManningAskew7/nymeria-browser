@@ -493,6 +493,20 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
 
   if (!metrics) metrics = await readMetrics(a.tab_id)
 
+  // A full-page capture ASKS to reach past the viewport, which is not the same
+  // as reaching. On a document that already fits there is no scrollbar to drop
+  // and no layout to shift, so saying otherwise spends the agent's trust on a
+  // warning that does not apply. Live QA 2026-08-17 caught exactly that (a
+  // 2560x1215 page whose document was 1215 tall) and said, correctly, that a
+  // notice which cries wolf is one it starts skimming. Unreadable content size
+  // stays disclosed, since not knowing is not the same as knowing it was fine.
+  const reachedBeyond = fullPage
+    ? metrics.content && metrics.viewport
+      ? metrics.content.width > metrics.viewport.width + 1 ||
+        metrics.content.height > metrics.viewport.height + 1
+      : true
+    : beyondViewport
+
   return {
     ok: true,
     status: 'success',
@@ -505,7 +519,7 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
       zoom: metrics.zoom,
       scroll: metrics.scroll,
       region: clip ? { ...clip, clamped, beyond_viewport: beyondViewport } : null,
-      beyond_viewport: fullPage || beyondViewport,
+      beyond_viewport: reachedBeyond,
     },
   }
 }

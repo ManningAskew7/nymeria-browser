@@ -74,6 +74,17 @@ POSTs results. Consequences:
 - Standing user request: after functional rounds, ALWAYS ask the thread
   agent for its opinion/suggestions on the tooling as its operator, and
   relay those to the user (they routinely become backlog rows).
+- A legibility fixture must draw its secret text on a CANVAS. Measured
+  2026-08-16: the operator flagged its own "can you read this now" round as
+  contaminated, because an earlier `chrome_read_page(detail="full")` had
+  already printed the fixture's codes into its context from the
+  accessibility tree. Canvas text never enters that tree, so the magnified
+  capture stays the only way in.
+- The user's external-PC hourly cron agent is PIPELINE PLUMBING ONLY: it
+  keeps the pull/rebuild loop smooth, so a stale `version_after` tends to
+  self-heal if you wait and retry. It is never an observer. Anything
+  needing human eyes (a Chrome banner, what is on screen) still waits for
+  the user.
 - Etiquette: fresh tabs only, close QA tabs at the end, never touch the
   user's own tabs. The browser-control kit binds with a 2h TTL; the agent
   re-binds itself when lapsed.
@@ -108,6 +119,10 @@ POSTs results. Consequences:
   `#dismiss-overlay`; child is `...-actionability-child-6.html` with
   `#child-btn`/`#child-status`. Every status paragraph starts
   `*-untouched`, so a refusal that actually acted is visible in one read),
+  `...-capture-fixture-7.html` (capture-fidelity pass: three 5px codes
+  `#tiny-a`/`#tiny-b`/`#tiny-c` that no plain capture can resolve, a
+  canvas, a compositor-promoted layer, four fixed viewport-corner markers,
+  and a 1400px scroll band so an element sits well below the fold),
   and `...-mixed-kind-fixture-1.html` (`#parent-btn`, same-origin
   `#wrapper-frame` -> `...-mixed-kind-wrapper-1.html` with
   `#wrapper-btn`/`#wrapper-input` and an example.org OOPIF `#oopif-frame`:
@@ -212,6 +227,39 @@ POSTs results. Consequences:
   must come FIRST and key on `checkVisibility`; frames.test had a DEAD
   `getComputedStyle` branch (a legacy frame-offset probe) that would
   otherwise have answered the new probe with `{x, y}`.
+
+- Capture traps (v0.7.x, every one measured, several the opposite of what
+  reasoning predicted):
+  - `fromSurface: false` is REFUSED for an extension's debugger session
+    (`{"code":-32000,"message":"Only screenshots from surface are allowed."}`);
+    Chromium allowlists it to one extension. It also points the wrong way,
+    being the OS window-grab path from a trusted client, so it NEEDS the
+    window on screen and ignores `clip`. Do not reach for it again.
+  - `clip` is DOCUMENT space, not viewport space. A viewport-space rect
+    captures the wrong place, or pure white. Add the scroll offset and clamp
+    to `cssContentSize`.
+  - An off-surface clip returns a SUCCESSFUL capture of one flat colour with
+    no error at all, which is why the backend flags a single-colour image.
+  - `captureBeyondViewport` permanently reflows the live page (layout
+    viewport 1353 -> 1368, scrollbar gone) until the tab navigates. Spend it
+    only when the box is not entirely on screen; `full_page` always pays it,
+    and both disclose it (`[Reflow]`).
+  - Report the viewport as `window.innerWidth/innerHeight`, NOT
+    `cssVisualViewport.clientWidth/Height`: the 15px scrollbar is inside the
+    captured image and outside that CSS box, so the narrower number puts
+    ~23px of error into an image-to-coordinate conversion at x=1200. Zoom
+    comes only from `getLayoutMetrics`.
+  - Chrome rounds the clip box before rendering, so a fractional element box
+    returns a few pixels off `width x scale` (measured: 244 where 248 was
+    predicted). The backend's did-Chrome-actually-clip cross-check is
+    therefore RELATIVE (5%), not an absolute pixel window.
+  - Backgrounded-tab capture is not slow and not stale: ~1.3s with live
+    pixels, canvas and composited layers included, through the tool and
+    through raw CDP. The old "backgrounded tabs capture badly" premise did
+    not reproduce on this Chrome.
+  - An image over 2000px on either side 400s the whole turn on a many-image
+    request, so a tall `full_page` is a turn-killer until the image-ceiling
+    slice lands (backlog 03, downscale-to-fit).
 
 ## Check commands
 

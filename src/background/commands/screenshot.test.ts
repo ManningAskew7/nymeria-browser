@@ -28,6 +28,7 @@ interface MockOpts {
   selectorBox?: { x: number; y: number; width: number; height: number } | null
   /** Make the probe-world lookup resolve to no element at all. */
   selectorMisses?: boolean
+  contentSize?: { width: number; height: number }
 }
 
 function installCdpMock(opts: MockOpts = {}) {
@@ -45,7 +46,7 @@ function installCdpMock(opts: MockOpts = {}) {
             pageY: 407,
             zoom: 1.5,
           },
-          cssContentSize: { width: 1280, height: 5000 },
+          cssContentSize: opts.contentSize ?? { width: 1280, height: 5000 },
         }
       }
       if (method === 'Runtime.evaluate') {
@@ -238,6 +239,29 @@ describe('execScreenshot', () => {
     const captures = mock.mock.calls.filter((c) => c[1] === 'Page.captureScreenshot')
     expect(paramsOf(captures[0]).captureBeyondViewport).toBe(true)
     expect(paramsOf(captures[1]).captureBeyondViewport).toBe(false)
+  })
+
+  it('does not claim a reflow on a full page that already fits the viewport', async () => {
+    // Live QA 2026-08-17: a full_page capture of a page whose document was no
+    // taller than its viewport still printed the reflow warning, and the
+    // operator said, correctly, that a notice which fires when it does not
+    // apply is one it starts skimming, which is exactly when the real one
+    // arrives. Asking to reach past the viewport is not reaching: with nothing
+    // off screen there is no scrollbar to drop and no layout to shift.
+    installCdpMock({ contentSize: { width: 1280, height: 700 } })
+    const fits = await execScreenshot({ tab_id: TAB, full_page: true })
+
+    installCdpMock() // the default document is 5000 tall
+    const tall = await execScreenshot({ tab_id: TAB, full_page: true })
+
+    // Not knowing is not the same as knowing it was fine.
+    installCdpMock({ noLayoutMetrics: true })
+    const unknown = await execScreenshot({ tab_id: TAB, full_page: true })
+
+    const beyond = (r: typeof fits) => (r.data as { beyond_viewport: boolean }).beyond_viewport
+    expect(beyond(fits), 'a document that fits reflows nothing').toBe(false)
+    expect(beyond(tall), 'a document past the fold does').toBe(true)
+    expect(beyond(unknown), 'an unreadable content size stays disclosed').toBe(true)
   })
 
   it('still returns the image when the page is too suspended to answer for metrics', async () => {

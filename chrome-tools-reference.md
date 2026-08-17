@@ -513,6 +513,10 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         key name for key (e.g. "Enter", "Tab", "Escape").
     coordinate: [x, y] viewport pixels, as an alternative target for click,
         hover and drag when there is no usable ref (canvas, custom widgets).
+        Viewport CSS pixels, which are NOT the pixels of a screenshot on a
+        HiDPI display or a zoomed page: convert with the image and viewport
+        sizes chrome_screenshot reports before aiming at something you saw
+        in a picture.
     modifiers: any of ["Ctrl", "Shift", "Alt", "Meta"].
     direction / amount_px: for scroll (default down, 500px).
     to_ref: drag destination.
@@ -697,6 +701,45 @@ Args schema:
     "default": false,
     "title": "Full Page",
     "type": "boolean"
+  },
+  "region": {
+    "anyOf": [
+      {
+        "items": {
+          "type": "integer"
+        },
+        "type": "array"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Region"
+  },
+  "region_ref": {
+    "anyOf": [
+      {
+        "type": "string"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Region Ref"
+  },
+  "region_scale": {
+    "anyOf": [
+      {
+        "type": "integer"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Region Scale"
   }
 }
 ```
@@ -707,12 +750,38 @@ Description (verbatim docstring):
 Capture what the user's Chrome tab looks like, and see it.
 
     full_page: capture the whole scrollable page rather than the viewport.
+    region: [x, y, width, height] in viewport CSS pixels, to photograph just
+        that part of the page. Chrome RE-RENDERS the region rather than
+        cropping the picture, so region_scale above the display's own pixel
+        ratio (reported with every capture) resolves detail no crop of the
+        full image could. A region that runs past the edge of the viewport is
+        trimmed to it and says so.
+    region_ref: what to capture instead of a rectangle, as a "@eN" ref or a
+        "css=" / "xpath=" selector; its box is measured in the page. Selectors
+        are the route to anything the tree mints no ref for, static text and
+        table cells especially, and reach the ROOT document only. A "@eN" ref
+        inside a cross-origin iframe is refused (its box is measured in that
+        frame's own coordinates, which cannot be placed in the page's): read a
+        rectangle off a plain screenshot instead.
+    region_scale: how far to magnify a region, 1 to 4. Left unset it is chosen
+        from the box: a small one is magnified to the ceiling, a large one is
+        not, so an unreadable label comes back readable without costing a
+        wall of pixels. Values outside the range are clamped, with a note.
 
     The image is saved to the workspace and attached for you to view. Reach for
     it when the accessibility tree is not enough: canvas, charts, custom-drawn
     widgets, CAPTCHAs, or confirming a page looks right before committing to
     something. For reading text or finding things to click, chrome_read_page
     and chrome_find are far cheaper.
+
+    Every capture reports its own geometry: the image size in pixels, the
+    viewport in CSS pixels, the device pixel ratio, the scroll position, and
+    the page zoom when it is not 100%. chrome_act(coordinate=...) takes
+    viewport CSS pixels, and those are NOT image pixels on a HiDPI display or
+    a zoomed page, so convert with the two reported sizes before aiming at
+    something you spotted in a picture. A region or full_page image is not a
+    picture of the viewport at all, so no coordinate can be read off it
+    directly.
 ````
 
 ---
