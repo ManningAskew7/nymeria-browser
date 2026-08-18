@@ -61,6 +61,11 @@ interface MockOptions {
   /** Thrown for the tally read; defaults to deliveryReadThrows (a dead
    * context kills the read and the tally alike). */
   deliveryTallyThrows?: string
+  /** Sequential answers to the scroll-offset reads (#203): the baseline
+   *  first, then the post-settle re-read. Default empty, so every read
+   *  answers null (unmeasurable) and scroll_moved stays absent unless a
+   *  test scripts a pair. */
+  scrollStates?: Array<{ t: number; l: number; d: boolean } | null>
   bodyText?: string
   selectMatches?: boolean
   /** false models a tab where the delivery probe's world cannot be created. */
@@ -186,6 +191,7 @@ function installCdpMock(opts: MockOptions = {}) {
     settleValue = 'quiet',
     deliveryTally = 3,
     deliveryTallyThrows = opts.deliveryReadThrows,
+    scrollStates = [],
     bodyText = '',
     selectMatches = true,
     deliveryWorld = true,
@@ -232,6 +238,10 @@ function installCdpMock(opts: MockOptions = {}) {
   const TRUST_CONTEXT = 88
   let dispatched = false
   let inputEvents = 0
+  // Consumed in read order by BOTH scroll-state shapes (the targeted
+  // ancestor walk and the targetless document read): one scroll makes at
+  // most two reads, baseline then after, whichever shape it uses.
+  const scrollQueue = [...scrollStates]
 
   // Every method that needs the renderer's main thread. A page suspended by its
   // own dialog answers NONE of them, which is what makes a single-method hang
@@ -316,6 +326,13 @@ function installCdpMock(opts: MockOptions = {}) {
       if (fn.includes('getBoundingClientRect')) {
         return { result: { value: geometry } }
       }
+      // The scroll-offset read (#203): SCROLL_STATE_FN walks to the nearest
+      // scrollable ancestor and falls back to document.scrollingElement,
+      // its unique marker. Answered from the sequential fixture; exhausted
+      // or unset means unmeasurable, which the code must treat as absence.
+      if (fn.includes('scrollingElement')) {
+        return { result: { value: scrollQueue.shift() ?? null } }
+      }
       if (fn.includes('const isFile =')) return { result: { value: isFileInput } }
       if (fn.includes('isContentEditable')) return { result: { value: textEntry } }
       if (fn.includes('activeElement')) {
@@ -392,6 +409,7 @@ function installCdpMock(opts: MockOptions = {}) {
         expression.includes('elementFromPoint') ||
         expression.includes('innerText.includes') ||
         expression.includes('innerWidth') ||
+        expression.includes('scrollingElement') ||
         expression.includes('document.querySelector(') ||
         expression.includes('document.evaluate(')
       if (mustBeInWorld && params.contextId !== TRUST_CONTEXT) {
@@ -405,6 +423,11 @@ function installCdpMock(opts: MockOptions = {}) {
         return { result: { value: { description: pointDescription, opensFileChooser: isFileInput } } }
       }
       if (expression.includes('readyState')) return { result: { value: settleValue } }
+      // The targetless scroll-offset twin: the document is the only
+      // measurable scroller, read in the probe world.
+      if (expression.includes('scrollingElement')) {
+        return { result: { value: scrollQueue.shift() ?? null } }
+      }
       if (expression.includes('activeElement')) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
       }
@@ -4542,6 +4565,147 @@ describe('isolated probe world (#160)', () => {
         String((c[2] as { expression?: string }).expression).includes('document.evaluate('),
     )
     expect((xpathEval?.[2] as { contextId?: number }).contextId).toBe(88)
+  })
+})
+
+/**
+ * Scroll at a ref (#203): scroll joined OPTIONAL_TARGET, so a ref resolves
+ * (an unknown ref refuses instead of silently wheeling the root), the wheel
+ * dispatches AT the element's point on its own session, and `scroll_moved`
+ * reports what actually moved from before/after offsets of the nearest
+ * scrollable ancestor (else the document). {0,0} is a MEASURED
+ * nothing-moved; the key absent means unmeasured, never a fake zero.
+ */
+describe('scroll at a ref (#203)', () => {
+  const wheelCall = (cdp: ReturnType<typeof installCdpMock>) =>
+    cdp.mock.calls.find(
+      (c) =>
+        c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type?: string }).type === 'mouseWheel',
+    )
+
+  it('wheels at the resolved element point, not the viewport centre', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    // Default mock geometry answers its centre as (50, 60); the viewport
+    // centre the targetless path would use is (400, 300).
+    expect(wheelCall(cdp)?.[2]).toMatchObject({ x: 50, y: 60, deltaY: 500 })
+    expect((result.data as { target?: string }).target).toBe('@e1')
+  })
+
+  it('an unknown ref refuses instead of silently wheeling the root', async () => {
+    // The pre-#203 shape: scroll had no target resolution at all, so a ref
+    // was IGNORED and the wheel landed on the viewport centre while the
+    // payload implied the pane was scrolled. Dropping scroll from
+    // OPTIONAL_TARGET reintroduces exactly that, and this goes red.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e99', direction: 'down' })
+
+    expect(result.ok).toBe(false)
+    expect((result.data as { reason?: string }).reason).toBe('unknown-ref')
+    expect(cdp.mock.calls.some((c) => String(c[1]).startsWith('Input.'))).toBe(false)
+  })
+
+  it('a targetless scroll still wheels the viewport centre with no target echo', async () => {
+    const cdp = installCdpMock({
+      scrollStates: [
+        { t: 0, l: 0, d: true },
+        { t: 480, l: 0, d: true },
+      ],
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect(wheelCall(cdp)?.[2]).toMatchObject({ x: 400, y: 300, deltaY: 500 })
+    expect('target' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 480,
+      scroller: 'document',
+    })
+  })
+
+  it('scroll_moved reports the container delta for an inner-pane ref scroll', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      scrollStates: [
+        { t: 10, l: 0, d: false },
+        { t: 310, l: 5, d: false },
+      ],
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 5,
+      dy: 300,
+      scroller: 'container',
+    })
+  })
+
+  it('a wheel the page ignored reports a measured zero, never silence', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      scrollStates: [
+        { t: 120, l: 0, d: false },
+        { t: 120, l: 0, d: false },
+      ],
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'up' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 0,
+      scroller: 'container',
+    })
+  })
+
+  it('scroll_moved stays absent when the offsets cannot be read', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('scroll_moved stays absent when the scroller identity changed between reads', async () => {
+    // A container baseline and a document after-read are offsets of two
+    // DIFFERENT elements; subtracting them fabricates a delta.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      scrollStates: [
+        { t: 0, l: 0, d: false },
+        { t: 100, l: 0, d: true },
+      ],
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('a ref scroll whose position cannot be read refuses without dispatching', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ geometry: null })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toContain('position on the page could not be read')
+    expect((result.data as { input?: string }).input).toBe('none')
+    expect(cdp.mock.calls.some((c) => String(c[1]).startsWith('Input.'))).toBe(false)
   })
 })
 

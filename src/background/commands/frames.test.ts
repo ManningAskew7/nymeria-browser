@@ -214,6 +214,29 @@ describe('frame input dispatch', () => {
     expect(cdp.mock.calls.some((c) => c[1] === 'DOM.getFrameOwner')).toBe(false)
   })
 
+  it("a frame ref's scroll wheels the FRAME's own session at frame-local coordinates (#203)", async () => {
+    // The wheel rides the same delivery channel the click was measured to
+    // need: root-session input never reaches OOPIF content, so a wheel
+    // meant for a pane inside the frame must dispatch on the frame session
+    // in ITS viewport space.
+    const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    const wheel = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mouseWheel',
+    )
+    expect(wheel?.[2]).toMatchObject({ x: 30, y: 40, deltaY: 500 })
+    expect(wheel?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    // The facts bag rides the shared resolution: the payload names the frame.
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(
+      'https://pay.example/card',
+    )
+  })
+
   it('dispatches a main-document click on the root session, un-offset', async () => {
     const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
     await attachFrame()
@@ -1651,6 +1674,25 @@ describe('same-process frame refs (reads-honesty pass)', () => {
     expect(pressed?.[2]).toMatchObject({ x: 280, y: 350 })
   })
 
+  it('a same-process frame ref scroll wheels the SHARED session at page coordinates (#203)', async () => {
+    // Same-process frames receive root-session input routed by position,
+    // so the wheel point is the browser-composed quad centre, never the
+    // frame-local rect the probes read.
+    const cdp = installCdpMock()
+    overrideSameProcess()
+    localRef()
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    const wheel = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mouseWheel',
+    )
+    expect(wheel?.[0]).toEqual({ tabId: TAB })
+    expect(wheel?.[2]).toMatchObject({ x: 280, y: 350, deltaY: 500 })
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(LOCAL_URL)
+  })
+
   it('a ref whose frame is GONE refuses with the frame-gone story, nothing dispatched', async () => {
     const cdp = installCdpMock()
     overrideSameProcess({ childFrames: [] })
@@ -2621,6 +2663,49 @@ describe('act payload frame attribution (#201)', () => {
 
     expect(result.ok).toBe(true)
     expect('resolved_frame' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('a located frame with an EMPTY URL claims resolved_frame null, not silence (#203)', async () => {
+    // locateFrame's defensive `?? ''` paths can hand back a frame record
+    // whose URL is empty. Absence already means "the root document", so an
+    // empty URL must not be dropped into the same shape: null says a frame
+    // WAS involved but its URL cannot be named. Reverting the emission
+    // guard to truthiness collapses the two states and this goes red.
+    installCdpMock()
+    await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
+    cdpEmitter()({ tabId: TAB }, 'Target.attachedToTarget', {
+      sessionId: FRAME_SESSION,
+      targetInfo: { targetId: FRAME_TARGET, type: 'iframe', url: '' },
+    })
+    setRefs(TAB, frameRef(), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect('resolved_frame' in data).toBe(true)
+    expect(data.resolved_frame).toBeNull()
+  })
+
+  it('a CONFIRMED keyboard frame with an empty URL claims null, not nothing (#203)', async () => {
+    // The keyboard router already computed `url || null` for a confirmed
+    // frame and then dropped the null at the claim site, conflating "frame
+    // confirmed, URL unreadable" with the genuinely-uncertain case. Only
+    // the confirmed kind may claim; its claim may be null.
+    installCdpMock()
+    overrideKeyboardFocus(true)
+    await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
+    cdpEmitter()({ tabId: TAB }, 'Target.attachedToTarget', {
+      sessionId: FRAME_SESSION,
+      targetInfo: { targetId: FRAME_TARGET, type: 'iframe', url: '' },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as Record<string, unknown>
+    expect('resolved_frame' in data).toBe(true)
+    expect(data.resolved_frame).toBeNull()
   })
 
   it('the same-origin keyboard claim is the frame-tree URL, not the truncated in-page hint', async () => {

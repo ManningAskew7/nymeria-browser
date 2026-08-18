@@ -185,8 +185,14 @@ const NEEDS_TARGET: ReadonlySet<ActionName> = new Set<ActionName>([
   'upload',
 ])
 
-/** Actions that focus a target first when given one, but work without. */
-const OPTIONAL_TARGET: ReadonlySet<ActionName> = new Set<ActionName>(['type', 'key'])
+/** Actions that focus a target first when given one, but work without.
+ *  `scroll` is here since #203: a ref/selector resolves and the wheel goes
+ *  in AT the element's point on its own session (the inner-pane case), but
+ *  a bare scroll still wheels the viewport centre. Resolution gives it the
+ *  detached-ref refusal and frame attribution for free; the activation
+ *  gates (fingerprint, disabled) exclude it naturally, since wheeling over
+ *  an element is not acting ON it. */
+const OPTIONAL_TARGET: ReadonlySet<ActionName> = new Set<ActionName>(['type', 'key', 'scroll'])
 
 /**
  * Verbs that can act on a bare coordinate. The rest of `NEEDS_TARGET` reject
@@ -1443,11 +1449,13 @@ type TargetResolution =
       frameTargetId?: string
       /** The owning frame's URL as currently recorded, from `locateFrame`
        *  at resolution time (#201; distinct from RefTarget.frameUrl, the
-       *  MINT-time URL). Set only when the target resolved into a subframe,
-       *  so its absence on a resolved target MEANS the root document; the
-       *  payload's `resolved_frame` key inherits both the value and that
-       *  rule. */
-      liveFrameUrl?: string
+       *  MINT-time URL). Three states (#203, previous_value's precedent):
+       *  undefined = the target lives in the root document (the key stays
+       *  absent), null = the target resolved into a LOCATED frame whose
+       *  recorded URL is empty (the defensive `?? ''` paths in
+       *  `locateFrame`; the payload says `resolved_frame: null` so absence
+       *  keeps meaning root), string = the frame and its URL are known. */
+      liveFrameUrl?: string | null
       backendNodeId?: number
       mintRole?: string
       mintName?: string
@@ -1545,7 +1553,7 @@ async function resolveTarget(
     // its nodes and would tell a lying staleness story). A frame found
     // nowhere is genuinely gone.
     let session: Cdp = tabId
-    let liveFrameUrl: string | undefined
+    let liveFrameUrl: string | null | undefined
     if (resolution.frameTargetId) {
       const located = await locateFrame(tabId, resolution.frameTargetId)
       if (!located) {
@@ -1573,7 +1581,9 @@ async function resolveTarget(
         }
       }
       session = located.session
-      if (located.url) liveFrameUrl = located.url
+      // A located frame with an empty recorded URL claims null, not
+      // silence: absence must keep meaning "root document" (#203).
+      liveFrameUrl = located.url || null
     }
     try {
       const resolved = await resolveNodeInProbeWorld(session, resolution.backendNodeId)
@@ -1895,7 +1905,11 @@ function sameFocusFrameUrl(frameTreeUrl: string, focusUrl: string): boolean {
 async function localFrameHoldingFocus(
   tabId: number,
   frameUrl: string,
-): Promise<{ session: Cdp; url: string | null }> {
+): Promise<{ session: Cdp; url: string | null | undefined }> {
+  // `url` states (#203): a string names the confirmed frame; null means
+  // the frame was CONFIRMED but its recorded URL is empty (the payload
+  // claims `resolved_frame: null`); undefined means no confirmation (the
+  // root fallbacks) and no claim is made.
   let locals: LocalFrame[]
   try {
     locals = await localFrames(tabId)
@@ -1903,7 +1917,7 @@ async function localFrameHoldingFocus(
     // Session-layer failures rethrow like every other pre-dispatch probe;
     // anything else leaves the keystrokes where they already were going.
     if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
-    return { session: tabId, url: null }
+    return { session: tabId, url: undefined }
   }
   const byUrl = locals.filter((f) => sameFocusFrameUrl(f.url, frameUrl))
   // DEEPEST FIRST. `document.activeElement` is the frame OWNER in every
@@ -1928,7 +1942,7 @@ async function localFrameHoldingFocus(
       // rule: a whole-loop try let a single bad frame decide the verdict).
     }
   }
-  return { session: tabId, url: null }
+  return { session: tabId, url: undefined }
 }
 
 /** Where ref-less keystrokes go: the frame holding focus, else the root.
@@ -1944,11 +1958,13 @@ async function localFrameHoldingFocus(
  *  `focused` read names wherever the caret ended up. Sourced from the CDP
  *  frame records only (the in-page focus read truncates its URL and is
  *  page-readable state, so it routes the confirmation but never supplies
- *  the claim). Null means the root document or an unconfirmed frame; the
- *  payload stays silent both ways. */
+ *  the claim). `frameUrl` states (#203): a string names the confirmed
+ *  frame; null means CONFIRMED but the recorded URL is empty (the payload
+ *  claims `resolved_frame: null`); undefined means the root document or an
+ *  unconfirmed frame, and the payload stays silent. */
 async function keyboardSessionForFocus(
   tabId: number,
-): Promise<{ session: Cdp; frameUrl: string | null }> {
+): Promise<{ session: Cdp; frameUrl: string | null | undefined }> {
   // Cheap gate before the per-frame scan: only when the ROOT document's own
   // focus rests on a frame owner can the caret be inside a cross-origin
   // frame, so anything else answers with one evaluate instead of three CDP
@@ -1972,9 +1988,9 @@ async function keyboardSessionForFocus(
   } catch (e) {
     if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
     // An unanswerable gate keeps the pre-frames behavior: type at the root.
-    return { session: tabId, frameUrl: null }
+    return { session: tabId, frameUrl: undefined }
   }
-  if (!top) return { session: tabId, frameUrl: null }
+  if (!top) return { session: tabId, frameUrl: undefined }
   if (top.tag !== 'iframe' && top.tag !== 'frame') {
     // The expression descended a SAME-ORIGIN frame chain itself, so a
     // non-frame tag with a `frame_url` means the caret is inside a
@@ -1982,7 +1998,7 @@ async function keyboardSessionForFocus(
     // reaches those frames), but the DELIVERY PROBE must arm in the frame's
     // own world: armed at the root it counted nothing and the verdict was a
     // permanent "unknown", which is the residual this closes.
-    if (!top.frame_url) return { session: tabId, frameUrl: null }
+    if (!top.frame_url) return { session: tabId, frameUrl: undefined }
     const picked = await localFrameHoldingFocus(tabId, top.frame_url)
     return { session: picked.session, frameUrl: picked.url }
   }
@@ -1998,7 +2014,85 @@ async function keyboardSessionForFocus(
   // destination is genuinely uncertain, so no attribution is claimed.
   return frame
     ? { session: { tabId, sessionId: frame.sessionId }, frameUrl: frame.url || null }
-    : { session: tabId, frameUrl: null }
+    : { session: tabId, frameUrl: undefined }
+}
+
+/** What a wheel would move, read before and after a scroll (#203). For a
+ * targeted scroll: the element's nearest scrollable ancestor (self
+ * included; computed-overflow gated so an overflow:visible giant does not
+ * masquerade as a scroller), falling back to the document's scrolling
+ * element. `d` says which kind answered. Runs against the probe-world
+ * object handle, so a page cannot script the number. One honest limit,
+ * docstring-taught: only the NEAREST scroller and the document are
+ * measured, so a wheel that moved some other pane reads as {0,0}. */
+const SCROLL_STATE_FN = `function(){
+  try {
+    var n = this;
+    while (n) {
+      var scrollable = (n.scrollHeight > n.clientHeight + 1) || (n.scrollWidth > n.clientWidth + 1);
+      if (scrollable && n !== document.documentElement && n !== document.body) {
+        var cs = getComputedStyle(n);
+        var oy = cs.overflowY, ox = cs.overflowX;
+        if (oy === 'auto' || oy === 'scroll' || oy === 'overlay' ||
+            ox === 'auto' || ox === 'scroll' || ox === 'overlay') {
+          return { t: n.scrollTop, l: n.scrollLeft, d: false };
+        }
+      }
+      n = n.parentElement;
+    }
+  } catch (e) {}
+  try {
+    var se = document.scrollingElement || document.documentElement;
+    return { t: se.scrollTop, l: se.scrollLeft, d: true };
+  } catch (e) { return null; }
+}`
+
+const SCROLL_STATE_EXPRESSION = `(function(){
+  try {
+    var se = document.scrollingElement || document.documentElement;
+    return { t: se.scrollTop, l: se.scrollLeft, d: true };
+  } catch (e) { return null; }
+})()`
+
+interface ScrollState {
+  t: number
+  l: number
+  d: boolean
+}
+
+async function scrollState(session: Cdp, objectId: string | null): Promise<ScrollState | null> {
+  try {
+    if (objectId) {
+      const v = await callOn<{ t?: unknown; l?: unknown; d?: unknown } | null>(
+        session,
+        objectId,
+        SCROLL_STATE_FN,
+      )
+      return v && typeof v.t === 'number' && typeof v.l === 'number'
+        ? { t: v.t, l: v.l, d: v.d === true }
+        : null
+    }
+    // A targetless scroll: the document is the only measurable scroller.
+    return await withProbeWorld(session, async (contextId) => {
+      const resp = await sendCommand<{
+        result?: { value?: { t?: unknown; l?: unknown } | null }
+        exceptionDetails?: unknown
+      }>(session, 'Runtime.evaluate', {
+        expression: SCROLL_STATE_EXPRESSION,
+        contextId,
+        returnByValue: true,
+      })
+      if (resp.exceptionDetails) return null
+      const v = resp.result?.value
+      return v && typeof v.t === 'number' && typeof v.l === 'number'
+        ? { t: v.t, l: v.l, d: true }
+        : null
+    })
+  } catch {
+    // Unmeasurable is a state, not an error: scroll_moved simply stays
+    // absent (never a fake zero).
+    return null
+  }
 }
 
 async function stillConnected(session: Cdp, objectId: string | null): Promise<boolean | null> {
@@ -2528,8 +2622,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       // from `focused`, a state read that never moves on hover/scroll_to/
       // drag and so names the PREVIOUS act's frame. Absent on a resolved
       // target it means the root document; resolution state, no round
-      // trip, so it survives the budget clamp that drops `focused`.
-      if (resolution.liveFrameUrl) selectorFacts.resolved_frame = resolution.liveFrameUrl
+      // trip, so it survives the budget clamp that drops `focused`. NULL
+      // is a value here (#203): a located frame whose URL could not be
+      // read still names itself as not-the-root.
+      if (resolution.liveFrameUrl !== undefined) {
+        selectorFacts.resolved_frame = resolution.liveFrameUrl
+      }
       // The widened pre-dispatch probe, for BOTH target classes. A selector
       // target pays exactly the one `callFunctionOn` a ref pays, and gets the
       // same six facts plus the two only a selector has (how many elements
@@ -2694,6 +2792,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   let inputMode: 'trusted' | 'synthetic' | 'none' = 'none'
   let previousValue: string | null | undefined
   const extra: Record<string, unknown> = {}
+  /** The pre-wheel scroll baseline (#203); non-null only for `scroll`,
+   *  compared post-settle so smooth scrolling has finished animating. */
+  let scrollBaseline: ScrollState | null = null
   // Only ever set for a coordinate act: a ref act already names its target,
   // and `target_exists` answers the same question for it more directly. On a
   // drag the point is the SOURCE, so it is named as such rather than left to
@@ -2753,7 +2854,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // dispatch time (see keyboardSessionForFocus). Set into `extra` directly
   // (it is declared above and every later exit carries it); the resolution
   // path cannot also have set it, since this branch only runs ref-less.
-  if (keyboardFocus?.frameUrl) extra.resolved_frame = keyboardFocus.frameUrl
+  if (keyboardFocus && keyboardFocus.frameUrl !== undefined) {
+    extra.resolved_frame = keyboardFocus.frameUrl
+  }
   // Armed on the session the input will ride: the frame's own for a frame
   // ref, the focused frame's for ref-less keystrokes, the root otherwise.
   // Arming the root for an in-frame act was the pre-2026-08-16 shape, and
@@ -3247,8 +3350,45 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         const direction = a.direction ?? 'down'
         const deltaX = direction === 'left' ? -amount : direction === 'right' ? amount : 0
         const deltaY = direction === 'up' ? -amount : direction === 'down' ? amount : 0
-        const at = pointFrom(a.coordinate) ?? (await viewportCentre(tabId, budgetDeadline))
-        await trustedWheel(tabId, at, { x: deltaX, y: deltaY }, modifiers)
+        // #203: a targeted scroll wheels AT the resolved element's point on
+        // the element's OWN session (frame-local for an OOPIF ref, composed
+        // root coordinates for a same-process frame ref: the drag source's
+        // exact geometry shape), which scrolls the scrollable CONTAINER
+        // under it, the inner-pane case that used to require coordinates.
+        // No activation gates apply: wheeling over a disabled or covered
+        // element is how scrolling works.
+        let at: Point
+        let wheelTarget: Cdp = tabId
+        if (objectId) {
+          const local = (await elementGeometry(elementSession, objectId))?.point ?? null
+          const dp = local
+            ? await dispatchPointFor(elementSession, elementBackendNodeId, local)
+            : null
+          if (!dp) {
+            return {
+              ok: false,
+              status: 'error',
+              error:
+                "the scroll target's position on the page could not be read (it may " +
+                'have no layout box, or its frame is hidden or scrolled away). Nothing ' +
+                'was dispatched; scroll by coordinate, or scroll_to an element inside ' +
+                'the pane.',
+              data: {
+                action: 'scroll',
+                ...(target ? { target } : {}),
+                ...selectorFacts,
+                input: 'none',
+              },
+            }
+          }
+          at = dp
+          wheelTarget = elementSession
+          scrollBaseline = await scrollState(elementSession, objectId)
+        } else {
+          at = pointFrom(a.coordinate) ?? (await viewportCentre(tabId, budgetDeadline))
+          scrollBaseline = await scrollState(tabId, null)
+        }
+        await trustedWheel(wheelTarget, at, { x: deltaX, y: deltaY }, modifiers)
         inputMode = 'trusted'
         extra.scrolled = { direction, amount_px: amount }
         break
@@ -3708,6 +3848,21 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   if (probe && !budgetSpent(budgetDeadline)) {
     const tally = await probe.tally()
     if (tally !== null) extra.dom_mutations = tally
+  }
+  // scroll_moved (#203): the same scroller is re-read after settle (smooth
+  // scrolling animates), and the delta is the verb's verification: {0,0}
+  // is a MEASURED nothing-moved (end of scroll, or a wheel the page
+  // ignored), absence means unmeasured. A scroller-kind mismatch between
+  // the reads (the layout changed underneath) is unmeasured, not a guess.
+  if (scrollBaseline && !budgetSpent(budgetDeadline)) {
+    const after = await scrollState(objectId ? elementSession : tabId, objectId)
+    if (after && after.d === scrollBaseline.d) {
+      extra.scroll_moved = {
+        dx: after.l - scrollBaseline.l,
+        dy: after.t - scrollBaseline.t,
+        scroller: after.d ? 'document' : 'container',
+      }
+    }
   }
   const data = await buildVerification({
     action: a.action,
