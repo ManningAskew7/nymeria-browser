@@ -68,6 +68,13 @@ function installCdpMock(opts: MockOpts = {}) {
         if (fn.includes('checkVisibility')) {
           return { result: { value: { connected: true, textEntry: false, visible: true } } }
         }
+        // The scroll baseline (#203): dispatch point at the frame-local
+        // rect origin (mirroring the geometry answer below), nothing
+        // measurable. Before getBoundingClientRect, whose marker the
+        // baseline body also contains.
+        if (fn.includes('__nymScroll')) {
+          return { result: { value: { p: { x: local.x, y: local.y }, c: null, d: null } } }
+        }
         if (fn.includes('getBoundingClientRect')) {
           return { result: { value: local } }
         }
@@ -218,8 +225,30 @@ describe('frame input dispatch', () => {
     // The wheel rides the same delivery channel the click was measured to
     // need: root-session input never reaches OOPIF content, so a wheel
     // meant for a pane inside the frame must dispatch on the frame session
-    // in ITS viewport space.
+    // in ITS viewport space. The scroll_moved read pair rides that same
+    // session too: a root-session after-read would measure the wrong
+    // document.
     const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1]
+      const params = (args[2] ?? {}) as { functionDeclaration?: string; expression?: string }
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        String(params.functionDeclaration ?? '').includes('__nymScroll')
+      ) {
+        return { result: { value: { p: { x: 30, y: 40 }, c: { t: 0, l: 0 }, d: { t: 0, l: 0 } } } }
+      }
+      if (
+        method === 'Runtime.evaluate' &&
+        String(params.expression ?? '').includes('__nymScroll') &&
+        !String(params.expression ?? '').includes('scrollingElement')
+      ) {
+        return { result: { value: { c: { t: 200, l: 0 }, d: { t: 0, l: 0 } } } }
+      }
+      return base(...args)
+    })
     await attachFrame()
     setRefs(TAB, new Map([['e1', { backendNodeId: 7, frameTargetId: FRAME_TARGET, role: 'button', name: 'Pay' }]]), TAB_URL)
 
@@ -235,6 +264,17 @@ describe('frame input dispatch', () => {
     expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(
       'https://pay.example/card',
     )
+    // The FRAME's pane moved and the payload measured it there.
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 200,
+      scroller: 'container',
+    })
+    const after = cdp.mock.calls.find((c) => {
+      const e = String((c[2] as { expression?: string }).expression ?? '')
+      return c[1] === 'Runtime.evaluate' && e.includes('__nymScroll') && !e.includes('scrollingElement')
+    })
+    expect(after?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
   })
 
   it('dispatches a main-document click on the root session, un-offset', async () => {

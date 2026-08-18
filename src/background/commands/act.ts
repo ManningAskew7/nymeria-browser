@@ -1897,10 +1897,12 @@ function sameFocusFrameUrl(frameTreeUrl: string, focusUrl: string): boolean {
  * Returns a `frameId`-carrying root target: `debuggee()` ignores `frameId`,
  * so trusted keystrokes keep riding the shared session exactly as before and
  * ONLY the probe's document moves. `url` is the CONFIRMED frame's URL from
- * the CDP frame tree (null when the scan falls back to the root): the
- * payload's `resolved_frame` claim, sourced from the browser's own record
- * rather than the in-page focus read, which both truncates its URL and is
- * only a hint about WHICH frame to confirm (#201 review).
+ * the CDP frame tree (undefined when the scan falls back to the root, null
+ * when the confirmed frame's recorded URL is empty: the payload claim's
+ * three states, #203): the payload's `resolved_frame` claim, sourced from
+ * the browser's own record rather than the in-page focus read, which both
+ * truncates its URL and is only a hint about WHICH frame to confirm (#201
+ * review).
  */
 async function localFrameHoldingFocus(
   tabId: number,
@@ -2017,82 +2019,196 @@ async function keyboardSessionForFocus(
     : { session: tabId, frameUrl: undefined }
 }
 
-/** What a wheel would move, read before and after a scroll (#203). For a
- * targeted scroll: the element's nearest scrollable ancestor (self
- * included; computed-overflow gated so an overflow:visible giant does not
- * masquerade as a scroller), falling back to the document's scrolling
- * element. `d` says which kind answered. Runs against the probe-world
- * object handle, so a page cannot script the number. One honest limit,
- * docstring-taught: only the NEAREST scroller and the document are
- * measured, so a wheel that moved some other pane reads as {0,0}. */
-const SCROLL_STATE_FN = `function(){
+/** The scroll probes' shared preamble (#203 review round). `document`'s
+ * named-property getter has LegacyOverrideBuiltIns, so a bare
+ * `document.scrollingElement` is forgeable by an <img
+ * name="scrollingElement"> in EVERY world, isolated included (worlds.ts
+ * states the rule; extract_text.ts pins the same class to a fixed
+ * prototype): every document.* lookup here rides a prototype-chain getter
+ * instead. Starting at the instance's PROTO skips both the instance's own
+ * properties and the named-getter interception (the two forgery surfaces;
+ * in-world prototypes themselves are pristine), while finding the real
+ * accessor wherever the implementation hung it. `doc` is the document's
+ * scrolling element. */
+const SCROLL_DOC_SNIPPET = `
+  var read = function (name, obj) {
+    var p = Object.getPrototypeOf(obj);
+    while (p) {
+      var d = Object.getOwnPropertyDescriptor(p, name);
+      if (d && d.get) return d.get.call(obj);
+      p = Object.getPrototypeOf(p);
+    }
+    return undefined;
+  };
+  var docEl = read('documentElement', document);
+  var bodyEl = read('body', document);
+  var doc = read('scrollingElement', document) || docEl;`
+
+/** The one pre-wheel read for a TARGETED scroll (#203): the dispatch point
+ * and the baseline offsets, and the registration that makes the after-read
+ * honest. Three answers in one round trip:
+ *
+ * `p` is where the wheel can be dispatched: the centre of the element's
+ * VIEWPORT-VISIBLE region, not its geometric centre, because wheel input
+ * is positional: a rect below the fold has a centre, and a wheel at that
+ * off-screen point scrolls whatever happens to be there instead (review
+ * round). `{off: true}` says the element has layout but no visible region,
+ * which the caller refuses rather than wheels.
+ *
+ * `c`/`d` are the baseline offsets of the nearest scrollable ancestor
+ * (self included; computed-overflow gated so an overflow:visible giant is
+ * not a scroller; crosses shadow boundaries via the host hop) and of the
+ * document's scrolling element.
+ *
+ * The resolved ELEMENTS ride a registry in this world (the delivery
+ * probe's reg pattern), so the after-read measures the SAME scrollers: a
+ * re-walk could resolve a DIFFERENT container (settle-time hydration
+ * making a wrapper scrollable) and subtract offsets of two different
+ * elements into a fabricated delta (review round). */
+const SCROLL_BASE_FN = `function(id){
+  ${SCROLL_DOC_SNIPPET}
+  var p = null;
+  try {
+    var r = this.getBoundingClientRect();
+    if (r && r.width > 0 && r.height > 0) {
+      var x0 = Math.max(r.left, 0), y0 = Math.max(r.top, 0);
+      var x1 = Math.min(r.right, window.innerWidth), y1 = Math.min(r.bottom, window.innerHeight);
+      p = (x1 - x0 < 4 || y1 - y0 < 4) ? { off: true } : { x: (x0 + x1) / 2, y: (y0 + y1) / 2 };
+    }
+  } catch (e) { p = null; }
+  var c = null;
   try {
     var n = this;
     while (n) {
       var scrollable = (n.scrollHeight > n.clientHeight + 1) || (n.scrollWidth > n.clientWidth + 1);
-      if (scrollable && n !== document.documentElement && n !== document.body) {
+      if (scrollable && n !== docEl && n !== bodyEl) {
         var cs = getComputedStyle(n);
         var oy = cs.overflowY, ox = cs.overflowX;
         if (oy === 'auto' || oy === 'scroll' || oy === 'overlay' ||
-            ox === 'auto' || ox === 'scroll' || ox === 'overlay') {
-          return { t: n.scrollTop, l: n.scrollLeft, d: false };
-        }
+            ox === 'auto' || ox === 'scroll' || ox === 'overlay') { c = n; break; }
       }
-      n = n.parentElement;
+      n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
     }
-  } catch (e) {}
+  } catch (e) { c = null; }
   try {
-    var se = document.scrollingElement || document.documentElement;
-    return { t: se.scrollTop, l: se.scrollLeft, d: true };
-  } catch (e) { return null; }
+    var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
+    reg[id] = { c: c, d: doc };
+  } catch (e) {}
+  return {
+    p: p,
+    c: c ? { t: c.scrollTop, l: c.scrollLeft } : null,
+    d: doc ? { t: doc.scrollTop, l: doc.scrollLeft } : null
+  };
 }`
 
-const SCROLL_STATE_EXPRESSION = `(function(){
+/** The targetless twin: the document is the only watchable scroller, read
+ * and registered in the probe world the same way. */
+function scrollBaseExpression(id: string): string {
+  return `(function(){
+  ${SCROLL_DOC_SNIPPET}
   try {
-    var se = document.scrollingElement || document.documentElement;
-    return { t: se.scrollTop, l: se.scrollLeft, d: true };
-  } catch (e) { return null; }
+    var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
+    reg[${JSON.stringify(id)}] = { c: null, d: doc };
+  } catch (e) {}
+  return { p: null, c: null, d: doc ? { t: doc.scrollTop, l: doc.scrollLeft } : null };
 })()`
-
-interface ScrollState {
-  t: number
-  l: number
-  d: boolean
 }
 
-async function scrollState(session: Cdp, objectId: string | null): Promise<ScrollState | null> {
+/** Post-settle re-read of the REGISTERED scrollers, never a re-walk. A
+ * container detached by settle-time churn answers null (its offsets would
+ * be stale garbage); a missing slot (world died, navigation) answers null
+ * wholesale, which keeps scroll_moved absent. */
+function scrollAfterExpression(id: string): string {
+  return `(function(){
+  var reg = globalThis.__nymScroll;
+  var s = reg && reg[${JSON.stringify(id)}];
+  if (reg) { delete reg[${JSON.stringify(id)}]; }
+  if (!s) return null;
+  var c = s.c && s.c.isConnected ? { t: s.c.scrollTop, l: s.c.scrollLeft } : null;
+  var d = s.d && s.d.isConnected ? { t: s.d.scrollTop, l: s.d.scrollLeft } : null;
+  return { c: c, d: d };
+})()`
+}
+
+interface ScrollPair {
+  t: number
+  l: number
+}
+
+interface ScrollSnap {
+  p: { x: number; y: number } | { off: true } | null
+  c: ScrollPair | null
+  d: ScrollPair | null
+}
+
+function scrollPair(v: unknown): ScrollPair | null {
+  const o = v as { t?: unknown; l?: unknown } | null | undefined
+  return o && typeof o.t === 'number' && typeof o.l === 'number' ? { t: o.t, l: o.l } : null
+}
+
+function parseScrollSnap(v: unknown): ScrollSnap | null {
+  if (!v || typeof v !== 'object') return null
+  const o = v as { p?: unknown; c?: unknown; d?: unknown }
+  const raw = o.p as { x?: unknown; y?: unknown; off?: unknown } | null | undefined
+  const p =
+    raw && typeof raw.x === 'number' && typeof raw.y === 'number'
+      ? { x: raw.x, y: raw.y }
+      : raw && raw.off === true
+        ? ({ off: true } as const)
+        : null
+  return { p, c: scrollPair(o.c), d: scrollPair(o.d) }
+}
+
+/** Slot names for the scroll registry, unique per act within a worker. */
+let scrollSlot = 0
+
+async function scrollBase(
+  session: Cdp,
+  objectId: string,
+  id: string,
+  deadline: number | null,
+): Promise<ScrollSnap | null> {
   try {
-    if (objectId) {
-      const v = await callOn<{ t?: unknown; l?: unknown; d?: unknown } | null>(
-        session,
-        objectId,
-        SCROLL_STATE_FN,
-      )
-      return v && typeof v.t === 'number' && typeof v.l === 'number'
-        ? { t: v.t, l: v.l, d: v.d === true }
-        : null
-    }
-    // A targetless scroll: the document is the only measurable scroller.
-    return await withProbeWorld(session, async (contextId) => {
-      const resp = await sendCommand<{
-        result?: { value?: { t?: unknown; l?: unknown } | null }
-        exceptionDetails?: unknown
-      }>(session, 'Runtime.evaluate', {
-        expression: SCROLL_STATE_EXPRESSION,
-        contextId,
-        returnByValue: true,
-      })
-      if (resp.exceptionDetails) return null
-      const v = resp.result?.value
-      return v && typeof v.t === 'number' && typeof v.l === 'number'
-        ? { t: v.t, l: v.l, d: true }
-        : null
-    })
+    const v = await callOn<unknown>(
+      session,
+      objectId,
+      SCROLL_BASE_FN,
+      [id],
+      // #162: a pre-dispatch read must not ride the full CDP deadline past
+      // a spent budget (viewportCentre documents the same hazard).
+      deadline === null ? {} : { deadlineMs: clampToDeadline(15_000, deadline) },
+    )
+    return parseScrollSnap(v)
   } catch {
-    // Unmeasurable is a state, not an error: scroll_moved simply stays
-    // absent (never a fake zero).
+    // Unreadable is a refusal at the call site, not an error here.
     return null
   }
+}
+
+async function scrollBaseTargetless(
+  tabId: number,
+  id: string,
+  deadline: number | null,
+): Promise<ScrollSnap | null> {
+  if (budgetSpent(deadline)) return null
+  const v = await evaluateInProbeWorld<unknown>(
+    tabId,
+    scrollBaseExpression(id),
+    deadline === null ? {} : { deadlineMs: clampToDeadline(15_000, deadline) },
+  )
+  return v === undefined ? null : parseScrollSnap(v)
+}
+
+async function scrollAfter(
+  session: Cdp,
+  id: string,
+): Promise<{ c: ScrollPair | null; d: ScrollPair | null } | null> {
+  const v = await evaluateInProbeWorld<{ c?: unknown; d?: unknown }>(
+    session,
+    scrollAfterExpression(id),
+  )
+  if (!v || typeof v !== 'object') return null
+  return { c: scrollPair(v.c), d: scrollPair(v.d) }
 }
 
 async function stillConnected(session: Cdp, objectId: string | null): Promise<boolean | null> {
@@ -2794,7 +2910,8 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   const extra: Record<string, unknown> = {}
   /** The pre-wheel scroll baseline (#203); non-null only for `scroll`,
    *  compared post-settle so smooth scrolling has finished animating. */
-  let scrollBaseline: ScrollState | null = null
+  let scrollBaseline: { c: ScrollPair | null; d: ScrollPair | null } | null = null
+  let scrollSlotId: string | null = null
   // Only ever set for a coordinate act: a ref act already names its target,
   // and `target_exists` answers the same question for it more directly. On a
   // drag the point is the SOURCE, so it is named as such rather than left to
@@ -3356,15 +3473,60 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         // exact geometry shape), which scrolls the scrollable CONTAINER
         // under it, the inner-pane case that used to require coordinates.
         // No activation gates apply: wheeling over a disabled or covered
-        // element is how scrolling works.
+        // element is how scrolling works. And deliberately NO scrollIntoView
+        // first, unlike every other point-dispatching verb: bringing the
+        // target into view would move the very offsets scroll_moved is
+        // about to measure. Do not reintroduce it.
         let at: Point
         let wheelTarget: Cdp = tabId
         if (objectId) {
-          const local = (await elementGeometry(elementSession, objectId))?.point ?? null
-          const dp = local
-            ? await dispatchPointFor(elementSession, elementBackendNodeId, local)
-            : null
+          scrollSlotId = `s${++scrollSlot}`
+          const base = await scrollBase(elementSession, objectId, scrollSlotId, budgetDeadline)
+          if (!base || base.p === null) {
+            return {
+              ok: false,
+              status: 'error',
+              error:
+                "the scroll target's position on the page could not be read (it may " +
+                'have no layout box, or its frame is hidden or scrolled away). Nothing ' +
+                'was dispatched; scroll by coordinate, or scroll_to an element inside ' +
+                'the pane.',
+              data: {
+                action: 'scroll',
+                ...(target ? { target } : {}),
+                ...selectorFacts,
+                input: 'none',
+              },
+            }
+          }
+          if ('off' in base.p) {
+            // Wheel input is positional: an off-screen point would scroll
+            // whatever happens to be there, and the follow-up read would
+            // then report an honest-looking measured zero about the pane
+            // the wheel never reached (review round).
+            return {
+              ok: false,
+              status: 'error',
+              error:
+                'the scroll target is entirely outside the viewport, and wheel input ' +
+                'is positional: a wheel at its off-screen point would scroll whatever ' +
+                'is there instead. Nothing was dispatched; scroll_to the element ' +
+                'first, or scroll by coordinate.',
+              data: {
+                action: 'scroll',
+                ...(target ? { target } : {}),
+                ...selectorFacts,
+                input: 'none',
+              },
+            }
+          }
+          const dp = await dispatchPointFor(elementSession, elementBackendNodeId, base.p)
           if (!dp) {
+            // Same-process frame with no readable quads: the element has
+            // layout in its frame but no dispatch-space position. One
+            // residual gap, recorded: the visible-region gate above runs in
+            // the FRAME's viewport, so a frame itself scrolled off the page
+            // still dispatches at the quad centre wherever that lands.
             return {
               ok: false,
               status: 'error',
@@ -3383,10 +3545,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           }
           at = dp
           wheelTarget = elementSession
-          scrollBaseline = await scrollState(elementSession, objectId)
+          scrollBaseline = base.c || base.d ? { c: base.c, d: base.d } : null
         } else {
           at = pointFrom(a.coordinate) ?? (await viewportCentre(tabId, budgetDeadline))
-          scrollBaseline = await scrollState(tabId, null)
+          scrollSlotId = `s${++scrollSlot}`
+          const base = await scrollBaseTargetless(tabId, scrollSlotId, budgetDeadline)
+          scrollBaseline = base && (base.c || base.d) ? { c: base.c, d: base.d } : null
         }
         await trustedWheel(wheelTarget, at, { x: deltaX, y: deltaY }, modifiers)
         inputMode = 'trusted'
@@ -3849,18 +4013,35 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     const tally = await probe.tally()
     if (tally !== null) extra.dom_mutations = tally
   }
-  // scroll_moved (#203): the same scroller is re-read after settle (smooth
-  // scrolling animates), and the delta is the verb's verification: {0,0}
-  // is a MEASURED nothing-moved (end of scroll, or a wheel the page
-  // ignored), absence means unmeasured. A scroller-kind mismatch between
-  // the reads (the layout changed underneath) is unmeasured, not a guess.
-  if (scrollBaseline && !budgetSpent(budgetDeadline)) {
-    const after = await scrollState(objectId ? elementSession : tabId, objectId)
-    if (after && after.d === scrollBaseline.d) {
-      extra.scroll_moved = {
-        dx: after.l - scrollBaseline.l,
-        dy: after.t - scrollBaseline.t,
-        scroller: after.d ? 'document' : 'container',
+  // scroll_moved (#203): the SAME registered scrollers are re-read after
+  // settle. Post-settle is the best available moment, not a guarantee:
+  // settle is DOM quiescence and offsets mutate nothing, so a slow smooth
+  // scroll can still be mid-flight at the read (docstring-taught as a rare
+  // {0,0}/partial cause). The container's delta when it moved; else the
+  // document's, which is where a wheel CHAINS when the pane is at its end
+  // (review round: reporting the untouched container's zero there called a
+  // page that visibly scrolled a measured nothing); else a measured zero
+  // naming the container when one was watched. Absence means a read
+  // failed, never a guess.
+  if (scrollBaseline && scrollSlotId && !budgetSpent(budgetDeadline)) {
+    const after = await scrollAfter(objectId ? elementSession : tabId, scrollSlotId)
+    if (after) {
+      const cd =
+        scrollBaseline.c && after.c
+          ? { dx: after.c.l - scrollBaseline.c.l, dy: after.c.t - scrollBaseline.c.t }
+          : null
+      const dd =
+        scrollBaseline.d && after.d
+          ? { dx: after.d.l - scrollBaseline.d.l, dy: after.d.t - scrollBaseline.d.t }
+          : null
+      if (cd && (cd.dx !== 0 || cd.dy !== 0)) {
+        extra.scroll_moved = { ...cd, scroller: 'container' }
+      } else if (dd && (dd.dx !== 0 || dd.dy !== 0)) {
+        extra.scroll_moved = { ...dd, scroller: 'document' }
+      } else if (cd) {
+        extra.scroll_moved = { dx: 0, dy: 0, scroller: 'container' }
+      } else if (dd) {
+        extra.scroll_moved = { dx: 0, dy: 0, scroller: 'document' }
       }
     }
   }
@@ -3941,4 +4122,7 @@ export const __test = {
   OPENS_FILE_CHOOSER,
   DESCRIBE_ELEMENT,
   SELECTOR_MISS,
+  SCROLL_BASE_FN,
+  scrollBaseExpression,
+  scrollAfterExpression,
 }

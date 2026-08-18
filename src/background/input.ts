@@ -1,5 +1,5 @@
 import { budgetSpent } from './budget'
-import { sendCommand, type Cdp } from './debuggerSession'
+import { sendCommand, type Cdp, type SendCommandOpts } from './debuggerSession'
 import { cssMatchCountExpression } from './shadowWalk'
 
 /**
@@ -233,14 +233,20 @@ export async function callOn<T = unknown>(
   objectId: string,
   fn: string,
   args: unknown[] = [],
+  opts: SendCommandOpts = {},
 ): Promise<T> {
-  const r = await sendCommand<{ result: { value?: T } }>(target, 'Runtime.callFunctionOn', {
-    objectId,
-    functionDeclaration: fn,
-    arguments: args.map((v) => ({ value: v })),
-    returnByValue: true,
-    awaitPromise: true,
-  })
+  const r = await sendCommand<{ result: { value?: T } }>(
+    target,
+    'Runtime.callFunctionOn',
+    {
+      objectId,
+      functionDeclaration: fn,
+      arguments: args.map((v) => ({ value: v })),
+      returnByValue: true,
+      awaitPromise: true,
+    },
+    opts,
+  )
   return r.result.value as T
 }
 

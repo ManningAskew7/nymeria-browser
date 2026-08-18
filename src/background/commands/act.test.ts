@@ -61,11 +61,25 @@ interface MockOptions {
   /** Thrown for the tally read; defaults to deliveryReadThrows (a dead
    * context kills the read and the tally alike). */
   deliveryTallyThrows?: string
-  /** Sequential answers to the scroll-offset reads (#203): the baseline
-   *  first, then the post-settle re-read. Default empty, so every read
-   *  answers null (unmeasurable) and scroll_moved stays absent unless a
-   *  test scripts a pair. */
-  scrollStates?: Array<{ t: number; l: number; d: boolean } | null>
+  /** The one pre-wheel scroll read (#203): the dispatch point `p` (the
+   *  element's visible-region centre, `{off: true}` for a laid-out but
+   *  off-viewport element, null for no layout box) plus the baseline
+   *  offsets of the registered container/document scrollers. null models
+   *  the whole read failing. Default: the point matches the old geometry
+   *  centre and nothing is measurable, so scroll_moved stays absent
+   *  unless a test opts in. */
+  scrollBase?: {
+    p?: { x: number; y: number } | { off: true } | null
+    c?: { t: number; l: number } | null
+    d?: { t: number; l: number } | null
+  } | null
+  /** The post-settle re-read of the STORED scrollers (a distinct fixture
+   *  from `scrollBase` on a distinct marker, so a cross-wired read goes
+   *  red). null models a dead world or missing slot. */
+  scrollAfter?: {
+    c?: { t: number; l: number } | null
+    d?: { t: number; l: number } | null
+  } | null
   bodyText?: string
   selectMatches?: boolean
   /** false models a tab where the delivery probe's world cannot be created. */
@@ -191,7 +205,8 @@ function installCdpMock(opts: MockOptions = {}) {
     settleValue = 'quiet',
     deliveryTally = 3,
     deliveryTallyThrows = opts.deliveryReadThrows,
-    scrollStates = [],
+    scrollBase = { p: { x: 50, y: 60 }, c: null, d: null },
+    scrollAfter = null,
     bodyText = '',
     selectMatches = true,
     deliveryWorld = true,
@@ -238,10 +253,6 @@ function installCdpMock(opts: MockOptions = {}) {
   const TRUST_CONTEXT = 88
   let dispatched = false
   let inputEvents = 0
-  // Consumed in read order by BOTH scroll-state shapes (the targeted
-  // ancestor walk and the targetless document read): one scroll makes at
-  // most two reads, baseline then after, whichever shape it uses.
-  const scrollQueue = [...scrollStates]
 
   // Every method that needs the renderer's main thread. A page suspended by its
   // own dialog answers NONE of them, which is what makes a single-method hang
@@ -323,15 +334,15 @@ function installCdpMock(opts: MockOptions = {}) {
       if (fn.includes("pointerEvents === 'none'")) {
         return { result: { value: pointerEventsNone && !pointerEventsClearsBeforeRefusal } }
       }
+      // The scroll baseline (#203): one call answers the dispatch point,
+      // the baseline offsets, and the registration. Routed on the registry
+      // name, unique to it, and BEFORE getBoundingClientRect, whose marker
+      // the baseline body also contains.
+      if (fn.includes('__nymScroll')) {
+        return { result: { value: scrollBase } }
+      }
       if (fn.includes('getBoundingClientRect')) {
         return { result: { value: geometry } }
-      }
-      // The scroll-offset read (#203): SCROLL_STATE_FN walks to the nearest
-      // scrollable ancestor and falls back to document.scrollingElement,
-      // its unique marker. Answered from the sequential fixture; exhausted
-      // or unset means unmeasurable, which the code must treat as absence.
-      if (fn.includes('scrollingElement')) {
-        return { result: { value: scrollQueue.shift() ?? null } }
       }
       if (fn.includes('const isFile =')) return { result: { value: isFileInput } }
       if (fn.includes('isContentEditable')) return { result: { value: textEntry } }
@@ -409,7 +420,7 @@ function installCdpMock(opts: MockOptions = {}) {
         expression.includes('elementFromPoint') ||
         expression.includes('innerText.includes') ||
         expression.includes('innerWidth') ||
-        expression.includes('scrollingElement') ||
+        expression.includes('__nymScroll') ||
         expression.includes('document.querySelector(') ||
         expression.includes('document.evaluate(')
       if (mustBeInWorld && params.contextId !== TRUST_CONTEXT) {
@@ -423,10 +434,16 @@ function installCdpMock(opts: MockOptions = {}) {
         return { result: { value: { description: pointDescription, opensFileChooser: isFileInput } } }
       }
       if (expression.includes('readyState')) return { result: { value: settleValue } }
-      // The targetless scroll-offset twin: the document is the only
-      // measurable scroller, read in the probe world.
-      if (expression.includes('scrollingElement')) {
-        return { result: { value: scrollQueue.shift() ?? null } }
+      // The scroll reads (#203). Base and after are DISTINCT fixtures on
+      // distinct markers (only the baseline contains the document-scroller
+      // lookup), so a cross-wired read (the after-read re-running the
+      // lookup, or the baseline hitting the registry read) answers the
+      // wrong fixture and goes red: the first cut's shared queue hid
+      // exactly that (review round).
+      if (expression.includes('__nymScroll')) {
+        return expression.includes('scrollingElement')
+          ? { result: { value: scrollBase && { ...scrollBase, p: null, c: null } } }
+          : { result: { value: scrollAfter } }
       }
       if (expression.includes('activeElement')) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
@@ -4613,10 +4630,8 @@ describe('scroll at a ref (#203)', () => {
 
   it('a targetless scroll still wheels the viewport centre with no target echo', async () => {
     const cdp = installCdpMock({
-      scrollStates: [
-        { t: 0, l: 0, d: true },
-        { t: 480, l: 0, d: true },
-      ],
+      scrollBase: { d: { t: 0, l: 0 } },
+      scrollAfter: { c: null, d: { t: 480, l: 0 } },
     })
 
     const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
@@ -4633,11 +4648,9 @@ describe('scroll at a ref (#203)', () => {
 
   it('scroll_moved reports the container delta for an inner-pane ref scroll', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
-    installCdpMock({
-      scrollStates: [
-        { t: 10, l: 0, d: false },
-        { t: 310, l: 5, d: false },
-      ],
+    const cdp = installCdpMock({
+      scrollBase: { p: { x: 50, y: 60 }, c: { t: 10, l: 0 }, d: { t: 0, l: 0 } },
+      scrollAfter: { c: { t: 310, l: 5 }, d: { t: 0, l: 0 } },
     })
 
     const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
@@ -4648,15 +4661,50 @@ describe('scroll at a ref (#203)', () => {
       dy: 300,
       scroller: 'container',
     })
+    // The read-pair's shape is pinned: the baseline rides the element's own
+    // handle (callFunctionOn on the probe-world objectId), the after-read
+    // rides the registry in the probe world, never a fresh document lookup.
+    const baseline = cdp.mock.calls.find(
+      (c) =>
+        c[1] === 'Runtime.callFunctionOn' &&
+        String((c[2] as { functionDeclaration?: string }).functionDeclaration).includes(
+          '__nymScroll',
+        ),
+    )
+    expect((baseline?.[2] as { objectId?: string }).objectId).toBe('obj-1')
+    const after = cdp.mock.calls.find((c) => {
+      const e = String((c[2] as { expression?: string }).expression ?? '')
+      return c[1] === 'Runtime.evaluate' && e.includes('__nymScroll') && !e.includes('scrollingElement')
+    })
+    expect((after?.[2] as { contextId?: number }).contextId).toBe(88)
+  })
+
+  it('a wheel that chains off a pane at its end reports the document, not a fake container zero', async () => {
+    // The pane is at its bottom, so the wheel CHAINS to the page and the
+    // page visibly scrolls. Reporting the untouched container's {0,0} as
+    // "measured nothing moved" would be the exact dishonest class this
+    // field exists to remove (review round).
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      scrollBase: { p: { x: 50, y: 60 }, c: { t: 800, l: 0 }, d: { t: 0, l: 0 } },
+      scrollAfter: { c: { t: 800, l: 0 }, d: { t: 500, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 500,
+      scroller: 'document',
+    })
   })
 
   it('a wheel the page ignored reports a measured zero, never silence', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({
-      scrollStates: [
-        { t: 120, l: 0, d: false },
-        { t: 120, l: 0, d: false },
-      ],
+      scrollBase: { p: { x: 50, y: 60 }, c: { t: 120, l: 0 }, d: { t: 40, l: 0 } },
+      scrollAfter: { c: { t: 120, l: 0 }, d: { t: 40, l: 0 } },
     })
 
     const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'up' })
@@ -4669,7 +4717,27 @@ describe('scroll at a ref (#203)', () => {
     })
   })
 
-  it('scroll_moved stays absent when the offsets cannot be read', async () => {
+  it('a container detached during settle falls back to the document, never stale offsets', async () => {
+    // The registry read answers null for a disconnected container (its
+    // offsets would be garbage); the document, watched from the same
+    // baseline, still reports honestly.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      scrollBase: { p: { x: 50, y: 60 }, c: { t: 100, l: 0 }, d: { t: 0, l: 0 } },
+      scrollAfter: { c: null, d: { t: 0, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 0,
+      scroller: 'document',
+    })
+  })
+
+  it('scroll_moved stays absent when nothing was measurable at the baseline', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
 
@@ -4679,15 +4747,11 @@ describe('scroll at a ref (#203)', () => {
     expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
   })
 
-  it('scroll_moved stays absent when the scroller identity changed between reads', async () => {
-    // A container baseline and a document after-read are offsets of two
-    // DIFFERENT elements; subtracting them fabricates a delta.
+  it('scroll_moved stays absent when the after-read fails', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({
-      scrollStates: [
-        { t: 0, l: 0, d: false },
-        { t: 100, l: 0, d: true },
-      ],
+      scrollBase: { p: { x: 50, y: 60 }, c: { t: 10, l: 0 }, d: { t: 0, l: 0 } },
+      scrollAfter: null,
     })
 
     const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
@@ -4698,7 +4762,7 @@ describe('scroll at a ref (#203)', () => {
 
   it('a ref scroll whose position cannot be read refuses without dispatching', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
-    const cdp = installCdpMock({ geometry: null })
+    const cdp = installCdpMock({ scrollBase: null })
 
     const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
 
@@ -4706,6 +4770,180 @@ describe('scroll at a ref (#203)', () => {
     expect(String(result.error)).toContain('position on the page could not be read')
     expect((result.data as { input?: string }).input).toBe('none')
     expect(cdp.mock.calls.some((c) => String(c[1]).startsWith('Input.'))).toBe(false)
+  })
+
+  it('a laid-out but off-viewport ref refuses: wheel input is positional', async () => {
+    // The old shape wheeled at the off-screen geometric centre, scrolled
+    // whatever happened to be there (usually the root), and then reported
+    // an honest-looking measured zero about the pane the wheel never
+    // reached (review round).
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    const cdp = installCdpMock({ scrollBase: { p: { off: true } } })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toContain('outside the viewport')
+    expect((result.data as { input?: string }).input).toBe('none')
+    expect(cdp.mock.calls.some((c) => String(c[1]).startsWith('Input.'))).toBe(false)
+  })
+})
+
+/**
+ * The scroll probe strings run for real here (#160's lesson: a probe string
+ * no test ever executes is unverified logic wearing a tested function's
+ * name). The DOM env computes no layout, so scroll metrics and rects are
+ * defined per element.
+ */
+describe('scroll probes (executed in-page)', () => {
+  interface Pair {
+    t: number
+    l: number
+  }
+  const runBase = (el: Element, id: string) =>
+    (
+      new Function(`return (${__test.SCROLL_BASE_FN}).apply(this, arguments)`) as (
+        this: Element,
+        id: string,
+      ) => { p: { x: number; y: number } | { off: true } | null; c: Pair | null; d: Pair | null }
+    ).call(el, id)
+  const runAfter = (id: string) =>
+    (
+      new Function(`return (${__test.scrollAfterExpression(id)})`) as () => {
+        c: Pair | null
+        d: Pair | null
+      } | null
+    )()
+
+  function metrics(el: Element, over: { sh?: number; ch?: number; st?: number } = {}) {
+    Object.defineProperty(el, 'scrollHeight', { value: over.sh ?? 500, configurable: true })
+    Object.defineProperty(el, 'clientHeight', { value: over.ch ?? 200, configurable: true })
+    Object.defineProperty(el, 'scrollTop', {
+      value: over.st ?? 0,
+      configurable: true,
+      writable: true,
+    })
+  }
+
+  function rect(el: Element, r: { left: number; top: number; right: number; bottom: number }) {
+    ;(el as unknown as { getBoundingClientRect: () => unknown }).getBoundingClientRect = () => ({
+      left: r.left,
+      top: r.top,
+      right: r.right,
+      bottom: r.bottom,
+      width: r.right - r.left,
+      height: r.bottom - r.top,
+    })
+  }
+
+  beforeEach(() => {
+    document.body.innerHTML = ''
+    delete (globalThis as { __nymScroll?: unknown }).__nymScroll
+  })
+
+  it('finds the nearest overflow-auto ancestor, self excluded from doc roots, and registers it', () => {
+    document.body.innerHTML = '<div id="pane"><span id="target">x</span></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 40 })
+
+    const snap = runBase(document.getElementById('target') as Element, 'x1')
+
+    expect(snap.c).toEqual({ t: 40, l: 0 })
+    const reg = (globalThis as { __nymScroll?: Record<string, { c: unknown }> }).__nymScroll
+    expect(reg?.x1?.c).toBe(pane)
+  })
+
+  it('skips an overflow:visible giant: tall is not scrollable', () => {
+    document.body.innerHTML = '<div id="giant"><span id="target">x</span></div>'
+    metrics(document.getElementById('giant') as Element, { st: 40 })
+
+    const snap = runBase(document.getElementById('target') as Element, 'x2')
+
+    expect(snap.c).toBeNull()
+  })
+
+  it('the target itself can be the pane (self-inclusion)', () => {
+    document.body.innerHTML = '<div id="pane">x</div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'scroll'
+    metrics(pane, { st: 15 })
+
+    expect(runBase(pane, 'x3').c).toEqual({ t: 15, l: 0 })
+  })
+
+  it('body is never the container, even when scrollable', () => {
+    document.body.innerHTML = '<span id="target">x</span>'
+    ;(document.body as HTMLElement).style.overflowY = 'auto'
+    metrics(document.body, { st: 70 })
+
+    expect(runBase(document.getElementById('target') as Element, 'x4').c).toBeNull()
+  })
+
+  it('crosses a shadow boundary to a host-side scroller', () => {
+    document.body.innerHTML = '<div id="pane"><div id="host"></div></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 25 })
+    const shadow = (document.getElementById('host') as Element).attachShadow({ mode: 'open' })
+    shadow.innerHTML = '<span id="inner">x</span>'
+
+    const snap = runBase(shadow.querySelector('#inner') as Element, 'x5')
+
+    expect(snap.c).toEqual({ t: 25, l: 0 })
+  })
+
+  it('an own-property scrollingElement forgery never reaches the document reading', () => {
+    // Document's named getter can shadow bare lookups in every world; the
+    // probe reads through the prototype getter, so an own property (the
+    // planted-name shape) cannot supply the number.
+    document.body.innerHTML = '<span id="target">x</span>'
+    const fake = document.createElement('div')
+    metrics(fake, { st: 999 })
+    Object.defineProperty(document, 'scrollingElement', { get: () => fake, configurable: true })
+    try {
+      const snap = runBase(document.getElementById('target') as Element, 'x6')
+      expect(snap.d?.t ?? 0).not.toBe(999)
+    } finally {
+      delete (document as { scrollingElement?: unknown }).scrollingElement
+    }
+  })
+
+  it('the after-read measures the REGISTERED container, and drops it once detached', () => {
+    document.body.innerHTML = '<div id="pane"><span id="target">x</span></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 40 })
+    const target = document.getElementById('target') as Element
+
+    runBase(target, 'x7')
+    ;(pane as unknown as { scrollTop: number }).scrollTop = 340
+    expect(runAfter('x7')?.c).toEqual({ t: 340, l: 0 })
+
+    runBase(target, 'x8')
+    pane.remove()
+    const after = runAfter('x8')
+    expect(after?.c).toBeNull()
+    expect(after?.d).not.toBeNull()
+  })
+
+  it('a missing slot answers null, never a fabricated pair', () => {
+    expect(runAfter('never-registered')).toBeNull()
+  })
+
+  it('the dispatch point is the visible-region centre, off:true past the fold, null with no box', () => {
+    document.body.innerHTML = '<span id="target">x</span>'
+    const target = document.getElementById('target') as Element
+    const vh = window.innerHeight
+
+    rect(target, { left: 0, top: vh - 68, right: 100, bottom: vh + 132 })
+    expect(runBase(target, 'x9').p).toEqual({ x: 50, y: vh - 34 })
+
+    rect(target, { left: 0, top: vh + 10, right: 100, bottom: vh + 210 })
+    expect(runBase(target, 'x10').p).toEqual({ off: true })
+
+    rect(target, { left: 0, top: 0, right: 0, bottom: 0 })
+    expect(runBase(target, 'x11').p).toBeNull()
   })
 })
 
