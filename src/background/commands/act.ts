@@ -427,6 +427,30 @@ function sameOriginAs(url: string, pageUrl: string | null): boolean | undefined 
 }
 
 /**
+ * The known-benign failure class (#202, from the #188 QA round: a
+ * LaunchDarkly EventSource "canceled" rode two act payloads as an apparent
+ * error, `same_origin: false` its only tell). A CROSS-ORIGIN request that
+ * was canceled (teardown, stream churn) or blocked by the user's own
+ * content blocker is routine page noise, not the act's story.
+ *
+ * Same-origin entries are NEVER tagged: a first-party cancel can be the
+ * very failure the payload exists to surface, and a first-party request
+ * eaten by a content blocker is genuinely notable. Unknown origin
+ * (unparseable either side) says nothing, so it also never tags: a benign
+ * claim needs the fact it rests on. An error-status response (a 500 whose
+ * stream was then canceled) is a REAL failure wearing a cancel, so it is
+ * never tagged either; a 2xx-then-canceled stream (the measured
+ * LaunchDarkly shape) is. Hedged key (`likely_benign`) because it is a
+ * classification, not a verdict; tagged entries still appear when the cap
+ * has room, ranked last.
+ */
+function likelyBenign(entry: { error?: string; status?: number }, sameOrigin: boolean | undefined): boolean {
+  if (sameOrigin !== false || !entry.error) return false
+  if (typeof entry.status === 'number' && entry.status >= 400) return false
+  return entry.error === 'canceled' || entry.error.includes('ERR_BLOCKED_BY_CLIENT')
+}
+
+/**
  * The capped failed-requests report, classified and ranked (#166, from the
  * 2026-08-15 QA round: a successful upload's payload carried five failed
  * third-party telemetry beacons in the field where a broken first-party POST
@@ -438,8 +462,9 @@ function sameOriginAs(url: string, pageUrl: string | null): boolean | undefined 
  * telemetry-shaped types, same-origin before cross-origin within the class.
  * Origin alone would demote a first-party API on its own api.* domain; type
  * alone would keep third-party fetch beacons; the combination plus the
- * visible annotations covers both. Most-recent wins within a rank, and the
- * final list reads chronologically.
+ * visible annotations covers both. The known-benign class (#202) demotes
+ * below everything else, telemetry included. Most-recent wins within a
+ * rank, and the final list reads chronologically.
  */
 function classifiedFailures(
   tabId: number,
@@ -449,9 +474,19 @@ function classifiedFailures(
   const raw = networkFailuresSince(tabId, since, FAILURE_RANK_POOL)
   const annotated = raw.map((e) => {
     const so = sameOriginAs(e.url, pageUrl)
+    const benign = likelyBenign(e, so)
     return {
-      entry: { ...e, ...(so === undefined ? {} : { same_origin: so }) },
-      rank: (TELEMETRY_TYPES.has(e.resource_type ?? '') ? 2 : 0) + (so === false ? 1 : 0),
+      entry: {
+        ...e,
+        ...(so === undefined ? {} : { same_origin: so }),
+        ...(benign ? { likely_benign: true } : {}),
+      },
+      // Benign outranks (sorts below) everything, telemetry included: a
+      // tagged entry must never crowd an untagged one out of the cap.
+      rank:
+        (TELEMETRY_TYPES.has(e.resource_type ?? '') ? 2 : 0) +
+        (so === false ? 1 : 0) +
+        (benign ? 4 : 0),
     }
   })
   annotated.sort((a, b) => a.rank - b.rank || b.entry.ts - a.entry.ts)
@@ -1395,6 +1430,13 @@ type TargetResolution =
       session: Cdp
       /** Stable target id of the owning cross-origin frame (refs only). */
       frameTargetId?: string
+      /** The owning frame's URL as currently recorded, from `locateFrame`
+       *  at resolution time (#201; distinct from RefTarget.frameUrl, the
+       *  MINT-time URL). Set only when the target resolved into a subframe,
+       *  so its absence on a resolved target MEANS the root document; the
+       *  payload's `resolved_frame` key inherits both the value and that
+       *  rule. */
+      liveFrameUrl?: string
       backendNodeId?: number
       mintRole?: string
       mintName?: string
@@ -1492,6 +1534,7 @@ async function resolveTarget(
     // its nodes and would tell a lying staleness story). A frame found
     // nowhere is genuinely gone.
     let session: Cdp = tabId
+    let liveFrameUrl: string | undefined
     if (resolution.frameTargetId) {
       const located = await locateFrame(tabId, resolution.frameTargetId)
       if (!located) {
@@ -1519,6 +1562,7 @@ async function resolveTarget(
         }
       }
       session = located.session
+      if (located.url) liveFrameUrl = located.url
     }
     try {
       const resolved = await resolveNodeInProbeWorld(session, resolution.backendNodeId)
@@ -1546,6 +1590,7 @@ async function resolveTarget(
         objectId: resolved.objectId,
         session,
         frameTargetId: resolution.frameTargetId,
+        liveFrameUrl,
         backendNodeId: resolution.backendNodeId,
         mintRole: resolution.role,
         mintName: resolution.name,
@@ -1770,7 +1815,7 @@ async function describeFocused(tabId: number): Promise<FocusedDescription | null
       tabId,
       OWNER_HAS_FOCUS_FN,
       [],
-      top.frame_url ? await localFrameHoldingFocus(tabId, top.frame_url) : tabId,
+      top.frame_url ? (await localFrameHoldingFocus(tabId, top.frame_url)).session : tabId,
     )
     if (!frame) return top
     const innerValue = await evaluateInProbeWorld<FocusedDescription | null>(
@@ -1830,9 +1875,16 @@ function sameFocusFrameUrl(frameTreeUrl: string, focusUrl: string): boolean {
  *
  * Returns a `frameId`-carrying root target: `debuggee()` ignores `frameId`,
  * so trusted keystrokes keep riding the shared session exactly as before and
- * ONLY the probe's document moves.
+ * ONLY the probe's document moves. `url` is the CONFIRMED frame's URL from
+ * the CDP frame tree (null when the scan falls back to the root): the
+ * payload's `resolved_frame` claim, sourced from the browser's own record
+ * rather than the in-page focus read, which both truncates its URL and is
+ * only a hint about WHICH frame to confirm (#201 review).
  */
-async function localFrameHoldingFocus(tabId: number, frameUrl: string): Promise<Cdp> {
+async function localFrameHoldingFocus(
+  tabId: number,
+  frameUrl: string,
+): Promise<{ session: Cdp; url: string | null }> {
   let locals: LocalFrame[]
   try {
     locals = await localFrames(tabId)
@@ -1840,7 +1892,7 @@ async function localFrameHoldingFocus(tabId: number, frameUrl: string): Promise<
     // Session-layer failures rethrow like every other pre-dispatch probe;
     // anything else leaves the keystrokes where they already were going.
     if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
-    return tabId
+    return { session: tabId, url: null }
   }
   const byUrl = locals.filter((f) => sameFocusFrameUrl(f.url, frameUrl))
   // DEEPEST FIRST. `document.activeElement` is the frame OWNER in every
@@ -1857,7 +1909,7 @@ async function localFrameHoldingFocus(tabId: number, frameUrl: string): Promise<
     const host: Cdp = parentFrameId ? { tabId, frameId: parentFrameId } : tabId
     try {
       if ((await askFrameOwner<boolean>(host, f.frameId, OWNER_HAS_FOCUS_FN)) === true) {
-        return { tabId, frameId: f.frameId }
+        return { session: { tabId, frameId: f.frameId }, url: f.url || null }
       }
     } catch (e) {
       if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
@@ -1865,15 +1917,27 @@ async function localFrameHoldingFocus(tabId: number, frameUrl: string): Promise<
       // rule: a whole-loop try let a single bad frame decide the verdict).
     }
   }
-  return tabId
+  return { session: tabId, url: null }
 }
 
 /** Where ref-less keystrokes go: the frame holding focus, else the root.
  *  Keyboard input has no coordinates; what it has is a focused element, and
  *  when that element lives in a cross-origin frame, root-session key events
  *  never arrive (the measured wall). Following focus keeps the "type
- *  continues at the caret" contract across the frame boundary. */
-async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
+ *  continues at the caret" contract across the frame boundary.
+ *
+ *  `frameUrl` is the destination document's URL when that document is a
+ *  CONFIRMED subframe, for the payload's `resolved_frame` attribution
+ *  (#201): read at DISPATCH time, so it stays honest even when the typing
+ *  itself moves focus (autocomplete widgets), where the verification-time
+ *  `focused` read names wherever the caret ended up. Sourced from the CDP
+ *  frame records only (the in-page focus read truncates its URL and is
+ *  page-readable state, so it routes the confirmation but never supplies
+ *  the claim). Null means the root document or an unconfirmed frame; the
+ *  payload stays silent both ways. */
+async function keyboardSessionForFocus(
+  tabId: number,
+): Promise<{ session: Cdp; frameUrl: string | null }> {
   // Cheap gate before the per-frame scan: only when the ROOT document's own
   // focus rests on a frame owner can the caret be inside a cross-origin
   // frame, so anything else answers with one evaluate instead of three CDP
@@ -1897,9 +1961,9 @@ async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
   } catch (e) {
     if (e instanceof CdpCallTimeout || e instanceof TabUnusable) throw e
     // An unanswerable gate keeps the pre-frames behavior: type at the root.
-    return tabId
+    return { session: tabId, frameUrl: null }
   }
-  if (!top) return tabId
+  if (!top) return { session: tabId, frameUrl: null }
   if (top.tag !== 'iframe' && top.tag !== 'frame') {
     // The expression descended a SAME-ORIGIN frame chain itself, so a
     // non-frame tag with a `frame_url` means the caret is inside a
@@ -1907,7 +1971,9 @@ async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
     // reaches those frames), but the DELIVERY PROBE must arm in the frame's
     // own world: armed at the root it counted nothing and the verdict was a
     // permanent "unknown", which is the residual this closes.
-    return top.frame_url ? await localFrameHoldingFocus(tabId, top.frame_url) : tabId
+    if (!top.frame_url) return { session: tabId, frameUrl: null }
+    const picked = await localFrameHoldingFocus(tabId, top.frame_url)
+    return { session: picked.session, frameUrl: picked.url }
   }
   // Same as `describeFocused`: the owner element lives in the document the
   // focus read named, and naming it is what keeps the answer unique.
@@ -1915,9 +1981,13 @@ async function keyboardSessionForFocus(tabId: number): Promise<Cdp> {
     tabId,
     OWNER_HAS_FOCUS_FN,
     [],
-    top.frame_url ? await localFrameHoldingFocus(tabId, top.frame_url) : tabId,
+    top.frame_url ? (await localFrameHoldingFocus(tabId, top.frame_url)).session : tabId,
   )
-  return frame ? { tabId, sessionId: frame.sessionId } : tabId
+  // No confirmed frame: the keystrokes ride the root session and the
+  // destination is genuinely uncertain, so no attribution is claimed.
+  return frame
+    ? { session: { tabId, sessionId: frame.sessionId }, frameUrl: frame.url || null }
+    : { session: tabId, frameUrl: null }
 }
 
 async function stillConnected(session: Cdp, objectId: string | null): Promise<boolean | null> {
@@ -2411,8 +2481,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
    *  by the `target_invisible` annotation, by the selector honesty fields,
    *  and by the pointer-events copy inside the click and check branches. */
   let actionability: Actionability | null = null
-  /** The selector-target honesty pair (how many elements the rule matched,
-   *  whether the match came from a shadow root), declared HERE because they
+  /** The post-resolution facts bag: the selector honesty pair (how many
+   *  elements the rule matched, whether the match came from a shadow root)
+   *  and, since #201, `resolved_frame`. Declared HERE because these facts
    *  ride every exit from here on, refusals included: a `css=.btn` that
    *  matched 14 and then refused because the first one is disabled needs the
    *  other 13 named exactly as much as a success does (review round). A count
@@ -2436,6 +2507,14 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           data: resolution.stale ? { stale_refs: true, reason: resolution.stale } : undefined,
         }
       }
+      // #201: the payload's frame ATTRIBUTION, into the facts bag that
+      // rides every exit from here on, refusals included (the bag's
+      // declared rule), and the success/dialog exits via `extra`. Distinct
+      // from `focused`, a state read that never moves on hover/scroll_to/
+      // drag and so names the PREVIOUS act's frame. Absent on a resolved
+      // target it means the root document; resolution state, no round
+      // trip, so it survives the budget clamp that drops `focused`.
+      if (resolution.liveFrameUrl) selectorFacts.resolved_frame = resolution.liveFrameUrl
       // The widened pre-dispatch probe, for BOTH target classes. A selector
       // target pays exactly the one `callFunctionOn` a ref pays, and gets the
       // same six facts plus the two only a selector has (how many elements
@@ -2472,7 +2551,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           ok: false,
           status: 'error',
           error: detachedRefError(target, a.action),
-          data: { action: a.action, target, stale_refs: true, reason: 'detached' },
+          data: {
+            action: a.action,
+            target,
+            stale_refs: true,
+            reason: 'detached',
+            ...selectorFacts,
+          },
         }
       }
       // The mint-fingerprint re-check, for the verbs that dispatch input into
@@ -2483,7 +2568,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       // nothing was sent.
       if (FINGERPRINT_VERBS.has(a.action)) {
         const refusal = await fingerprintRefusal(resolution, a.action, target, target)
-        if (refusal) return refusal
+        // The bag rides this refusal too (resolved_frame; selector facts
+        // cannot occur here, refs only). The drag-destination call to the
+        // same function deliberately does NOT get it: its data names the
+        // SOURCE as target, and stamping the destination's frame under
+        // that key would attribute the wrong element (#201 review).
+        if (refusal) return { ...refusal, data: { ...(refusal.data ?? {}), ...selectorFacts } }
       }
       // The actionability refusals, from the same probe. AFTER the
       // fingerprint gate on purpose: an element that changed MEANING is the
@@ -2638,10 +2728,16 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // Resolved here, before the probe arms, so the probe watches the same
   // document the keys actually enter; armed at the root, an in-frame
   // ref-less type would count zero and shrug "unknown" forever.
-  const keyboardSession: Cdp | null =
+  const keyboardFocus =
     !objectId && (a.action === 'type' || a.action === 'key')
       ? await keyboardSessionForFocus(tabId)
       : null
+  const keyboardSession: Cdp | null = keyboardFocus?.session ?? null
+  // #201's keyboard half: the keystrokes' destination frame, claimed at
+  // dispatch time (see keyboardSessionForFocus). Set into `extra` directly
+  // (it is declared above and every later exit carries it); the resolution
+  // path cannot also have set it, since this branch only runs ref-less.
+  if (keyboardFocus?.frameUrl) extra.resolved_frame = keyboardFocus.frameUrl
   // Armed on the session the input will ride: the frame's own for a frame
   // ref, the focused frame's for ref-less keystrokes, the root otherwise.
   // Arming the root for an in-frame act was the pre-2026-08-16 shape, and

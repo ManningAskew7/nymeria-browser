@@ -514,6 +514,11 @@ describe('keyboard follows focus across the frame boundary', () => {
 
     expect(result.ok).toBe(true)
     expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    // #201: the confirmed destination frame is claimed, from the frame
+    // tree record (CDP truth), not from the in-page focus hint.
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(
+      'https://example.com/widget',
+    )
     // A same-process frame has no session of its own, so "which document"
     // is carried by the WORLD the probe armed in, not by the addressee.
     const arm = send.mock.calls.find(
@@ -1624,6 +1629,9 @@ describe('same-process frame refs (reads-honesty pass)', () => {
     expect(resolveCall?.[2]).toMatchObject({ executionContextId: 55 })
     // Same-process frames have no session of their own: everything rides root.
     expect(resolveCall?.[0]).toEqual({ tabId: TAB })
+    // #201: the same-process frame kind is attributed too, from the frame
+    // tree record locateFrame answered with.
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(LOCAL_URL)
     // Dispatch at the browser-composed page-space quad centre, NOT the
     // frame-local rect (30, 40) the probes read.
     const pressed = cdp.mock.calls.find(
@@ -2398,5 +2406,299 @@ describe('same-process frame refs: review-round defenses', () => {
     const tree = (result.data as { tree: string }).tree
     const sections = tree.match(/iframe "https:\/\/pay\.example\/card"/g) ?? []
     expect(sections).toHaveLength(1)
+  })
+})
+
+/**
+ * Act payload frame attribution (#201): `resolved_frame` is the LIVE URL of
+ * the subframe the target resolved into, read off `locateFrame` at
+ * resolution time. It exists because `focused` is a STATE read that hover,
+ * scroll and drag never move, so their payloads named the previous act's
+ * frame (the filed QA round). Absent means the target resolved in the root
+ * document, or (coordinates) that no frame is known.
+ */
+describe('act payload frame attribution (#201)', () => {
+  function frameRef(mintUrl?: string) {
+    return new Map([
+      [
+        'e1',
+        {
+          backendNodeId: 7,
+          frameTargetId: FRAME_TARGET,
+          ...(mintUrl ? { frameUrl: mintUrl } : {}),
+          role: 'button',
+          name: 'Pay',
+        },
+      ],
+    ])
+  }
+
+  /** Layer one Runtime.callFunctionOn answer over the standard mock. */
+  function overrideActionability(value: Record<string, unknown>) {
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1]
+      const params = (args[2] ?? {}) as { functionDeclaration?: string }
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        String(params.functionDeclaration ?? '').includes('checkVisibility')
+      ) {
+        return { result: { value } }
+      }
+      return base(...args)
+    })
+  }
+
+  it('hover on a frame ref reports the LIVE frame URL, not the mint-time one', async () => {
+    // Hover is the filed verb: it never moves focus, so before this field
+    // the payload's only frame-shaped fact named the PREVIOUS act's frame.
+    // The mint URL differs by fragment (same document, so no navigated
+    // refusal): only the live URL may appear, or the claim is stale.
+    installCdpMock()
+    await attachFrame()
+    setRefs(TAB, frameRef('https://pay.example/card#step1'), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(
+      'https://pay.example/card',
+    )
+  })
+
+  it('a root-document ref act carries NO resolved_frame key (absence means root)', async () => {
+    installCdpMock()
+    await attachFrame()
+    setRefs(TAB, new Map([['e1', { backendNodeId: 7, role: 'button', name: 'Pay' }]]), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect('resolved_frame' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('a disabled refusal on a frame element still names the frame', async () => {
+    // Post-resolution refusals know the frame; a refusal about a frame
+    // element's state is exactly where attribution earns its keep.
+    installCdpMock()
+    overrideActionability({ connected: true, visible: true, disabled: true })
+    await attachFrame()
+    setRefs(TAB, frameRef(), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    const data = result.data as { refused?: string; resolved_frame?: string }
+    expect(data.refused).toBe('disabled')
+    expect(data.resolved_frame).toBe('https://pay.example/card')
+  })
+
+  it('a detached-ref refusal on a frame element still names the frame', async () => {
+    installCdpMock()
+    overrideActionability({ connected: false })
+    await attachFrame()
+    setRefs(TAB, frameRef(), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    const data = result.data as { reason?: string; resolved_frame?: string }
+    expect(data.reason).toBe('detached')
+    expect(data.resolved_frame).toBe('https://pay.example/card')
+  })
+
+  it('a changed-meaning (fingerprint) refusal on a frame ref still names the frame', async () => {
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1]
+      const params = (args[2] ?? {}) as { backendNodeId?: number }
+      if (method === 'Accessibility.getPartialAXTree') {
+        return {
+          nodes: [
+            {
+              backendDOMNodeId: params.backendNodeId,
+              ignored: false,
+              role: { value: 'button' },
+              name: { value: 'Delete everything' },
+            },
+          ],
+        }
+      }
+      return base(...args)
+    })
+    await attachFrame()
+    setRefs(TAB, frameRef(), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    const data = result.data as { reason?: string; resolved_frame?: string }
+    expect(data.reason).toBe('changed')
+    expect(data.resolved_frame).toBe('https://pay.example/card')
+  })
+
+  /** The keyboard-router focus mock: the root's focus read answers with a
+   *  frame owner, and the owner predicate confirms (or denies) the frame. */
+  function overrideKeyboardFocus(frameHasFocus: boolean) {
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as { expression?: string; functionDeclaration?: string }
+      if (method === 'Runtime.evaluate' && params.expression?.includes('activeElement')) {
+        return target.sessionId
+          ? { result: { value: null } }
+          : { result: { value: { tag: 'iframe', label: '' } } }
+      }
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        params.functionDeclaration?.includes('document.activeElement === this')
+      ) {
+        return { result: { value: frameHasFocus } }
+      }
+      return base(...args)
+    })
+  }
+
+  it('ref-less type into a focused frame claims the frame the keystrokes entered', async () => {
+    // The keyboard half: attribution is claimed at DISPATCH time from the
+    // focus-following router, so it stays honest even when the typing
+    // itself moves focus before the verification-time `focused` read.
+    installCdpMock()
+    overrideKeyboardFocus(true)
+    await attachFrame()
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(
+      'https://pay.example/card',
+    )
+  })
+
+  it('ref-less type with an UNCONFIRMED frame claims no frame', async () => {
+    // The router falls back to the root when no frame owner admits to
+    // holding focus; the destination is genuinely uncertain there, and an
+    // uncertain claim must be silence, not a guess.
+    installCdpMock()
+    overrideKeyboardFocus(false)
+    await attachFrame()
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'h' })
+
+    expect(result.ok).toBe(true)
+    expect('resolved_frame' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('the same-origin keyboard claim is the frame-tree URL, not the truncated in-page hint', async () => {
+    // DESCRIBE_FOCUSED_EXPRESSION slices location.href to 200 chars; that
+    // slice routes WHICH frame to confirm but must never be published as
+    // the claim (#201 review). The confirmed frame's CDP record is.
+    const fullUrl = `https://example.com/widget?session=${'x'.repeat(200)}`
+    const hint = fullUrl.slice(0, 200)
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as Record<string, unknown>
+      if (method === 'Page.getFrameTree' && !target.sessionId) {
+        return {
+          frameTree: {
+            frame: { id: 'frame-root' },
+            childFrames: [{ frame: { id: 'LOCAL-KB', url: fullUrl } }],
+          },
+        }
+      }
+      if (method === 'DOM.getFrameOwner') return { backendNodeId: 777 }
+      if (method === 'DOM.resolveNode') return { object: { objectId: 'owner-777' } }
+      if (method === 'Runtime.callFunctionOn') {
+        const fn = String(params.functionDeclaration ?? '')
+        if (fn.includes('document.activeElement === this')) return { result: { value: true } }
+      }
+      if (method === 'Runtime.evaluate') {
+        const expression = String(params.expression ?? '')
+        if (expression.includes('activeElement')) {
+          return { result: { value: { tag: 'input', label: 'CVC', frame_url: hint } } }
+        }
+      }
+      return base(...args)
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'type', value: 'hi' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(fullUrl)
+  })
+
+  it('a bare-coordinate act carries NO resolved_frame key (the frame is unknown)', async () => {
+    installCdpMock()
+    await attachFrame()
+
+    const result = await execAct({ tab_id: TAB, action: 'hover', coordinate: [10, 10] })
+
+    expect(result.ok).toBe(true)
+    expect('resolved_frame' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('resolved_frame and focused diverge honestly: attribution beats the stale focus read', async () => {
+    // The filed QA round in one test: hover into the frame while the
+    // PREVIOUS act's focus still sits on a root-document element. Both
+    // fields appear; only resolved_frame names where this act landed.
+    installCdpMock()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const target = args[0] as { sessionId?: string }
+      const method = args[1]
+      const params = (args[2] ?? {}) as { expression?: string }
+      if (
+        method === 'Runtime.evaluate' &&
+        params.expression?.includes('activeElement') &&
+        !target.sessionId
+      ) {
+        return { result: { value: { tag: 'input', label: 'Search' } } }
+      }
+      return base(...args)
+    })
+    await attachFrame()
+    setRefs(TAB, frameRef(), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as {
+      resolved_frame?: string
+      focused?: { tag?: string; frame_url?: string }
+    }
+    expect(data.resolved_frame).toBe('https://pay.example/card')
+    expect(data.focused?.tag).toBe('input')
+    expect(data.focused?.frame_url).toBeUndefined()
+  })
+
+  it('an OOPIF that navigated in place is attributed under its CURRENT URL', async () => {
+    // Target.targetInfoChanged keeps the frame record current (#201
+    // review): without it, locateFrame answered with the attach-time URL
+    // forever, and a ref minted AFTER an in-place navigation refused as
+    // "navigated" against the stale record.
+    installCdpMock()
+    await attachFrame()
+    cdpEmitter()({ tabId: TAB }, 'Target.targetInfoChanged', {
+      targetInfo: { targetId: FRAME_TARGET, type: 'iframe', url: 'https://pay.example/card/step-2' },
+    })
+    // A fresh read after the navigation mints against the current URL.
+    setRefs(TAB, frameRef('https://pay.example/card/step-2'), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(
+      'https://pay.example/card/step-2',
+    )
   })
 })

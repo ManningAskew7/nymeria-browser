@@ -533,6 +533,22 @@ export function installFrameTracking(): void {
       }
       return
     }
+    if (method === 'Target.targetInfoChanged') {
+      // Keep the recorded URL current: without this the map holds the
+      // attach-time URL forever, and an OOPIF that navigates in-place
+      // (in-process nav, pushState route) would be reported under the URL
+      // it had when auto-attach announced it (#201 review). Keyed by
+      // targetId because that is what the event carries; sessionId is the
+      // map key, so scan (the map is a handful of frames at most).
+      const p = params as { targetInfo?: { targetId?: string; type?: string; url?: string } }
+      if (p.targetInfo?.type !== 'iframe' || !p.targetInfo.targetId || !p.targetInfo.url) return
+      const session = sessions.get(tabId)
+      if (!session) return
+      for (const frame of session.frames.values()) {
+        if (frame.targetId === p.targetInfo.targetId) frame.url = p.targetInfo.url
+      }
+      return
+    }
     if (method === 'Target.detachedFromTarget') {
       const p = params as { sessionId?: string }
       if (p.sessionId) sessions.get(tabId)?.frames.delete(p.sessionId)
@@ -552,12 +568,12 @@ export function frameSessions(tabId: number): FrameSession[] {
  * attribution (#177). Resolved at event-receipt time while the session is
  * live, and stored as a plain string on the buffer entry, so attribution
  * survives the 10s detach without keying anything on the ephemeral
- * sessionId. The URL is the frame's mint-time URL from auto-attach; a
- * frame that later navigates in-process keeps its mint attribution, the
- * same staleness contract the rest of the frame machinery carries.
- * "unknown" should not happen (auto-attach only announces iframes, and an
- * event cannot precede its session's announcement), but a wrong label is
- * worse than an honest one.
+ * sessionId. The URL comes from auto-attach and is kept current by the
+ * `Target.targetInfoChanged` handler above (#201 review), so a frame that
+ * navigates in-place updates its attribution where Chrome reports the
+ * change. "unknown" should not happen (auto-attach only announces iframes,
+ * and an event cannot precede its session's announcement), but a wrong
+ * label is worse than an honest one.
  */
 export function frameOriginForSession(tabId: number, sessionId: string): string {
   const url = sessions.get(tabId)?.frames.get(sessionId)?.url

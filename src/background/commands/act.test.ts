@@ -4737,4 +4737,134 @@ describe('failed_requests classification', () => {
     expect(failed?.[0].url).toBe('not a url at all')
     expect('same_origin' in (failed?.[0] ?? {})).toBe(false)
   })
+
+  // The known-benign class (#202, from the #188 QA round): a LaunchDarkly
+  // EventSource "canceled" rode two act payloads as an apparent error. A
+  // cross-origin cancel or content-blocker kill is routine page noise: it is
+  // tagged `likely_benign` and ranked below EVERYTHING untagged, telemetry
+  // included, so it can never crowd a real failure out of the cap. Nothing
+  // is hidden: the entries still appear.
+
+  it('tags cross-origin canceled entries likely_benign and ranks them below telemetry noise', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    // A real (untagged) cross-origin telemetry failure FIRST, then five
+    // NEWER benign cancels: recency or the old rank would evict the ping.
+    pushNetwork(TAB, {
+      url: 'https://telemetry.example.net/collect',
+      method: 'POST',
+      error: 'net::ERR_NAME_NOT_RESOLVED',
+      resource_type: 'Ping',
+      ts: future(),
+    })
+    for (let i = 0; i < 5; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://stream${i}.example.net/eventsource`,
+        method: 'GET',
+        error: 'canceled',
+        resource_type: 'EventSource',
+        ts: future() + 100 + i,
+      })
+    }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed).toHaveLength(5)
+    const ping = failed?.find((e) => String(e.url).includes('telemetry'))
+    expect(ping, 'the untagged telemetry failure survives five benign cancels').toBeDefined()
+    expect('likely_benign' in (ping ?? {})).toBe(false)
+    const streams = failed?.filter((e) => String(e.url).includes('stream')) ?? []
+    expect(streams).toHaveLength(4)
+    for (const s of streams) expect(s.likely_benign).toBe(true)
+  })
+
+  it('never tags a same-origin cancel: it can be the very failure the payload exists to surface', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://example.com/api/stream',
+      method: 'GET',
+      error: 'canceled',
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed).toHaveLength(1)
+    expect(failed?.[0].same_origin).toBe(true)
+    expect('likely_benign' in (failed?.[0] ?? {})).toBe(false)
+  })
+
+  it('tags a cross-origin request eaten by the content blocker', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://ads.example.net/pixel',
+      method: 'GET',
+      error: 'net::ERR_BLOCKED_BY_CLIENT',
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed).toHaveLength(1)
+    expect(failed?.[0].likely_benign).toBe(true)
+  })
+
+  it('an error-status response wearing a cancel is a REAL failure, never tagged', async () => {
+    // A cross-origin 500 whose stream was then canceled is the failure the
+    // payload exists to surface; only a healthy-status cancel is noise.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://api.example.net/v1/stream',
+      method: 'GET',
+      status: 502,
+      error: 'canceled',
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+    pushNetwork(TAB, {
+      url: 'https://stream.example.net/eventsource',
+      method: 'GET',
+      status: 200,
+      error: 'canceled',
+      resource_type: 'EventSource',
+      ts: future() + 1,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed).toHaveLength(2)
+    const errored = failed?.find((e) => String(e.url).includes('api.example.net'))
+    expect('likely_benign' in (errored ?? {})).toBe(false)
+    const healthy = failed?.find((e) => String(e.url).includes('stream.example.net'))
+    expect(healthy?.likely_benign).toBe(true)
+  })
+
+  it('an unparseable URL cannot ground a benign claim', async () => {
+    // The tag rests on same_origin === false; unknown origin says nothing,
+    // so it must never tag, even on a "canceled" error.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'not a url at all',
+      method: 'GET',
+      error: 'canceled',
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed).toHaveLength(1)
+    expect('likely_benign' in (failed?.[0] ?? {})).toBe(false)
+  })
 })
