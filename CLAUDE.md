@@ -307,8 +307,15 @@ POSTs results. Consequences:
   (`__nymScroll` + `scrollingElement` = baseline, `__nymScroll` alone =
   after); the `__nymScroll` evaluate route must precede
   `elementFromPoint`'s. Measured: root-session wheels DO reach OOPIFs by
-  position, unlike clicks. Known defect filed backend-side (#207):
-  per-tab scroll verification death after repeated over-frame wheels.
+  position, unlike clicks. Since v0.15.3-0.15.5 (#207) the wheel ACK is
+  not load-bearing: Chromium never acks a coalesced-away wheel (source-
+  confirmed) so trustedWheel resolves acked/timeout (only
+  InputDispatchStalled tolerated; other rejections propagate), the
+  payload says `wheel_ack: "not_received"` (absence = acked; no live
+  sighting yet, unit-proven), a per-widget latch drops later wheels to
+  500ms and DIES WITH THE WIDGET (index.ts onCommitted/onRemoved clear
+  it), and `stall_at` names which stall gate raised. Every other
+  Input.* dispatch keeps its load-bearing ack.
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
@@ -489,7 +496,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 14-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `4a9af884` / extension `20d8b78` (v0.15.2,
+live code at backend commit `e7b27636` / extension `ea972d4` (v0.15.5,
 2026-08-18).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):

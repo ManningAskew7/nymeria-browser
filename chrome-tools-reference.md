@@ -553,9 +553,14 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         MEASURED nothing-moved (end of scroll, a pane that ignored the
         wheel, or rarely a smooth animation still in flight at the
         read); the key ABSENT means it could not be measured. A wheel
-        that moved some OTHER pane than the two watched reads {0,0}. To
-        bring a specific element into view, action="scroll_to" with its
-        ref is still the direct verb.
+        that moved some OTHER pane than the two watched reads {0,0}. A
+        rare "wheel_ack": "not_received" beside a successful scroll says
+        the browser mislaid the wheel's RECEIPT, not the wheel (a Chrome
+        quirk on wheel-heavy tabs): the scroll went in, the extension
+        self-heals the cost, and scroll_moved is the field to believe;
+        no "wheel_ack" key means the receipt arrived normally.
+        To bring a specific element into view, action="scroll_to" with
+        its ref is still the direct verb.
     to_ref: drag destination.
     wait_for_text / wait_for_url / wait_for_ref / timeout_ms: a wait
         condition, honoured on EVERY action, not just action="wait". The
