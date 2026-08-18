@@ -3586,7 +3586,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
             // measured live, the page scrolled through every "failed" ack).
             // Not a failure: scroll_moved and settle carry the verdict, and
             // the widget latch in input.ts caps what later wheels pay.
-            extra.wheel_ack = 'timeout'
+            extra.wheel_ack = 'not_received'
           }
         }
         inputMode = 'trusted'

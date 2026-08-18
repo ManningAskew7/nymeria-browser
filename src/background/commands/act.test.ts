@@ -4835,7 +4835,7 @@ describe('scroll at a ref (#203)', () => {
     })
   })
 
-  it('a scroll whose wheel ack never arrives succeeds with wheel_ack: "timeout" (#207)', async () => {
+  it('a scroll whose wheel ack never arrives succeeds with wheel_ack: "not_received" (#207)', async () => {
     // Measured live: Chromium coalesces queue-deep wheels, a coalesced-away
     // wheel never acks while its delta still lands, and the desync is
     // permanent per widget. The ack is therefore not load-bearing for
@@ -4856,7 +4856,7 @@ describe('scroll at a ref (#203)', () => {
       const result = await pending
 
       expect(result.ok).toBe(true)
-      expect((result.data as { wheel_ack?: string }).wheel_ack).toBe('timeout')
+      expect((result.data as { wheel_ack?: string }).wheel_ack).toBe('not_received')
       expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
         dx: 0,
         dy: 500,
