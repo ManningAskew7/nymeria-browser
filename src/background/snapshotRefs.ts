@@ -45,8 +45,25 @@
  * Callers never get a bare `null` back: `resolve` returns a typed reason so
  * the agent is told to re-read the page instead of being left to guess why a
  * ref stopped working. Acting on a stale ref must never silently mis-click.
+ *
+ * THE MAP SURVIVES MV3 WORKER RECYCLES (#179), not just the counter. Chrome
+ * idle-kills the worker ~30s after activity, which is exactly the pause an
+ * agent takes to talk to the user, and refs dying there broke the documented
+ * contract ("refs stay valid until the page navigates") in the commonest
+ * flow. Every `RefTarget` is five durable JSON fields with no live handles
+ * (sessions and objectIds are looked up at use time), so the whole per-tab
+ * entry mirrors into chrome.storage.session beside the counter and hydrates
+ * once per worker life (`refsReady`, awaited by the command dispatcher
+ * before any executor runs). Writes are fire-and-forget with their own
+ * `.catch`: storage bookkeeping must never sit in front of a command (the
+ * v0.9.0 transport lesson), and a failed write only degrades that tab to
+ * the pre-#179 behavior. Hydration never overwrites in-memory state, and a
+ * `clear`/`dropTab` that lands while hydration is in flight tombstones the
+ * tab so a navigated-away document's refs cannot be resurrected (the
+ * resolve-time URL compare remains the second line of defense).
  */
 
+import { backgroundLogger as logger } from '../utils/logger'
 import { sameDocumentUrl } from './urlMatch'
 
 type Ref = string // "e1", "e2", ...
@@ -147,8 +164,132 @@ const cache = new Map<number, TabRefs>()
 const counters = new Map<number, number>()
 const hydrated = new Set<number>()
 
+const COUNTER_PREFIX = 'nymRefCounter:'
+const REFS_PREFIX = 'nymRefs:'
+
 function counterKey(tabId: number): string {
-  return `nymRefCounter:${tabId}`
+  return `${COUNTER_PREFIX}${tabId}`
+}
+
+function refsKey(tabId: number): string {
+  return `${REFS_PREFIX}${tabId}`
+}
+
+/** Wire shape of a persisted per-tab entry (`nymRefs:<tabId>`). */
+interface PersistedTabRefs {
+  url: string | null
+  refs: Record<string, RefTarget>
+}
+
+/**
+ * Mirror a tab's map into storage.session. Fire-and-forget BY DESIGN: an
+ * over-quota `set()` REJECTS (measured, the v0.9.0 transport incident), and
+ * a rejection awaited anywhere near the command path would trade a working
+ * command for bookkeeping. Failure cost is bounded and honest: that tab's
+ * refs die with this worker, the pre-#179 status quo, and the log says so.
+ */
+function persistTab(tabId: number, entry: TabRefs): void {
+  try {
+    const payload: PersistedTabRefs = {
+      url: entry.urlAtSnapshot,
+      refs: Object.fromEntries(entry.byRef),
+    }
+    void chrome.storage.session.set({ [refsKey(tabId)]: payload }).catch((e) => {
+      logger.warn(`ref map for tab ${tabId} not persisted (refs die with this worker):`, e)
+    })
+  } catch {
+    // No storage.session (very old Chrome): refs live for this worker only.
+  }
+}
+
+/** Best-effort storage removal; sync throw and async rejection both no-ops. */
+function removeStored(keys: string[]): void {
+  try {
+    void chrome.storage.session.remove(keys).catch(() => {})
+  } catch {
+    // Best-effort.
+  }
+}
+
+/**
+ * One hydration per worker life. Restores every persisted counter and map
+ * into module memory, skipping tabs that already have in-memory state (a
+ * command that somehow minted first wins) and tabs tombstoned by a
+ * `clear`/`dropTab` that fired while the storage read was in flight (their
+ * documents are gone; resurrecting the map would hand back exactly the
+ * wrong-element class monotonic numbering exists to prevent).
+ *
+ * Tombstones are FLAVORED because the two mutators disagree about the
+ * counter. `clear` (navigation) keeps the counter, in memory and in
+ * storage, so its tombstone blocks only the MAP: wake-BY-navigation is the
+ * ordinary ordering (the commit event is what starts the worker, so the
+ * clear routinely lands mid-hydration), and blocking the counter there
+ * would answer the next resolve with "read the page first" on a tab that
+ * was read, the exact copy lie this pass removes. `dropTab` (tab close)
+ * blocks both. Total storage failure degrades to the pre-#179 status quo.
+ */
+let hydration: Promise<void> | null = null
+let hydrationDone = false
+const tombstones = new Map<number, 'map' | 'all'>()
+
+export function refsReady(): Promise<void> {
+  if (hydration === null) hydration = hydrate()
+  return hydration
+}
+
+async function hydrate(): Promise<void> {
+  try {
+    const all = await chrome.storage.session.get(null)
+    for (const [key, value] of Object.entries(all ?? {})) {
+      if (key.startsWith(COUNTER_PREFIX)) {
+        const tabId = Number(key.slice(COUNTER_PREFIX.length))
+        if (!Number.isInteger(tabId) || tombstones.get(tabId) === 'all') continue
+        if (typeof value === 'number' && !counters.has(tabId)) {
+          counters.set(tabId, value)
+          hydrated.add(tabId)
+        }
+      } else if (key.startsWith(REFS_PREFIX)) {
+        const tabId = Number(key.slice(REFS_PREFIX.length))
+        if (!Number.isInteger(tabId) || tombstones.has(tabId) || cache.has(tabId)) continue
+        const entry = deserializeTabRefs(value)
+        if (entry !== null) cache.set(tabId, entry)
+      }
+    }
+  } catch {
+    // No storage.session, or the read failed: refs from before the recycle
+    // stay lost, which is the pre-#179 status quo.
+  }
+  hydrationDone = true
+  tombstones.clear()
+}
+
+/**
+ * Validate a stored entry field by field before trusting it. Storage is
+ * extension-private, but a malformed entry (a schema change, a partial
+ * write) must skip the WHOLE tab rather than seed a half-map that resolves
+ * some refs and refuses others with a lying story.
+ */
+function deserializeTabRefs(value: unknown): TabRefs | null {
+  if (typeof value !== 'object' || value === null) return null
+  const { url, refs } = value as { url?: unknown; refs?: unknown }
+  if (url !== null && typeof url !== 'string') return null
+  if (typeof refs !== 'object' || refs === null || Array.isArray(refs)) return null
+  const byRef = new Map<Ref, RefTarget>()
+  for (const [ref, raw] of Object.entries(refs as Record<string, unknown>)) {
+    if (typeof raw !== 'object' || raw === null) return null
+    const t = raw as Partial<RefTarget>
+    if (typeof t.backendNodeId !== 'number' || typeof t.role !== 'string' || typeof t.name !== 'string') return null
+    if (t.frameTargetId !== undefined && typeof t.frameTargetId !== 'string') return null
+    if (t.frameUrl !== undefined && typeof t.frameUrl !== 'string') return null
+    byRef.set(ref, {
+      backendNodeId: t.backendNodeId,
+      frameTargetId: t.frameTargetId,
+      frameUrl: t.frameUrl,
+      role: t.role,
+      name: t.name,
+    })
+  }
+  return { byRef, urlAtSnapshot: url ?? null }
 }
 
 /**
@@ -216,15 +357,22 @@ export function set(
   const existing = cache.get(tabId)
   const merge = existing !== undefined && sameDocumentUrl(existing.urlAtSnapshot, url)
   const byRef = merge ? new Map([...existing.byRef, ...refs]) : new Map(refs)
-  cache.set(tabId, { byRef, urlAtSnapshot: url })
+  const entry: TabRefs = { byRef, urlAtSnapshot: url }
+  cache.set(tabId, entry)
   if (typeof nextCounterValue === 'number') {
     counters.set(tabId, nextCounterValue)
     try {
-      void chrome.storage.session.set({ [counterKey(tabId)]: nextCounterValue })
+      // Deliberately a SEPARATE write from the map mirror below: quota is
+      // per-area, but a write fails on the payload it carries, so the tiny
+      // counter write can land where a big map write cannot. Bundled, the
+      // counter would share the map's failure and numbering would restart
+      // on the next recycle, the collision class.
+      void chrome.storage.session.set({ [counterKey(tabId)]: nextCounterValue }).catch(() => {})
     } catch {
       // Best-effort mirror; memory stays authoritative for this worker.
     }
   }
+  persistTab(tabId, entry)
 }
 
 /**
@@ -241,10 +389,18 @@ export function resolve(tabId: number, target: string, currentUrl?: string | nul
   const ref = target.startsWith('@') ? target.slice(1) : target
   const entry = cache.get(tabId)
   if (!entry) {
+    // The counter splits two honestly different states the old single copy
+    // conflated: a tab nobody ever read, and a tab whose refs were
+    // invalidated (normally by navigation). Telling an agent that DID read
+    // the page to "read the page first" reads as gaslighting (#179 QA).
+    const mintedBefore = (counters.get(tabId) ?? 0) > 0
     return {
       ok: false,
       reason: 'no-snapshot',
-      detail: `no snapshot cached for tab ${tabId} (read the page first)`,
+      detail: mintedBefore
+        ? `tab ${tabId} has no live snapshot: the refs minted earlier are gone ` +
+          '(usually a navigation invalidated them). Re-read the page for fresh refs'
+        : `no snapshot cached for tab ${tabId} (read the page first)`,
     }
   }
   if (currentUrl && entry.urlAtSnapshot && !sameDocumentUrl(entry.urlAtSnapshot, currentUrl)) {
@@ -283,10 +439,14 @@ export function resolve(tabId: number, target: string, currentUrl?: string | nul
   }
 }
 
-/** Invalidate the map (navigation). The COUNTER deliberately survives: it is
- *  what keeps a post-navigation read from re-minting held numbers. */
+/** Invalidate the map (navigation), stored mirror included: a recycle must
+ *  not resurrect a navigated-away document's refs. The COUNTER deliberately
+ *  survives, in memory and in storage: it is what keeps a post-navigation
+ *  read from re-minting held numbers. */
 export function clear(tabId: number): void {
   cache.delete(tabId)
+  if (!hydrationDone && !tombstones.has(tabId)) tombstones.set(tabId, 'map')
+  removeStored([refsKey(tabId)])
 }
 
 /** Tab closed: everything goes, counter included (tab ids are not reused
@@ -296,15 +456,8 @@ export function dropTab(tabId: number): void {
   counters.delete(tabId)
   hydrated.delete(tabId)
   mintLocks.delete(tabId)
-  try {
-    void chrome.storage.session.remove(counterKey(tabId))
-  } catch {
-    // Best-effort.
-  }
-}
-
-export function clearAll(): void {
-  cache.clear()
+  if (!hydrationDone) tombstones.set(tabId, 'all')
+  removeStored([counterKey(tabId), refsKey(tabId)])
 }
 
 export function size(tabId: number): number {
@@ -320,4 +473,7 @@ export function resetForTests(): void {
   counters.clear()
   hydrated.clear()
   mintLocks.clear()
+  hydration = null
+  hydrationDone = false
+  tombstones.clear()
 }

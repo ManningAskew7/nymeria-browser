@@ -16,6 +16,7 @@ import { execScreenshot } from './screenshot'
 import { execSnapshot } from './snapshot'
 import { execTabs } from './tabs'
 import { dialogBlockedReadError, standingDialog } from '../dialogs'
+import { refsReady } from '../snapshotRefs'
 import { READ_LIVENESS_DEADLINE_MS, rendererResponsive, suspendedPageReadError } from '../settle'
 
 type Executor = (args: unknown, ctx?: ExecContext) => Promise<CommandResult>
@@ -87,6 +88,16 @@ const READS_THE_PAGE: Record<CommandType, boolean> = {
 }
 
 async function runSingle(type: string, args: unknown, ctx?: ExecContext): Promise<CommandResult> {
+  // Refs hydrate from storage.session once per worker life (#179). Gated
+  // HERE, the one entry every command and every batch sub-command flows
+  // through: a command arriving on a freshly recycled worker must not
+  // resolve @refs (or split stale-read vs never-minted) against an empty
+  // map and un-hydrated counters. Memoized, so every await after the first
+  // costs a microtask. This does not violate the bookkeeping-never-blocks
+  // rule: that rule is about a WRITE's rejection eating a command, and this
+  // is an in-memory read whose promise cannot reject (total failure resolves
+  // to the pre-#179 empty-map status quo).
+  await refsReady()
   const executor = EXECUTORS[type as CommandType]
   if (!executor) {
     return { ok: false, status: 'error', error: `unknown command_type: ${String(type)}` }

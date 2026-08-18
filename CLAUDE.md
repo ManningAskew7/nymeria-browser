@@ -198,18 +198,22 @@ POSTs results. Consequences:
   with "click Connect"). The extension DOES auto-reconnect through an
   ordinary backend restart (measured; the 2026-08-16 strand was a
   one-off): a "not connected" right after a bounce usually just wants a
-  beat, not a popup click. Snapshots die with the worker too: measured
-  2026-08-16, both QA tabs answered `stale_refs: true, reason: "no-snapshot"`
-  about 90 seconds after their last act, with NO navigation and page state
-  intact. Mid-QA that is the worker recycling, not a bug in the round: re-read
-  the page and carry on (the honest-copy half is filed as a residual).
+  beat, not a popup click. Snapshot REFS no longer die with the worker
+  (v0.10.0, #179): the ref map mirrors into `chrome.storage.session` beside
+  the counter and hydrates once per worker life (`refsReady`, awaited in
+  `runSingle` before any executor; `clear`/`dropTab` racing an in-flight
+  hydration tombstone the tab so a navigated map cannot resurrect). A
+  `no-snapshot` refusal now means never-read or navigation-invalidated, and
+  the copy says which; mid-QA it is no longer explainable as the recycle.
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
   (mint-URL compare). Do not "fix" a stale-looking frame ref by re-keying
   it to a session id. Since the reads-honesty pass (v0.4.0/0.5.0) the same
   token space also covers SAME-PROCESS frames (`Page.FrameId`; no session,
-  everything rides the shared one).
+  everything rides the shared one). Since v0.10.0 the whole map is also
+  persisted (see the recycle bullet above), which is what makes the
+  docstring promise "refs live until the page navigates" literally true.
 - Reads-honesty traps (v0.5.0, measured): the same-process occlusion gate
   must test the OUTERMOST local ancestor's owner (`LocalFrame.path[0]`),
   never the immediate one, and must SKIP (fail open) when no ancestor

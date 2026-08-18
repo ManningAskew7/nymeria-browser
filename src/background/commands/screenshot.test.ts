@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { BOX_FN, execScreenshot } from './screenshot'
 import { installCdpEventRouter, resetForTests as resetDebugger, sendCommand } from '../debuggerSession'
-import { resetForTests as resetRefs, set as setRefs, type RefTarget } from '../snapshotRefs'
+import { refsReady, resetForTests as resetRefs, set as setRefs, type RefTarget } from '../snapshotRefs'
 
 const TAB = 1
 // Must match the tab url in the chrome mock, or refs read as stale.
@@ -526,6 +526,23 @@ describe('execScreenshot regions', () => {
 
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/re-read the page/i)
+    expect(captureOf(mock)).toBeUndefined()
+  })
+
+  it('a never-minted region_ref answers never-minted even on a recycled worker (#166 rider)', async () => {
+    // Pre-fix this answered the no-snapshot "read the page first" story,
+    // because the recycle emptied the map before the never-minted question
+    // could be asked; hydration restores map AND counter so act and
+    // region_ref now tell one story from one state.
+    const mock = installCdpMock()
+    seedRef('e1')
+    resetRefs() // the worker recycle
+    await refsReady()
+
+    const result = await execScreenshot({ tab_id: TAB, region_ref: '@e999' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/never minted/)
     expect(captureOf(mock)).toBeUndefined()
   })
 

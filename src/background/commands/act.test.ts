@@ -12,7 +12,7 @@ import {
   type StandingDialog as StandingDialogT,
 } from '../dialogs'
 import { installNavWatch, resetForTests as resetNavWatch } from '../navWatch'
-import { resetForTests as resetRefs, set as setRefs, type RefTarget } from '../snapshotRefs'
+import { clear as clearRefs, refsReady, resetForTests as resetRefs, set as setRefs, type RefTarget } from '../snapshotRefs'
 
 // The dialogs seam is mocked so each test INJECTS a recorded dialog state
 // rather than re-driving the CDP event plumbing (which has its own tests in
@@ -627,13 +627,39 @@ describe('ref lifecycle', () => {
     expect(methodsOf(cdp)).not.toContain('DOM.resolveNode')
   })
 
-  it('reports no-snapshot rather than an unknown-ref crash after a worker recycle', async () => {
+  it('reports no-snapshot for a tab that was never read', async () => {
     installCdpMock()
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect(result.ok).toBe(false)
     expect((result.data as { reason: string }).reason).toBe('no-snapshot')
     expect(result.error).toMatch(/read the page first/)
+  })
+
+  it('a held ref SURVIVES a worker recycle: the persisted map hydrates and the act dispatches (#179)', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL, 1)
+    resetRefs() // the recycle: module memory gone, storage.session intact
+    await refsReady()
+    const cdp = installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { stale_refs?: boolean }).stale_refs).toBeUndefined()
+    expect(inputEventTypes(cdp)).toEqual(['mouseMoved', 'mousePressed', 'mouseReleased'])
+  })
+
+  it('after navigation invalidated the refs, the refusal says so instead of read-the-page-first', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL, 1)
+    clearRefs(TAB) // the navigation-commit hook
+    installCdpMock()
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect((result.data as { reason: string }).reason).toBe('no-snapshot')
+    expect(result.error).toMatch(/invalidated/)
+    expect(result.error).not.toMatch(/read the page first/)
   })
 
   it('reports unknown-ref for a ref that was never minted', async () => {

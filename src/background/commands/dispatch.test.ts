@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { dispatchBrowserCommand, EXECUTORS, setDispatchHooks } from './index'
 import { BUDGET_RESERVE_MS } from '../budget'
 import { standingDialog } from '../dialogs'
+import { resetForTests as resetRefs, resolve as resolveRef } from '../snapshotRefs'
 import { setConfig } from '../../utils/storage'
 import type { BrowserCommandEvent } from '../../shared/types'
 
@@ -15,6 +16,9 @@ vi.mock('../dialogs', async (importOriginal) => {
 beforeEach(async () => {
   await setConfig({ baseUrl: 'http://api.test', token: 'nym_unit' })
   setDispatchHooks({})
+  // The ref store memoizes its hydration per worker life; without a reset it
+  // would carry one test's storage view (and cache) into the next.
+  resetRefs()
 })
 
 describe('dispatchBrowserCommand', () => {
@@ -143,6 +147,55 @@ describe('dispatchBrowserCommand', () => {
     const [event, result] = onResult.mock.calls[0]
     expect(event.command_type).toBe('tabs')
     expect(result.ok).toBe(true)
+  })
+
+  it('waits for ref hydration before any executor runs (#179)', async () => {
+    // Fresh-worker shape: storage.session holds a persisted map, module
+    // memory holds nothing. The stubbed executor resolves a ref ITSELF, so
+    // without the runSingle gate it would race hydration and see an empty
+    // map (`act` is used because it has no page-reading pre-flight).
+    await chrome.storage.session.set({
+      'nymRefs:1': {
+        url: 'https://example.com',
+        refs: { e1: { backendNodeId: 100, role: 'button', name: 'Pay' } },
+      },
+      'nymRefCounter:1': 1,
+    })
+    resetRefs()
+
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ received: true, delivered: true }), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json' },
+      }),
+    )
+    ;(globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch
+
+    const original = EXECUTORS.act
+    ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>).act = async () => {
+      const resolution = resolveRef(1, '@e1', 'https://example.com')
+      return {
+        ok: resolution.ok,
+        status: resolution.ok ? 'success' : 'error',
+        data: resolution,
+      }
+    }
+    try {
+      await dispatchBrowserCommand({
+        type: 'browser_command',
+        command_id: 'bcmd_hydrate_1',
+        command_type: 'act',
+        args: { tab_id: 1, action: 'click', ref: '@e1' },
+        timeout_seconds: 30,
+      })
+    } finally {
+      ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>).act = original
+    }
+
+    const calls = fetchSpy.mock.calls as unknown as Array<[URL | string, RequestInit]>
+    const body = JSON.parse(String(calls[0][1].body))
+    expect(body.ok).toBe(true)
+    expect(body.data.backendNodeId).toBe(100)
   })
 })
 

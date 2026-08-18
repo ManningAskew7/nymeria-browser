@@ -6,7 +6,7 @@ import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs, forgetTab as forgetDebuggerTab } from './debuggerSession'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { clearTabWorlds } from './worlds'
-import { clear as clearRefs, dropTab as dropTabRefs } from './snapshotRefs'
+import { clear as clearRefs, dropTab as dropTabRefs, refsReady } from './snapshotRefs'
 import { installFrameTeardown } from './frameTeardown'
 import { clear as clearConsole, installCdpConsoleCapture } from './consoleBuffer'
 import { clearTabNav, installNavWatch } from './navWatch'
@@ -97,6 +97,10 @@ installFrameTeardown()
 
 async function bootstrap(): Promise<void> {
   logger.log('bootstrap')
+  // Kick ref hydration (#179) without waiting on it: the dispatcher awaits
+  // refsReady() before running any command, so starting it here just means
+  // it is usually already done by the time the SSE reconnect delivers one.
+  void refsReady()
   await loadFromStorage()
   await ensureClientId()
   // 1 minute is Chrome's floor for a packed extension; asking for less does
