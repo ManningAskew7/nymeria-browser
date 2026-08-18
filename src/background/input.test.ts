@@ -7,6 +7,7 @@ import {
   InputBudgetExhausted,
   InputDispatchStalled,
   insertText,
+  clearWheelAckLatchForTab,
   modifierMask,
   resetWheelAckLatchForTests,
   SELECTOR_FACTS_FN,
@@ -42,7 +43,10 @@ function keyEvents(mock: ReturnType<typeof installCdpMock>): KeyEvent[] {
     .map((c) => c[2])
 }
 
-beforeEach(() => resetDebugger())
+beforeEach(() => {
+  resetDebugger()
+  resetWheelAckLatchForTests()
+})
 
 describe('dispatchKey', () => {
   it('sends the character a named key produces, never the key NAME', async () => {
@@ -320,6 +324,98 @@ describe('dispatch ack deadline', () => {
       await vi.advanceTimersByTimeAsync(600)
       await second
       expect(outcome).toBe('timeout')
+    } finally {
+      vi.useRealTimers()
+      resetWheelAckLatchForTests()
+    }
+  })
+
+  it('a non-deadline wheel error propagates, never resolving timeout (#207 review)', async () => {
+    // Only the mislaid RECEIPT is tolerable. A failed attach, a detached
+    // session, or a protocol error means the wheel may never have gone
+    // out, and resolving 'timeout' there would report input: "trusted"
+    // and scrolled: {...} for a wheel that was not dispatched.
+    resetWheelAckLatchForTests()
+    ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) =>
+      method.startsWith('Input.')
+        ? Promise.reject(new Error('Detached while handling command'))
+        : Promise.resolve({}),
+    )
+
+    await expect(trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 })).rejects.toThrow(
+      /Detached/,
+    )
+  })
+
+  it('the latch is per WIDGET: another tab and another session keep the full deadline (#207 review)', async () => {
+    // The isolation the design rests on: a desynced widget on one tab must
+    // not shorten any other widget's deadline.
+    vi.useFakeTimers()
+    resetWheelAckLatchForTests()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) =>
+        method.startsWith('Input.') ? new Promise<never>(() => {}) : Promise.resolve({}),
+      )
+      const first = trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 })
+      await vi.advanceTimersByTimeAsync(8_100)
+      expect(await first).toBe('timeout')
+
+      // A different TAB: full deadline (must not resolve at the short one).
+      let otherTab = false
+      const onOther = trustedWheel(TAB + 1, { x: 5, y: 5 }, { x: 0, y: 100 }).then((v) => {
+        otherTab = true
+        return v
+      })
+      await vi.advanceTimersByTimeAsync(600)
+      expect(otherTab).toBe(false)
+      await vi.advanceTimersByTimeAsync(7_600)
+      expect(await onOther).toBe('timeout')
+
+      // A frame SESSION on the latched tab: its widget is its own.
+      let frameSession = false
+      const onFrame = trustedWheel(
+        { tabId: TAB, sessionId: 'frame-1' },
+        { x: 5, y: 5 },
+        { x: 0, y: 100 },
+      ).then((v) => {
+        frameSession = true
+        return v
+      })
+      await vi.advanceTimersByTimeAsync(600)
+      expect(frameSession).toBe(false)
+      await vi.advanceTimersByTimeAsync(7_600)
+      expect(await onFrame).toBe('timeout')
+    } finally {
+      vi.useRealTimers()
+      resetWheelAckLatchForTests()
+    }
+  })
+
+  it('a navigation or tab close clears the latch: the new widget gets the full deadline (#207 review)', async () => {
+    // A latched-then-navigated tab kept the short tolerance and turned a
+    // slow-but-fine wheel handler into a liveness failure; the latch must
+    // die with the widget it measured.
+    vi.useFakeTimers()
+    resetWheelAckLatchForTests()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) =>
+        method.startsWith('Input.') ? new Promise<never>(() => {}) : Promise.resolve({}),
+      )
+      const first = trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 })
+      await vi.advanceTimersByTimeAsync(8_100)
+      expect(await first).toBe('timeout')
+
+      clearWheelAckLatchForTab(TAB)
+
+      let resolved = false
+      const second = trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 }).then((v) => {
+        resolved = true
+        return v
+      })
+      await vi.advanceTimersByTimeAsync(600)
+      expect(resolved).toBe(false)
+      await vi.advanceTimersByTimeAsync(7_600)
+      expect(await second).toBe('timeout')
     } finally {
       vi.useRealTimers()
       resetWheelAckLatchForTests()

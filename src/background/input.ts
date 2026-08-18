@@ -711,6 +711,20 @@ export function resetWheelAckLatchForTests(): void {
   wheelAckBroken.clear()
 }
 
+/** A navigation or tab close builds a fresh RenderWidgetHost whose acks
+ * are healthy: the latch must not outlive the widget it measured (review
+ * round: a latched-then-navigated tab kept the short tolerance, turning a
+ * slow-but-fine wheel handler into a liveness failure; and the sole other
+ * exit, an ack inside the short window, is what a heavy page is least
+ * likely to meet, so a stale latch re-armed itself forever). Wired beside
+ * the other per-tab stores in index.ts. */
+export function clearWheelAckLatchForTab(tabId: number): void {
+  const prefix = `${tabId}:`
+  for (const key of wheelAckBroken) {
+    if (key.startsWith(prefix)) wheelAckBroken.delete(key)
+  }
+}
+
 /**
  * Wheel scroll. Lives here rather than at the call site so that every
  * `Input.*` dispatch in the extension goes through this module, and therefore

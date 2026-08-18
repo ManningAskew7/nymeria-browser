@@ -7,6 +7,7 @@ import { activeTabs as activeDebuggerTabs, forgetTab as forgetDebuggerTab } from
 import { clearProvenDelivery, clearSwallowedInput } from './delivery'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { dropDriveStamp } from './driveStamp'
+import { clearWheelAckLatchForTab } from './input'
 import { clearTabWorlds } from './worlds'
 import { clear as clearRefs, dropTab as dropTabRefs, refsReady } from './snapshotRefs'
 import { installFrameTeardown } from './frameTeardown'
@@ -70,6 +71,10 @@ chrome.webNavigation?.onCommitted.addListener?.((details) => {
   if (details.frameId !== 0) return
   clearRefs(details.tabId)
   clearTabWorlds(details.tabId)
+  // A committed navigation builds fresh RenderWidgetHosts: the wheel-ack
+  // latch (#207) measured the OLD widgets and must not shorten the new
+  // ones' deadline.
+  clearWheelAckLatchForTab(details.tabId)
 })
 chrome.tabs.onRemoved.addListener((tabId) => {
   // dropTab, not clear: a closed tab surrenders its ref COUNTER too (tab ids
@@ -97,6 +102,9 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   dropDriveStamp(tabId)
   clearSwallowedInput(tabId)
   clearProvenDelivery(tabId)
+  // The wheel-ack latch (#207): a reused tab id must not inherit the
+  // short ack tolerance from the widget that closed.
+  clearWheelAckLatchForTab(tabId)
 })
 
 // Per-frame world teardown (Target.detachedFromTarget); the module

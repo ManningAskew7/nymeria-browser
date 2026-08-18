@@ -503,6 +503,7 @@ beforeEach(() => {
   resetNetwork()
   resetDelivery()
   resetNavWatch()
+  resetWheelAckLatchForTests()
   vi.mocked(standingDialog).mockReturnValue(null)
   vi.mocked(chooserInterceptedSince).mockReturnValue(null)
   vi.mocked(resolvedDialogSince).mockReturnValue(null)
@@ -5054,6 +5055,19 @@ describe('scroll probes (executed in-page)', () => {
 
     expect(reg?.['stale-slot']).toBeUndefined()
     expect(reg?.['fresh-slot']).toBeTruthy()
+
+    // The targetless twin prunes too (review round: only one of the two
+    // byte-identical prunes was executed), and a ts-less foreign slot (a
+    // pre-upgrade registration) counts as stale.
+    reg!['fresh-slot']!.ts = Date.now() - 61_000
+    ;(reg as Record<string, unknown>)['no-ts-slot'] = { c: null, d: null }
+    const runTargetlessPrune = (id: string) =>
+      (new Function(`return (${__test.scrollBaseExpression(id, null)})`) as () => unknown)()
+    runTargetlessPrune('targetless-slot')
+
+    expect(reg?.['fresh-slot']).toBeUndefined()
+    expect((reg as Record<string, unknown>)['no-ts-slot']).toBeUndefined()
+    expect(reg?.['targetless-slot']).toBeTruthy()
   })
 
   it('the targetless read flags a wheel point over an embedded frame', () => {

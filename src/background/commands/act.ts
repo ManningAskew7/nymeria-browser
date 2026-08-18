@@ -2094,7 +2094,7 @@ const SCROLL_BASE_FN = `function(id){
     var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
     reg[id] = { c: c, d: doc, ts: Date.now() };
     for (var k in reg) {
-      if (reg[k] && reg[k].ts && Date.now() - reg[k].ts > 60000) { delete reg[k]; }
+      if (reg[k] && reg[k] !== reg[id] && (!reg[k].ts || Date.now() - reg[k].ts > 60000)) { delete reg[k]; }
     }
   } catch (e) {}
   return {
@@ -2128,7 +2128,7 @@ function scrollBaseExpression(id: string, point: Point | null): string {
     var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
     reg[${JSON.stringify(id)}] = { c: null, d: doc, ts: Date.now() };
     for (var k in reg) {
-      if (reg[k] && reg[k].ts && Date.now() - reg[k].ts > 60000) { delete reg[k]; }
+      if (reg[k] && reg[k] !== reg[${JSON.stringify(id)}] && (!reg[k].ts || Date.now() - reg[k].ts > 60000)) { delete reg[k]; }
     }
   } catch (e) {}
   return { p: null, c: null, d: doc ? { t: doc.scrollTop, l: doc.scrollLeft } : null, f: over };
