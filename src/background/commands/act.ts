@@ -17,6 +17,7 @@ import {
 import {
   absenceIsConclusive,
   armDelivery,
+  clearProvenDelivery,
   clearSwallowedInput,
   recordProvenDelivery,
   recordSwallowedInput,
@@ -3544,8 +3545,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           // was intercepted: that check outranks `delivered` at the failure
           // site below (interception proves the action ran in the page), so
           // evidence stamped here would contradict the verdict the command
-          // itself returns.
+          // itself returns. The cross-clear spends any standing positive
+          // stamp: the two stores tell ONE story, the last conclusive
+          // verdict, and a stale input_ok beside fresh swallow evidence
+          // would be the contradiction (#202; the mirror clear is in the
+          // yes branch below).
           recordSwallowedInput(tabId, a.action)
+          clearProvenDelivery(tabId)
         }
       } else if (delivered === 'yes') {
         // Proven delivered: whatever was swallowing input has stopped, and

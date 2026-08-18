@@ -1,5 +1,6 @@
 import { sendCommand, type Cdp } from './debuggerSession'
 import { callOn } from './input'
+import { sessionStamp } from './sessionStamp'
 import {
   cachedWorld,
   clearWorldEntry,
@@ -433,38 +434,28 @@ export async function absenceIsConclusive(
  * by the health read as "input was being swallowed as of T", never as "input
  * is suppressed now".
  *
- * Storage-only in `chrome.storage.session`, no in-memory front (the
- * driveStamp.ts rationale): the one reader is the health command, which can
- * afford an async read, the suppression being evidenced SURVIVES navigation
- * and outlives worker recycles (measured, module docstring), and a memory
- * copy would be a second source of truth for a fact storage already holds.
- * The clear path removes the key unconditionally and fire-and-forget:
- * removing a key that is not there is free, and knowing whether it is there
- * would cost a read on every successful act.
+ * Rides `sessionStamp.ts` (#204): storage-only in `chrome.storage.session`,
+ * fire-and-forget writes, shape-validated reads, health the sole reader.
+ * The suppression being evidenced SURVIVES navigation and outlives worker
+ * recycles (measured, module docstring). The two evidence stores tell ONE
+ * story, the last conclusive verdict: the cross-clears in BOTH directions
+ * live side by side at the act.ts verdict site, where that story is
+ * decided.
  */
 export interface SuppressionEvidence {
   at: number
   action: string
 }
 
-const SWALLOW_PREFIX = 'nymSwallow:'
+const swallowStore = sessionStamp<SuppressionEvidence>('nymSwallow:', (raw) =>
+  typeof raw.at === 'number' && typeof raw.action === 'string'
+    ? { at: raw.at, action: raw.action }
+    : null,
+)
 
-function swallowKey(tabId: number): string {
-  return `${SWALLOW_PREFIX}${tabId}`
-}
-
-/** An act's trusted input was provably swallowed on this tab. Also spends
- * any standing positive stamp (#202): the two stores tell ONE story, the
- * last conclusive verdict, and a stale `input_ok` beside fresh swallow
- * evidence would be the contradiction the cross-clear exists to prevent. */
+/** An act's trusted input was provably swallowed on this tab. */
 export function recordSwallowedInput(tabId: number, action: string): void {
-  const evidence: SuppressionEvidence = { at: Date.now(), action }
-  try {
-    void chrome.storage.session.set({ [swallowKey(tabId)]: evidence }).catch(() => undefined)
-  } catch {
-    /* No storage.session: the evidence is simply not kept. */
-  }
-  clearProvenDelivery(tabId)
+  swallowStore.record(tabId, { at: Date.now(), action })
 }
 
 /**
@@ -473,27 +464,12 @@ export function recordSwallowedInput(tabId: number, action: string): void {
  * Chrome reuses tab ids).
  */
 export function clearSwallowedInput(tabId: number): void {
-  try {
-    void chrome.storage.session.remove(swallowKey(tabId)).catch(() => undefined)
-  } catch {
-    /* ignore */
-  }
+  swallowStore.clear(tabId)
 }
 
-/** Last-known swallowed-input evidence for a tab, or null. Async because
- * the answer lives in storage.session. Shape-validated: storage is a store,
- * not a trusted producer. */
+/** Last-known swallowed-input evidence for a tab, or null. */
 export async function suppressionEvidence(tabId: number): Promise<SuppressionEvidence | null> {
-  try {
-    const got = await chrome.storage.session.get(swallowKey(tabId))
-    const raw = got?.[swallowKey(tabId)] as { at?: unknown; action?: unknown } | undefined
-    if (raw && typeof raw.at === 'number' && typeof raw.action === 'string') {
-      return { at: raw.at, action: raw.action }
-    }
-  } catch {
-    /* fall through */
-  }
-  return null
+  return swallowStore.read(tabId)
 }
 
 /**
@@ -518,10 +494,11 @@ export async function suppressionEvidence(tabId: number): Promise<SuppressionEvi
  * matches on text but not on seq. Per-worker (navWatch is in-memory), so
  * health only judges identity for same-worker stamps.
  *
- * Same storage rationale as the suppression store above: storage-only,
- * fire-and-forget writes, shape-validated reads, health the sole reader.
- * Cross-cleared by `recordSwallowedInput`; cleared on tab close beside the
- * other per-tab stores.
+ * Rides `sessionStamp.ts` (#204), same shape as the suppression store
+ * above; its validator REPAIRS rather than rejects a stamp whose optional
+ * fields are malformed (`url`/`navSeq` coerce to null, which just means
+ * health cannot judge document identity). Cross-cleared at the act.ts
+ * verdict site; cleared on tab close beside the other per-tab stores.
  */
 export interface DeliveryEvidence {
   at: number
@@ -530,11 +507,16 @@ export interface DeliveryEvidence {
   navSeq: number | null
 }
 
-const OK_PREFIX = 'nymInputOk:'
-
-function okKey(tabId: number): string {
-  return `${OK_PREFIX}${tabId}`
-}
+const okStore = sessionStamp<DeliveryEvidence>('nymInputOk:', (raw) =>
+  typeof raw.at === 'number' && typeof raw.action === 'string'
+    ? {
+        at: raw.at,
+        action: raw.action,
+        url: typeof raw.url === 'string' ? raw.url : null,
+        navSeq: typeof raw.navSeq === 'number' ? raw.navSeq : null,
+      }
+    : null,
+)
 
 /** An act's trusted input was proven delivered. */
 export function recordProvenDelivery(
@@ -543,45 +525,16 @@ export function recordProvenDelivery(
   url: string | null,
   navSeq: number | null,
 ): void {
-  const evidence: DeliveryEvidence = { at: Date.now(), action, url, navSeq }
-  try {
-    void chrome.storage.session.set({ [okKey(tabId)]: evidence }).catch(() => undefined)
-  } catch {
-    /* No storage.session: the evidence is simply not kept. */
-  }
+  okStore.record(tabId, { at: Date.now(), action, url, navSeq })
 }
 
 export function clearProvenDelivery(tabId: number): void {
-  try {
-    void chrome.storage.session.remove(okKey(tabId)).catch(() => undefined)
-  } catch {
-    /* ignore */
-  }
+  okStore.clear(tabId)
 }
 
-/** Last counted-delivery evidence for a tab, or null. Shape-validated:
- * storage is a store, not a trusted producer. */
+/** Last delivery-proof evidence for a tab, or null. */
 export async function provenDelivery(tabId: number): Promise<DeliveryEvidence | null> {
-  try {
-    const got = await chrome.storage.session.get(okKey(tabId))
-    const raw = got?.[okKey(tabId)] as {
-      at?: unknown
-      action?: unknown
-      url?: unknown
-      navSeq?: unknown
-    } | undefined
-    if (raw && typeof raw.at === 'number' && typeof raw.action === 'string') {
-      return {
-        at: raw.at,
-        action: raw.action,
-        url: typeof raw.url === 'string' ? raw.url : null,
-        navSeq: typeof raw.navSeq === 'number' ? raw.navSeq : null,
-      }
-    }
-  } catch {
-    /* fall through */
-  }
-  return null
+  return okStore.read(tabId)
 }
 
 export function resetForTests(): void {
