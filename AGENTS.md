@@ -142,7 +142,14 @@ POSTs results. Consequences:
   `document.title` override, a `querySelector` redirect to `#decoy`, and an
   `<img name="body">` clobber; honest answers all contain REAL or TARGET,
   every lie contains STEERED or DECOY, and the decoy legitimately appears in
-  an UNSCOPED read, so it is a failure only from a scoped `#target` read).
+  an UNSCOPED read, so it is a failure only from a scoped `#target` read),
+  and `...-rerender-fixture-9.html` (the negative ref round: `#morph-btn`
+  relabels IN PLACE via `#morph-now`, "Confirm order" -> "Delete
+  everything", same node so the fingerprint must refuse `changed`;
+  `#swap-btn` is node-REPLACED by a lookalike via `#swap-now`, refusing
+  `unknown-ref`; `#stable-btn` is the control; `#abort-fetch` mints a
+  cross-origin `canceled` failure for the `likely_benign` class; status
+  lines start `*-untouched` per the fixture-6 convention).
   TRAP, measured 2026-08-16 and corrected same day by #177's live capture:
   an in-frame link to iana.org NEVER navigates. The operative blocker is
   MIXED CONTENT
@@ -225,6 +232,22 @@ POSTs results. Consequences:
   shared `commands/captureFlags.ts` sampler gives BOTH `chrome_network` and
   `chrome_console` the started-now/resumed split plus `capture_gap_ms`
   (sample BEFORE the command's own withSession or the lapse is gone).
+- `resolved_frame` (v0.12.0, #201): act payloads attribute the frame the
+  TARGET RESOLVED into; `focused` is state, never attribution (hover and
+  scroll_to do not move it). Carriage is the post-resolution facts bag
+  (`selectorFacts`), set ONCE after resolution so every later exit,
+  refusals included, carries it; do not hand-spread it per exit (the
+  review round removed exactly that shape). Absent on a target-backed act
+  means ROOT; coordinates unknown; the drag-dest fingerprint refusal
+  deliberately omits it (its `target` names the SOURCE). Keyboard claims
+  come only from CDP frame records (the in-page focus read truncates to
+  200 chars and only routes the confirmation); an unconfirmed frame
+  claims nothing. `Target.targetInfoChanged` keeps the frame map's URLs
+  current (without it, attach-time URLs misattribute in-place navs AND
+  refuse fresh refs as `navigated`). Same pass: cross-origin
+  `canceled`/`ERR_BLOCKED_BY_CLIENT` failures with status < 400 tag
+  `likely_benign` and rank LAST (a tag can never evict an untagged
+  entry); same-origin/unparseable/error-status never tag.
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
@@ -405,7 +428,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 14-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `b8c46d30` / extension `1183ccd` (v0.11.1,
+live code at backend commit `c38f0023` / extension `b24db79` (v0.12.0,
 2026-08-18).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):

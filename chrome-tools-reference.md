@@ -533,7 +533,9 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         sizes chrome_screenshot reports before aiming at something you saw
         in a picture.
     modifiers: any of ["Ctrl", "Shift", "Alt", "Meta"].
-    direction / amount_px: for scroll (default down, 500px).
+    direction / amount_px: for scroll (default down, 500px). action="scroll"
+        wheels the PAGE and ignores ref; to bring a specific element into
+        view, use action="scroll_to" with its ref.
     to_ref: drag destination.
     wait_for_text / wait_for_url / wait_for_ref / timeout_ms: a wait
         condition, honoured on EVERY action, not just action="wait". The
@@ -611,6 +613,15 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     normally), and so is a drag whose two ends do not sit in the same frame,
     root to frame included. One limit: css=/xpath= targets resolve in the
     ROOT document only; inside any frame, use the frame section's @refs.
+    "resolved_frame" in the payload is the frame ATTRIBUTION: the URL of
+    the subframe the target resolved into, read at dispatch time. It is
+    not "focused", which reports where the caret sits and does not move on
+    hover or scroll_to (there focused can name the PREVIOUS act's frame;
+    resolved_frame is the field to believe). Absent on a ref/selector act
+    it means the root document (rarely: the frame's URL could not be
+    read); on a coordinate act the frame is unknown. Ref-less type/key
+    claim the frame the keystrokes entered the same way, only when it was
+    confirmed.
 
     Page dialogs your own action raises are OWNED while you drive
     (alert/confirm/prompt/"Leave site?"). An alert is acknowledged
@@ -633,7 +644,10 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     Each failed_requests entry carries "same_origin" where it can be judged,
     and the capped list is ranked so a broken first-party POST is never
     crowded out by third-party telemetry beacons; weigh same-origin data
-    failures heaviest.
+    failures heaviest. An entry tagged "likely_benign": true is a
+    CROSS-ORIGIN request that was canceled or eaten by the user's own
+    content blocker (analytics streams, ad pixels): routine page noise,
+    ranked last, almost never your action's story.
     Navigation is reported honestly. "url_changed" means the tab's URL
     changed, computed after a pending page load commits, so a click that
     navigates reports true with the new URL (an SPA route change reports it
