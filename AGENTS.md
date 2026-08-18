@@ -325,6 +325,16 @@ POSTs results. Consequences:
   everything rides the shared one). Since v0.10.0 the whole map is also
   persisted (see the recycle bullet above), which is what makes the
   docstring promise "refs live until the page navigates" literally true.
+- Ref MINTING is interactive-only at EVERY detail level (snapshot.ts
+  formatTree: `isInteractive(node)` gates the mint; `detail="full"`
+  shows static nodes but still mints nothing for them), and
+  `chrome_find` can only cite minted refs, so its miss copy fires on
+  text plainly present in the tree. An all-static page (fixture 11)
+  mints only RootWebAreas BY DESIGN: that shape produced two false
+  "frame mint gap" filings before the root-document control settled it
+  (#205 closed invalid 2026-08-18; honesty + scrollable-pane
+  capability follow-up is backend backlog #208). Before filing any
+  mint finding, run the same-shape control in the ROOT document.
 - Reads-honesty traps (v0.5.0, measured): the same-process occlusion gate
   must test the OUTERMOST local ancestor's owner (`LocalFrame.path[0]`),
   never the immediate one, and must SKIP (fail open) when no ancestor
