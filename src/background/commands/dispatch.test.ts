@@ -70,6 +70,44 @@ describe('dispatchBrowserCommand', () => {
     }
   })
 
+  it('health answers THROUGH a standing dialog instead of being refused (#188)', async () => {
+    // The READS_THE_PAGE classification is the contract here: health is the
+    // diagnostic FOR a wedged tab, so the dispatcher's standing-dialog
+    // refusal and liveness probe must not gate it (flipping health to `true`
+    // in that table must fail this test). Real executor, mocked dialog.
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ received: true, delivered: true }), { status: 200 }),
+    )
+    ;(globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch
+    // Once, not a standing return: with the correct classification exactly
+    // one call happens (the executor's own), and a regression that makes the
+    // DISPATCHER consume it still fails the assertion below.
+    const mockedStanding = standingDialog as unknown as ReturnType<typeof vi.fn>
+    mockedStanding.mockReturnValueOnce({
+      type: 'confirm',
+      message: 'Leave?',
+      url: 'https://example.com',
+      openedAt: Date.now() - 1_000,
+      deadlineAt: Date.now() + 50_000,
+    })
+    await dispatchBrowserCommand({
+      type: 'browser_command',
+      command_id: 'bcmd_health_dialog',
+      command_type: 'health',
+      args: { tab_id: 1 },
+      timeout_seconds: 5,
+    })
+
+    const calls = fetchSpy.mock.calls as unknown as Array<[URL | string, RequestInit]>
+    const body = JSON.parse(String(calls[0][1].body)) as {
+      ok: boolean
+      data?: { dialog?: { type?: string } }
+      error?: string
+    }
+    expect(body.ok, `health must not be dialog-refused (got: ${body.error})`).toBe(true)
+    expect(body.data?.dialog?.type).toBe('confirm')
+  })
+
   it('routes to the matching executor and POSTs the result', async () => {
     const fetchSpy = vi.fn(async () =>
       new Response(JSON.stringify({ received: true, delivered: true }), {

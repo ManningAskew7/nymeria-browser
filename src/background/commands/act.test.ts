@@ -2141,6 +2141,20 @@ describe('input delivery', () => {
     expect(await suppressionEvidence(TAB)).toBeNull()
   })
 
+  it('stamps no evidence on an INCONCLUSIVE zero count either', async () => {
+    // The other route to not-knowing: the probe counted nothing but a nested
+    // frame below the target could have received it, so the verdict is
+    // downgraded to unknown. The stamp must sit after that downgrade, not
+    // before it: this is the review-caught ordering (F4).
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0, pageHasFrames: true, targetInTopDocument: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect((result.data as { input_delivered: string }).input_delivered).toBe('unknown')
+    expect(await suppressionEvidence(TAB)).toBeNull()
+  })
+
   it('does not fail the command when delivery could not be proven either way', async () => {
     // Unprovable is not the same as failed. Turning "we could not check" into
     // an error would make the tool unusable wherever the probe cannot run.
@@ -3695,6 +3709,10 @@ describe('file chooser interception', () => {
     const data = result.data as { input_delivered?: string; chooser_intercepted?: boolean }
     expect(data.chooser_intercepted).toBe(true)
     expect(data.input_delivered, 'both facts still ride along on the failure').toBe('no')
+    // And the same outranking governs the persisted evidence (review F5):
+    // interception proves the action ran in the page, so stamping "input was
+    // swallowed" here would contradict the verdict this very command returns.
+    expect(await suppressionEvidence(TAB)).toBeNull()
   })
 
   it('names the verb that reached the input, not always "click"', async () => {

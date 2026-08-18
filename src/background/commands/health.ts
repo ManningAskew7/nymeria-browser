@@ -17,12 +17,18 @@
  * under a standing dialog would deadlock the cure on the disease (the
  * console/network/dialog rationale, one further).
  *
- * Absence is honest everywhere: an absent key means unknown or
- * none, never "fine". Ages are reported as `age_ms` rather than absolute
- * clocks so the reader does no clock math. The one cross-cutting caveat is
- * the MV3 recycle asymmetry (#179 made refs the ONLY section that survives
- * a worker recycle): `worker_recycled_since_drive` names it when it
- * applies, and the backend renders the honesty note.
+ * Shared shapes, not re-derived ones: the tab renders through tabs.ts's
+ * `describe`, the standing dialog through `standingDialogPayload`, the
+ * resolution through `describeResolution`, the capture gap through
+ * `captureGapMs`, and the auth inference through `isAuthChallenge`, so
+ * none of those facts can drift from the surfaces that already report them.
+ *
+ * Absence is honest everywhere: an absent key means unknown or none, never
+ * "fine". Ages are reported as `age_ms` rather than absolute clocks so the
+ * reader does no clock math. The one cross-cutting caveat is the MV3
+ * recycle asymmetry (#179 made refs the ONLY section that survives a worker
+ * recycle): `worker_recycled_since_drive` names it when it applies, and the
+ * backend renders the honesty note.
  *
  * Input suppression is EVIDENCE, not state: Chrome has no getter for the
  * flag (delivery.ts docstring), so `input_swallowed` reports the last act
@@ -35,13 +41,21 @@
 import type { CommandResult } from '../../shared/types'
 import { count as consoleCount } from '../consoleBuffer'
 import { suppressionEvidence } from '../delivery'
-import { everAttached, isAttached, lastDetachAt } from '../debuggerSession'
-import { lastResolvedDialog, recentChooser, standingDialog } from '../dialogs'
+import { everAttached, isAttached } from '../debuggerSession'
+import {
+  describeResolution,
+  lastResolvedDialog,
+  recentChooser,
+  standingDialog,
+  standingDialogPayload,
+} from '../dialogs'
 import { readDriveStamp, WORKER_STARTED_AT } from '../driveStamp'
-import { lastNavigationError, pendingNavigation } from '../navWatch'
+import { navigationState } from '../navWatch'
 import { count as networkCount } from '../networkBuffer'
 import { mintedCount, size as heldRefs, snapshotUrl } from '../snapshotRefs'
-import { lastStatus } from '../statusWatch'
+import { isAuthChallenge, lastStatus } from '../statusWatch'
+import { captureGapMs } from './captureFlags'
+import { describe as describeTab } from './tabs'
 
 interface HealthArgs {
   tab_id: number
@@ -66,15 +80,12 @@ export async function execHealth(args: unknown): Promise<CommandResult> {
   }
 
   const now = Date.now()
-  const attached = isAttached(tabId)
-  const everThisWorker = everAttached(tabId)
-  const detachedAt = lastDetachAt(tabId)
   const dialog = standingDialog(tabId)
   const resolved = dialog ? null : lastResolvedDialog(tabId)
   const chooser = recentChooser(tabId)
-  const pending = pendingNavigation(tabId)
-  const navError = lastNavigationError(tabId)
+  const nav = navigationState(tabId)
   const status = lastStatus(tabId)
+  const gapMs = captureGapMs(tabId)
   const driven = await readDriveStamp(tabId)
   const swallowed = await suppressionEvidence(tabId)
 
@@ -83,50 +94,38 @@ export async function execHealth(args: unknown): Promise<CommandResult> {
     status: 'success',
     data: {
       tab: {
-        id: tab.id,
-        url: tab.url,
-        title: tab.title,
-        active: tab.active,
-        window_id: tab.windowId,
-        status: tab.status,
+        ...describeTab(tab),
         ...(tab.discarded === true ? { discarded: true } : {}),
       },
-      attached,
-      ever_attached_this_worker: everThisWorker,
+      attached: isAttached(tabId),
+      ever_attached_this_worker: everAttached(tabId),
       console_entries: consoleCount(tabId),
       network_entries: networkCount(tabId),
-      // The lapse a buffer-reading command would resume from: only when
-      // detached after having captured, same rule as capture_gap_ms there.
-      ...(!attached && everThisWorker && detachedAt !== null
-        ? { capture_gap_ms: age(now, detachedAt) }
-        : {}),
+      // The lapse a buffer-reading command would resume from (#183 rule,
+      // shared with sampleCaptureFlags).
+      ...(gapMs !== null ? { capture_gap_ms: gapMs } : {}),
       ...(dialog
-        ? {
-            dialog: {
-              type: dialog.type,
-              message: dialog.message,
-              age_ms: age(now, dialog.openedAt),
-              auto_answer_in_ms: Math.max(0, dialog.deadlineAt - now),
-            },
-          }
+        ? { dialog: { ...standingDialogPayload(tabId, dialog), age_ms: age(now, dialog.openedAt) } }
         : {}),
       ...(resolved
         ? {
             dialog_resolved: {
               type: resolved.type,
-              accepted: resolved.accepted,
-              by: resolved.by,
+              message: resolved.message,
+              resolution: describeResolution(resolved),
               age_ms: age(now, resolved.resolvedAt),
             },
           }
         : {}),
       ...(chooser ? { file_chooser_intercepted: { mode: chooser.mode, age_ms: age(now, chooser.at) } } : {}),
-      ...(pending ? { navigation_pending: { url: pending.url, age_ms: age(now, pending.at) } } : {}),
-      ...(navError ? { navigation_error: { error: navError.error, age_ms: age(now, navError.at) } } : {}),
+      ...(nav.pending ? { navigation_pending: { url: nav.pending.url, age_ms: age(now, nav.pending.at) } } : {}),
+      ...(nav.lastError
+        ? { navigation_error: { error: nav.lastError.error, age_ms: age(now, nav.lastError.at) } }
+        : {}),
       ...(status
         ? {
             http_status: { status: status.status, url: status.url, age_ms: age(now, status.at) },
-            ...(status.status === 401 || status.status === 407 ? { auth_prompt_likely: true } : {}),
+            ...(isAuthChallenge(status.status) ? { auth_prompt_likely: true } : {}),
           }
         : {}),
       refs: {

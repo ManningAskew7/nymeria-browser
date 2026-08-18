@@ -3412,10 +3412,14 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           unknownReason =
             'the probe counted nothing, but a nested frame below the target ' +
             'could have received it (the probe watches the target document only)'
-        } else {
-          // Proven swallowed: stamp the evidence the health read reports
+        } else if (!chooserInterceptedSince(tabId, startedAt)) {
+          // Observed swallowed: stamp the evidence the health read reports
           // (#188). Only the CONCLUSIVE no, because an unknown must not
-          // masquerade as observed suppression.
+          // masquerade as observed suppression, and NOT when a file chooser
+          // was intercepted: that check outranks `delivered` at the failure
+          // site below (interception proves the action ran in the page), so
+          // evidence stamped here would contradict the verdict the command
+          // itself returns.
           recordSwallowedInput(tabId, a.action)
         }
       } else if (delivered === 'yes') {

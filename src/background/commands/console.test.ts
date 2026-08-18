@@ -125,4 +125,29 @@ describe('execConsole capture honesty (#183 rider)', () => {
     expect(data.capture_resumed).toBeUndefined()
     expect(data.capture_gap_ms).toBeUndefined()
   })
+
+  it('says how many entries the limit cut, like network does', async () => {
+    // The backend defaults only_errors=True AND limit=50, so a cut console
+    // answer was doubly easy to read as "the page logged nothing" (the same
+    // measured false read the network total closed).
+    const emit = wireCapture()
+    await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
+    consoleEvent(emit, 'one')
+    consoleEvent(emit, 'two')
+    consoleEvent(emit, 'three')
+
+    const cut = (await execConsole({ tab_id: TAB, only_errors: false, limit: 1 })).data as {
+      count: number
+      matched_total?: number
+      filtered: boolean
+    }
+    expect(cut.count).toBe(1)
+    expect(cut.matched_total).toBe(3)
+    expect(cut.filtered).toBe(false)
+
+    const whole = (await execConsole({ tab_id: TAB, only_errors: false })).data as {
+      matched_total?: number
+    }
+    expect(whole.matched_total, 'an untruncated answer must not grow furniture').toBeUndefined()
+  })
 })

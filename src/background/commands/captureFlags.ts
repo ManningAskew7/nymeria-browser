@@ -28,14 +28,22 @@ export interface CaptureSample {
   flags: Record<string, unknown>
 }
 
+/**
+ * Milliseconds this tab has gone unwatched: only when it is detached after
+ * having captured this worker life, and only while the detach stamp
+ * survives (a recycle wipes it with the buffers). The ONE definition of the
+ * gap rule; the health read shares it so the two cannot drift.
+ */
+export function captureGapMs(tabId: number): number | null {
+  if (isAttached(tabId) || !everAttached(tabId)) return null
+  const detachedAt = lastDetachAt(tabId)
+  return detachedAt !== null ? Math.max(0, Date.now() - detachedAt) : null
+}
+
 export function sampleCaptureFlags(tabId: number): CaptureSample {
   const wasAttached = isAttached(tabId)
   const wasCapturedBefore = everAttached(tabId)
-  const detachedAt = lastDetachAt(tabId)
-  const gapMs =
-    !wasAttached && wasCapturedBefore && detachedAt !== null
-      ? Math.max(0, Date.now() - detachedAt)
-      : null
+  const gapMs = captureGapMs(tabId)
   const flags = wasAttached
     ? {}
     : wasCapturedBefore

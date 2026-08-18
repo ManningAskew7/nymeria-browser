@@ -433,13 +433,14 @@ export async function absenceIsConclusive(
  * by the health read as "input was being swallowed as of T", never as "input
  * is suppressed now".
  *
- * Mirrored to `chrome.storage.session` because the suppression it evidences
- * SURVIVES navigation and outlives worker recycles (measured, module
- * docstring), so evidence that died with the worker would go missing in
- * exactly the after-a-pause case the health read exists for. The clear path
- * removes the key unconditionally and fire-and-forget: removing a key that
- * is not there is free, and knowing whether it is there would cost a read
- * on every successful act.
+ * Storage-only in `chrome.storage.session`, no in-memory front (the
+ * driveStamp.ts rationale): the one reader is the health command, which can
+ * afford an async read, the suppression being evidenced SURVIVES navigation
+ * and outlives worker recycles (measured, module docstring), and a memory
+ * copy would be a second source of truth for a fact storage already holds.
+ * The clear path removes the key unconditionally and fire-and-forget:
+ * removing a key that is not there is free, and knowing whether it is there
+ * would cost a read on every successful act.
  */
 export interface SuppressionEvidence {
   at: number
@@ -447,7 +448,6 @@ export interface SuppressionEvidence {
 }
 
 const SWALLOW_PREFIX = 'nymSwallow:'
-const swallowed = new Map<number, SuppressionEvidence>()
 
 function swallowKey(tabId: number): string {
   return `${SWALLOW_PREFIX}${tabId}`
@@ -456,11 +456,10 @@ function swallowKey(tabId: number): string {
 /** An act's trusted input was provably swallowed on this tab. */
 export function recordSwallowedInput(tabId: number, action: string): void {
   const evidence: SuppressionEvidence = { at: Date.now(), action }
-  swallowed.set(tabId, evidence)
   try {
     void chrome.storage.session.set({ [swallowKey(tabId)]: evidence }).catch(() => undefined)
   } catch {
-    /* No storage.session: evidence lives only as long as this worker. */
+    /* No storage.session: the evidence is simply not kept. */
   }
 }
 
@@ -470,7 +469,6 @@ export function recordSwallowedInput(tabId: number, action: string): void {
  * Chrome reuses tab ids).
  */
 export function clearSwallowedInput(tabId: number): void {
-  swallowed.delete(tabId)
   try {
     void chrome.storage.session.remove(swallowKey(tabId)).catch(() => undefined)
   } catch {
@@ -478,11 +476,10 @@ export function clearSwallowedInput(tabId: number): void {
   }
 }
 
-/** Last-known swallowed-input evidence for a tab, or null. Async because a
- * fresh worker's answer lives in storage.session. Shape-validated. */
+/** Last-known swallowed-input evidence for a tab, or null. Async because
+ * the answer lives in storage.session. Shape-validated: storage is a store,
+ * not a trusted producer. */
 export async function suppressionEvidence(tabId: number): Promise<SuppressionEvidence | null> {
-  const live = swallowed.get(tabId)
-  if (live) return live
   try {
     const got = await chrome.storage.session.get(swallowKey(tabId))
     const raw = got?.[swallowKey(tabId)] as { at?: unknown; action?: unknown } | undefined
@@ -497,5 +494,4 @@ export async function suppressionEvidence(tabId: number): Promise<SuppressionEvi
 
 export function resetForTests(): void {
   resetWorlds()
-  swallowed.clear()
 }

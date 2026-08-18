@@ -129,6 +129,11 @@ describe('execHealth', () => {
       type: 'XHR',
     })
 
+    const attachCalls = (chrome.debugger.attach as unknown as ReturnType<typeof vi.fn>).mock.calls
+      .length
+    const cdpCalls = (chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>).mock
+      .calls.length
+
     const data = payload(await execHealth({ tab_id: TAB }))
 
     const tab = data.tab as Record<string, unknown>
@@ -140,6 +145,16 @@ describe('execHealth', () => {
     expect(data.network_entries).toBe(1)
     // Attached means no lapse to measure.
     expect(data.capture_gap_ms).toBeUndefined()
+    // The no-attach contract holds on a DRIVEN tab too, not only a cold one:
+    // neither a new attach nor any CDP traffic at all.
+    expect(
+      (chrome.debugger.attach as unknown as ReturnType<typeof vi.fn>).mock.calls.length,
+      'health must not re-attach the session',
+    ).toBe(attachCalls)
+    expect(
+      (chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>).mock.calls.length,
+      'health must send no CDP commands',
+    ).toBe(cdpCalls)
   })
 
   it('reports how long capture has been lapsed once the session ends', async () => {
@@ -169,11 +184,14 @@ describe('execHealth', () => {
 
     expect(result.ok).toBe(true)
     const dialog = payload(result).dialog as Record<string, unknown>
+    // The shared standingDialogPayload shape (same keys act/navigate/reads
+    // emit), plus health's own age.
     expect(dialog.type).toBe('confirm')
     expect(dialog.message).toBe('Sure?')
     expect(typeof dialog.age_ms).toBe('number')
-    expect(typeof dialog.auto_answer_in_ms).toBe('number')
-    expect((dialog.auto_answer_in_ms as number) > 0).toBe(true)
+    expect(typeof dialog.expires_in_ms).toBe('number')
+    expect((dialog.expires_in_ms as number) > 0).toBe(true)
+    expect(String(dialog.answer_with)).toContain('chrome_dialog')
   })
 
   it('reports a recently resolved dialog when nothing stands', async () => {
@@ -192,7 +210,9 @@ describe('execHealth', () => {
     expect(data.dialog).toBeUndefined()
     const resolved = data.dialog_resolved as Record<string, unknown>
     expect(resolved.type).toBe('confirm')
-    expect(resolved.accepted).toBe(false)
+    // The shared describeResolution prose, not raw by/accepted codes: a
+    // cold reader should not need the AnsweredBy enum to know what happened.
+    expect(String(resolved.resolution)).toMatch(/dismissed|accepted/)
     expect(typeof resolved.age_ms).toBe('number')
   })
 

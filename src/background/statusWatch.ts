@@ -118,9 +118,15 @@ function statusForNavigation(
  * auth prompt is almost certainly showing, and Chrome discards input sent to
  * a tab under one (the SKILL.md recovery matrix's browser-dialog class), so
  * the payload says that instead of leaving the agent to click a dead tab.
+ * Exported as the ONE definition of the challenge set; the health read's
+ * `auth_prompt_likely` keys on it too.
  */
+export function isAuthChallenge(status: number): boolean {
+  return status === 401 || status === 407
+}
+
 function authHintFor(status: number): string | null {
-  if (status !== 401 && status !== 407) return null
+  if (!isAuthChallenge(status)) return null
   return (
     'an authentication prompt is likely showing on this tab, and Chrome ' +
     'suppresses input sent to a tab under one. Navigate the tab somewhere ' +

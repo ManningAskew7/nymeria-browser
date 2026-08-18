@@ -50,11 +50,23 @@ export async function execConsole(args: unknown): Promise<CommandResult> {
     await new Promise((resolve) => setTimeout(resolve, COLD_ATTACH_REPLAY_MS))
   }
 
+  // Whole matching set first, then under the limit: the total is what makes
+  // a truncated answer honest (`count` means rows RETURNED), same rule and
+  // same measured confusion as network.ts. only_errors defaults ON at the
+  // backend, so a cut here was doubly easy to read as "the page logged
+  // nothing" (#183-rider parity, flagged by the health read's true counts).
+  const matched = read(a.tab_id, { only_errors: a.only_errors })
   const entries = read(a.tab_id, { only_errors: a.only_errors, limit: a.limit })
   if (a.clear) clearBuffer(a.tab_id)
   return {
     ok: true,
     status: 'success',
-    data: { entries, count: entries.length, ...capture.flags },
+    data: {
+      entries,
+      count: entries.length,
+      ...(matched.length > entries.length ? { matched_total: matched.length } : {}),
+      filtered: Boolean(a.only_errors),
+      ...capture.flags,
+    },
   }
 }

@@ -58,7 +58,9 @@ async function drivenWindowId(): Promise<number | undefined> {
   }
 }
 
-function describe(tab: chrome.tabs.Tab) {
+/** The one payload shape for a tab; the health read shares it (#188) so a
+ * tab looks the same in chrome_tabs and chrome_health. */
+export function describe(tab: chrome.tabs.Tab) {
   return {
     id: tab.id,
     url: tab.url,

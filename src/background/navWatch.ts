@@ -179,17 +179,19 @@ export function sameDocumentSince(tabId: number, sinceMs: number): { url: string
 }
 
 /**
- * Ungated snapshots for the health read, which reports navigation state AS
- * state ("a navigation to X has been pending for 30s") rather than
+ * One ungated snapshot for the health read, which reports navigation state
+ * AS state ("a navigation to X has been pending for 30s") rather than
  * attributing it to any command, so the `sinceMs` attribution filters above
- * deliberately do not apply.
+ * deliberately do not apply. One accessor with its own name, not a twin of
+ * `navigationPending`, precisely because the two answer differently: this
+ * module's whole point is not mis-attributing navigations.
  */
-export function pendingNavigation(tabId: number): { url: string; at: number } | null {
-  return tabs.get(tabId)?.pending ?? null
-}
-
-export function lastNavigationError(tabId: number): NavErrorRecord | null {
-  return tabs.get(tabId)?.lastError ?? null
+export function navigationState(tabId: number): {
+  pending: { url: string; at: number } | null
+  lastError: NavErrorRecord | null
+} {
+  const s = tabs.get(tabId)
+  return { pending: s?.pending ?? null, lastError: s?.lastError ?? null }
 }
 
 /**
