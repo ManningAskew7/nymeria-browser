@@ -162,6 +162,13 @@ interface Session {
 const sessions = new Map<number, Session>()
 /** Tabs attached at least once this worker lifetime (see `everAttached`). */
 const capturedEver = new Set<number>()
+/**
+ * When each tab's attach last ENDED (see `lastDetachAt`). Worker-scoped like
+ * `capturedEver` and for the same reason: it describes the capture buffers'
+ * blind window, and an answer that outlived the buffers could disagree with
+ * them (#183).
+ */
+const lastDetach = new Map<number, number>()
 
 /**
  * Every CDP call gets a bounded lifetime.
@@ -338,6 +345,12 @@ export function onSessionEnd(handler: SessionEndHandler): () => void {
 }
 
 function fireSessionEnd(tabId: number): void {
+  // Stamped HERE, not in `detachNow`, because this is the one hook every
+  // detach path shares (voluntary, external, and a detach Chrome never
+  // answered). A stamp on the voluntary path alone would read "never
+  // detached" after DevTools stole the target, which is exactly the lapsed
+  // window #183 exists to measure.
+  lastDetach.set(tabId, Date.now())
   for (const handler of sessionEndHandlers) {
     try {
       handler(tabId)
@@ -1011,9 +1024,20 @@ export function everAttached(tabId: number): boolean {
   return capturedEver.has(tabId)
 }
 
+/**
+ * When this tab's attach last ended, or null if it never has (this worker
+ * life). The number a `capture_resumed` turns into a duration: how long the
+ * tab went unwatched before this command re-attached it (#183). Read it
+ * BEFORE re-attaching, like `everAttached`.
+ */
+export function lastDetachAt(tabId: number): number | null {
+  return lastDetach.get(tabId) ?? null
+}
+
 /** A closed tab surrenders the fact too: Chrome reuses tab ids. */
 export function forgetTab(tabId: number): void {
   capturedEver.delete(tabId)
+  lastDetach.delete(tabId)
 }
 
 export function resetForTests(): void {
@@ -1022,6 +1046,7 @@ export function resetForTests(): void {
   }
   sessions.clear()
   capturedEver.clear()
+  lastDetach.clear()
   pendingCalls.clear()
   eventHandlers.clear()
   // A test-registered gate must not leak into the next test: a never-resolving

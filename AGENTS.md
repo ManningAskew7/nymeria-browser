@@ -205,6 +205,26 @@ POSTs results. Consequences:
   hydration tombstone the tab so a navigated map cannot resurrect). A
   `no-snapshot` refusal now means never-read or navigation-invalidated, and
   the copy says which; mid-QA it is no longer explainable as the recycle.
+  Since v0.11.0 (#188) two more facts ride `chrome.storage.session`, both
+  storage-only (no hydration gate, health is their one reader): the per-tab
+  last-driven stamp (`driveStamp.ts`, written in `runSingle` for every
+  tab_id command EXCEPT health) and swallowed-input evidence
+  (`delivery.ts`, stamped on a conclusive probe "no", cleared on a proven
+  "yes"). Attach state, buffers, dialogs and statusWatch still reset with
+  the worker; `chrome_health` says `worker_recycled_since_drive` when its
+  stamp predates the worker.
+- `chrome_health` (v0.11.0, #188): the one-call tab diagnostic. LOCAL READS
+  ONLY by contract: it must never attach (`withSession` forbidden in
+  `health.ts`, pinned by a test), or it would flip the capture state it
+  reports; `READS_THE_PAGE: false` so it answers under a standing dialog or
+  a hung renderer (the cure must not deadlock on the disease). Absent keys
+  mean unknown/none, never fine; ages are `age_ms`. Suppression is
+  EVIDENCE + the 401/407 inference, never a readable flag (no CDP getter).
+  Capture gap honesty (#183): `fireSessionEnd` stamps detach time on every
+  path (worker-scoped like `capturedEver`, same-lifetime rule), and the
+  shared `commands/captureFlags.ts` sampler gives BOTH `chrome_network` and
+  `chrome_console` the started-now/resumed split plus `capture_gap_ms`
+  (sample BEFORE the command's own withSession or the lapse is gone).
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated

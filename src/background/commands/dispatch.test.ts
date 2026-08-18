@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { dispatchBrowserCommand, EXECUTORS, setDispatchHooks } from './index'
 import { BUDGET_RESERVE_MS } from '../budget'
 import { standingDialog } from '../dialogs'
+import { readDriveStamp } from '../driveStamp'
 import { resetForTests as resetRefs, resolve as resolveRef } from '../snapshotRefs'
 import { setConfig } from '../../utils/storage'
 import type { BrowserCommandEvent } from '../../shared/types'
@@ -22,6 +23,53 @@ beforeEach(async () => {
 })
 
 describe('dispatchBrowserCommand', () => {
+  it('stamps the tab as driven for a tab_id command, but never for health (#188)', async () => {
+    // The stamp feeds the health read's last_driven; health itself is a
+    // passive diagnostic and must not overwrite the record it reports.
+    const fetchSpy = vi.fn(async () =>
+      new Response(JSON.stringify({ received: true, delivered: true }), { status: 200 }),
+    )
+    ;(globalThis as unknown as { fetch: typeof fetch }).fetch = fetchSpy as unknown as typeof fetch
+    const originalConsole = EXECUTORS.console
+    const originalHealth = EXECUTORS.health
+    ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>).console = vi.fn(async () => ({
+      ok: true,
+      status: 'success',
+      data: {},
+    }))
+    ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>).health = vi.fn(async () => ({
+      ok: true,
+      status: 'success',
+      data: {},
+    }))
+    try {
+      await dispatchBrowserCommand({
+        type: 'browser_command',
+        command_id: 'bcmd_stamp_1',
+        command_type: 'console',
+        args: { tab_id: 5 },
+        timeout_seconds: 5,
+      })
+      const stamped = await readDriveStamp(5)
+      expect(stamped?.command).toBe('console')
+
+      const before = stamped?.at
+      await dispatchBrowserCommand({
+        type: 'browser_command',
+        command_id: 'bcmd_stamp_2',
+        command_type: 'health',
+        args: { tab_id: 5 },
+        timeout_seconds: 5,
+      })
+      const after = await readDriveStamp(5)
+      expect(after?.command, 'health must not stamp').toBe('console')
+      expect(after?.at).toBe(before)
+    } finally {
+      ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>).console = originalConsole
+      ;(EXECUTORS as Record<string, (a: unknown) => Promise<unknown>>).health = originalHealth
+    }
+  })
+
   it('routes to the matching executor and POSTs the result', async () => {
     const fetchSpy = vi.fn(async () =>
       new Response(JSON.stringify({ received: true, delivered: true }), {

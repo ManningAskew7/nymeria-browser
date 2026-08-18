@@ -25,6 +25,7 @@ export type CommandType =
   | 'console'
   | 'network'
   | 'dialog'
+  | 'health'
   | 'cdp'
   | 'reload_extension'
 

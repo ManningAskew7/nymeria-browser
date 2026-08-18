@@ -74,6 +74,11 @@ export function push(tabId: number, entry: NetworkEntry): void {
   if (buf.length > MAX_PER_TAB) buf.splice(0, buf.length - MAX_PER_TAB)
 }
 
+/** Entries currently buffered for a tab, unfiltered (the health read). */
+export function count(tabId: number): number {
+  return buffers.get(tabId)?.length ?? 0
+}
+
 export interface ReadOptions {
   url_pattern?: string
   only_failures?: boolean

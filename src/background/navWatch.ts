@@ -179,6 +179,20 @@ export function sameDocumentSince(tabId: number, sinceMs: number): { url: string
 }
 
 /**
+ * Ungated snapshots for the health read, which reports navigation state AS
+ * state ("a navigation to X has been pending for 30s") rather than
+ * attributing it to any command, so the `sinceMs` attribution filters above
+ * deliberately do not apply.
+ */
+export function pendingNavigation(tabId: number): { url: string; at: number } | null {
+  return tabs.get(tabId)?.pending ?? null
+}
+
+export function lastNavigationError(tabId: number): NavErrorRecord | null {
+  return tabs.get(tabId)?.lastError ?? null
+}
+
+/**
  * Resolve with the next navigation signal, or null at the deadline.
  *
  * Pre-checks answer immediately when the signal already landed, so arming

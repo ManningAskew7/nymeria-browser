@@ -49,6 +49,11 @@ export function push(tabId: number, entry: ConsoleEntry): void {
   buffers.set(tabId, buf)
 }
 
+/** Entries currently buffered for a tab, unfiltered (the health read). */
+export function count(tabId: number): number {
+  return buffers.get(tabId)?.length ?? 0
+}
+
 /**
  * Push unless an identical entry is already buffered.
  *

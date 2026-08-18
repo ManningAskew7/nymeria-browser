@@ -1,6 +1,7 @@
 import type { CommandResult } from '../../shared/types'
-import { everAttached, isAttached, withSession } from '../debuggerSession'
+import { withSession } from '../debuggerSession'
 import { clear as clearNetwork, read as readNetwork } from '../networkBuffer'
+import { sampleCaptureFlags } from './captureFlags'
 
 /**
  * Read buffered network activity for a tab.
@@ -15,7 +16,9 @@ import { clear as clearNetwork, read as readNetwork } from '../networkBuffer'
  *   about the page.
  * - `capture_resumed`: the tab was captured before but the session had been
  *   released (the debugger detaches after an idle linger), so whatever the
- *   page did between commands was never seen.
+ *   page did between commands was never seen. `capture_gap_ms` beside it
+ *   says HOW LONG went unwatched (#183); it is absent when the detach stamp
+ *   is gone (worker recycle), and absent means unknown, never zero.
  *
  * Both read the SESSION layer, not the buffer: an emptied buffer (`clear`, or
  * a tab driven that made no requests) is not a tab that was never watched,
@@ -46,9 +49,9 @@ export async function execNetwork(args: unknown): Promise<CommandResult> {
 
   // Touch the session so the Network domain is enabled even if this is the
   // first command ever sent to the tab, reading FIRST whether capture was
-  // actually running when the question was asked.
-  const wasAttached = isAttached(a.tab_id)
-  const wasCapturedBefore = everAttached(a.tab_id)
+  // actually running when the question was asked (sampleCaptureFlags must
+  // run before this attach or there is no lapse left to measure).
+  const capture = sampleCaptureFlags(a.tab_id)
   await withSession(a.tab_id, async () => undefined)
 
   // Read the matching set WHOLE first, then again under the limit. The total
@@ -78,11 +81,7 @@ export async function execNetwork(args: unknown): Promise<CommandResult> {
       // keeps its pre-0.9.2 shape and no key becomes always-on furniture.
       ...(matched.length > entries.length ? { matched_total: matched.length } : {}),
       filtered: Boolean(a.url_pattern || a.only_failures),
-      ...(wasAttached
-        ? {}
-        : wasCapturedBefore
-          ? { capture_resumed: true }
-          : { capture_started_now: true }),
+      ...capture.flags,
     },
   }
 }

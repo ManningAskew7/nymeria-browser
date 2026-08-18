@@ -14,7 +14,13 @@ import {
   type Cdp,
   type LocalFrame,
 } from '../debuggerSession'
-import { absenceIsConclusive, armDelivery, type DeliveryOutcome } from '../delivery'
+import {
+  absenceIsConclusive,
+  armDelivery,
+  clearSwallowedInput,
+  recordSwallowedInput,
+  type DeliveryOutcome,
+} from '../delivery'
 import {
   budgetLabel,
   budgetLeft,
@@ -479,11 +485,17 @@ function localDiagnostics(
 }
 
 /**
- * What to tell an agent whose action landed and then killed the page.
+ * What to tell an agent whose action landed and then got no verdict.
  *
  * Distinct from `stalledError` in the one way that matters: the input WAS
  * dispatched, so the action may well have taken effect. Telling the agent
  * nothing was sent would invite a retry that double-submits.
+ *
+ * The opening clause names the SYMPTOM neutrally ("did not answer the
+ * verification probe") rather than "stopped running scripts", because the
+ * first cause it goes on to name (a navigation in flight) is not breakage
+ * at all: during a large upload the page has not stopped so much as gone
+ * (#184, QA-operator wording, 2026-08-17).
  *
  * THREE causes, not two. The third was measured live 2026-08-17, the first
  * time a 9MB upload could actually run (the v0.9.0 journal fix; before it,
@@ -500,7 +512,7 @@ function localDiagnostics(
  */
 function dispatchedThenStalledError(action: ActionName): string {
   return (
-    `the ${action} was sent, and the page then stopped running scripts, so what it ` +
+    `the ${action} was sent, and the page did not answer the verification probe, so what it ` +
     'did could not be verified. Three things do that, and this does not say which: the ' +
     'action started a navigation that is still in flight (a form submit, and one ' +
     'carrying a large upload is the ORDINARY case, since the request can take tens of ' +
@@ -3400,7 +3412,15 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           unknownReason =
             'the probe counted nothing, but a nested frame below the target ' +
             'could have received it (the probe watches the target document only)'
+        } else {
+          // Proven swallowed: stamp the evidence the health read reports
+          // (#188). Only the CONCLUSIVE no, because an unknown must not
+          // masquerade as observed suppression.
+          recordSwallowedInput(tabId, a.action)
         }
+      } else if (delivered === 'yes') {
+        // Proven delivered: whatever was swallowing input has stopped.
+        clearSwallowedInput(tabId)
       }
       extra.input_delivered = delivered
       if (delivered === 'unknown' && unknownReason) {

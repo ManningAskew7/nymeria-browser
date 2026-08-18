@@ -3,7 +3,7 @@ import { execAct, __test } from './act'
 import { CdpCallTimeout, resetForTests as resetDebugger } from '../debuggerSession'
 import { push as pushConsole, resetForTests as resetConsole } from '../consoleBuffer'
 import { push as pushNetwork, resetForTests as resetNetwork } from '../networkBuffer'
-import { resetForTests as resetDelivery } from '../delivery'
+import { resetForTests as resetDelivery, suppressionEvidence } from '../delivery'
 import {
   chooserInterceptedSince,
   raceStandingDialog,
@@ -1775,6 +1775,11 @@ describe('input delivery', () => {
       expect(error).toMatch(/was sent/i)
       expect(error).toMatch(/not simply retry/i)
       expect(error).not.toMatch(/was NOT sent/i)
+      // The opening clause names the symptom neutrally (#184): the ordinary
+      // cause is a navigation in flight, not breakage, so "stopped running
+      // scripts" was retired for the probe-shaped fact.
+      expect(error).toMatch(/did not answer the verification probe/i)
+      expect(error).not.toMatch(/stopped running scripts/i)
     } finally {
       vi.useRealTimers()
     }
@@ -2104,6 +2109,36 @@ describe('input delivery', () => {
 
     expect(result.ok).toBe(true)
     expect((result.data as { input_delivered: string }).input_delivered).toBe('yes')
+  })
+
+  it('stamps suppression evidence on a proven swallow, and a delivery clears it (#188)', async () => {
+    // The health read's input_swallowed field is fed here: a conclusive "no"
+    // is the one observation of suppression Chrome allows (no readable flag),
+    // and a later proven "yes" spends it.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ deliveryCount: 0 })
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const evidence = await suppressionEvidence(TAB)
+    expect(evidence?.action).toBe('click')
+    expect(typeof evidence?.at).toBe('number')
+
+    installCdpMock({ deliveryCount: 1 })
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(await suppressionEvidence(TAB)).toBeNull()
+  })
+
+  it('stamps no evidence when delivery was merely unprovable', async () => {
+    // "unknown" must not masquerade as observed suppression: the health read
+    // would otherwise report a healthy tab as swallowing input.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ deliveryWorld: false })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect((result.data as { input_delivered: string }).input_delivered).toBe('unknown')
+    expect(await suppressionEvidence(TAB)).toBeNull()
   })
 
   it('does not fail the command when delivery could not be proven either way', async () => {

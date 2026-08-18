@@ -1,6 +1,7 @@
 import type { CommandResult } from '../../shared/types'
 import { clear as clearBuffer, read } from '../consoleBuffer'
-import { isAttached, withSession } from '../debuggerSession'
+import { withSession } from '../debuggerSession'
+import { sampleCaptureFlags } from './captureFlags'
 
 /**
  * Read buffered console messages and uncaught exceptions.
@@ -40,12 +41,20 @@ export async function execConsole(args: unknown): Promise<CommandResult> {
   if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'tab_id required' }
 
   // Touch the session so capture is enabled even if this is the first command
-  // ever sent to the tab.
-  const wasAttached = isAttached(a.tab_id)
+  // ever sent to the tab, sampling the capture-honesty flags FIRST (#183):
+  // console had the same silence ambiguity as network, unflagged, until this
+  // read joined the shared sampler.
+  const capture = sampleCaptureFlags(a.tab_id)
   await withSession(a.tab_id, async () => undefined)
-  if (!wasAttached) await new Promise((resolve) => setTimeout(resolve, COLD_ATTACH_REPLAY_MS))
+  if (!capture.wasAttached) {
+    await new Promise((resolve) => setTimeout(resolve, COLD_ATTACH_REPLAY_MS))
+  }
 
   const entries = read(a.tab_id, { only_errors: a.only_errors, limit: a.limit })
   if (a.clear) clearBuffer(a.tab_id)
-  return { ok: true, status: 'success', data: { entries, count: entries.length } }
+  return {
+    ok: true,
+    status: 'success',
+    data: { entries, count: entries.length, ...capture.flags },
+  }
 }

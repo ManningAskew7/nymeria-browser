@@ -172,6 +172,16 @@ export function chooserInterceptedSince(tabId: number, sinceTs: number): Interce
 }
 
 /**
+ * The last intercepted OS file chooser within the resolved-dialog recency
+ * window, for the health read: a chooser Chrome opened and the extension
+ * held is a real "this tab is in a weird state" fact no other read surfaces.
+ */
+export function recentChooser(tabId: number): InterceptedChooser | null {
+  const c = lastChooser.get(tabId)
+  return c && Date.now() - c.at <= RESOLVED_RECENCY_MS ? c : null
+}
+
+/**
  * Register that an agent-commanded close is about to hit this tab, so a
  * beforeunload it raises is accepted instead of held. Consumed by the first
  * beforeunload, expires on its own otherwise.

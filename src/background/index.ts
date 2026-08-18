@@ -4,7 +4,9 @@ import { HttpError, ping, whoami } from './api'
 import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs, forgetTab as forgetDebuggerTab } from './debuggerSession'
+import { clearSwallowedInput } from './delivery'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
+import { dropDriveStamp } from './driveStamp'
 import { clearTabWorlds } from './worlds'
 import { clear as clearRefs, dropTab as dropTabRefs, refsReady } from './snapshotRefs'
 import { installFrameTeardown } from './frameTeardown'
@@ -89,6 +91,11 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   // navigate on a tab the user just closed fails fast instead of riding
   // its deadline.
   clearTabNav(tabId)
+  // The two storage.session-backed health facts (#188): a reused tab id
+  // must not inherit "last driven" or "input was swallowed" from the tab
+  // that closed.
+  dropDriveStamp(tabId)
+  clearSwallowedInput(tabId)
 })
 
 // Per-frame world teardown (Target.detachedFromTarget); the module

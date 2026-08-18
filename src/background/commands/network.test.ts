@@ -73,6 +73,7 @@ function payload(result: { data?: unknown }) {
     matched_total?: number
     capture_started_now?: boolean
     capture_resumed?: boolean
+    capture_gap_ms?: number
   }
 }
 
@@ -119,6 +120,38 @@ describe('execNetwork', () => {
     expect(data.count).toBe(1)
     expect(data.capture_resumed, 'a gap in capture is its own fact').toBe(true)
     expect(data.capture_started_now, 'the history is real, so this is not a cold start').toBeUndefined()
+  })
+
+  it('says HOW LONG capture lapsed, from the detach stamp (#183)', async () => {
+    // "capture_resumed" after a 2-second gap and after a 35-second one used
+    // to read identically, and those are the two cases an agent needs to
+    // tell apart (QA operator, 2026-08-17). Fake time makes the arithmetic
+    // exact: detach at t, read 30s later, gap is 30s.
+    vi.useFakeTimers({ now: 100_000 })
+    try {
+      wireCapture()
+      await attach()
+      detachTab()
+      vi.setSystemTime(130_000)
+
+      const data = payload(await execNetwork({ tab_id: TAB }))
+
+      expect(data.capture_resumed).toBe(true)
+      expect(data.capture_gap_ms).toBe(30_000)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('carries no gap on a warm read or a cold start: there is no lapse to measure', async () => {
+    wireCapture()
+    const cold = payload(await execNetwork({ tab_id: TAB }))
+    expect(cold.capture_started_now).toBe(true)
+    expect(cold.capture_gap_ms).toBeUndefined()
+
+    const warm = payload(await execNetwork({ tab_id: TAB }))
+    expect(warm.capture_started_now).toBeUndefined()
+    expect(warm.capture_gap_ms).toBeUndefined()
   })
 
   it('says nothing of the kind on a warm read, which reports real history', async () => {

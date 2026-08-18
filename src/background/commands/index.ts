@@ -8,6 +8,7 @@ import { execCdp } from './cdp'
 import { execConsole } from './console'
 import { execDialog } from './dialog'
 import { execExtractText } from './extract_text'
+import { execHealth } from './health'
 import { execHistory } from './history'
 import { execNavigate } from './navigate'
 import { execNetwork } from './network'
@@ -16,6 +17,7 @@ import { execScreenshot } from './screenshot'
 import { execSnapshot } from './snapshot'
 import { execTabs } from './tabs'
 import { dialogBlockedReadError, standingDialog } from '../dialogs'
+import { recordDrive } from '../driveStamp'
 import { refsReady } from '../snapshotRefs'
 import { READ_LIVENESS_DEADLINE_MS, rendererResponsive, suspendedPageReadError } from '../settle'
 
@@ -80,6 +82,10 @@ const READS_THE_PAGE: Record<CommandType, boolean> = {
   console: false,
   network: false,
   dialog: false,
+  // The diagnostic FOR a wedged tab: local reads only, no attach, and it
+  // must answer while a dialog stands or a renderer hangs, or the cure
+  // deadlocks on the disease (health.ts docstring).
+  health: false,
   batch: false,
   cdp: false,
   // Talks only to chrome.runtime; a suspended renderer is irrelevant, and
@@ -103,6 +109,12 @@ async function runSingle(type: string, args: unknown, ctx?: ExecContext): Promis
     return { ok: false, status: 'error', error: `unknown command_type: ${String(type)}` }
   }
   const tabId = (args as { tab_id?: unknown } | null)?.tab_id
+  // Last-driven stamp (#188), at the one entry every command and batch
+  // sub-command flows through. `health` is excluded: a passive diagnostic
+  // must not overwrite the record of when the tab was last actually driven.
+  if (typeof tabId === 'number' && type !== 'health') {
+    recordDrive(tabId, type)
+  }
   let loadingAtRead = false
   if (READS_THE_PAGE[type as CommandType] && typeof tabId === 'number') {
     // A dialog we own is named outright (#169): faster than the liveness
@@ -142,6 +154,7 @@ export const EXECUTORS: Record<CommandType, Executor> = {
   console: execConsole,
   network: execNetwork,
   dialog: execDialog,
+  health: execHealth,
   cdp: execCdp,
   reload_extension: execReloadExtension,
 }

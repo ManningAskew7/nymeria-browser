@@ -74,6 +74,17 @@ export function clearTabStatus(tabId: number): void {
   tabs.delete(tabId)
 }
 
+/**
+ * The last main-frame response this tab saw, as a RECORD (url, status, at),
+ * or null. For the health read, which reports it as history rather than
+ * claiming it belongs to any particular navigation, so the
+ * `statusForNavigation` gates deliberately do not apply here. Absence still
+ * means unknown (no grant, no record yet, or a worker recycle), never OK.
+ */
+export function lastStatus(tabId: number): StatusRecord | null {
+  return tabs.get(tabId) ?? null
+}
+
 // URL equality with the fragment ignored (shared, urlMatch.ts): a navigate
 // to `/page#sec` commits with the fragment while the request that produced
 // it has none, and a mismatch on that difference would throw away a correct

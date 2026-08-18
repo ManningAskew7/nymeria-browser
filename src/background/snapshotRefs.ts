@@ -468,6 +468,15 @@ export function snapshotUrl(tabId: number): string | null {
   return cache.get(tabId)?.urlAtSnapshot ?? null
 }
 
+/**
+ * The @eN high-water mark for a tab: how many refs it has ever minted (the
+ * health read's "has this tab been read" fact, distinct from `size`, which
+ * a navigation zeroes while the counter survives).
+ */
+export function mintedCount(tabId: number): number {
+  return counters.get(tabId) ?? 0
+}
+
 export function resetForTests(): void {
   cache.clear()
   counters.clear()
