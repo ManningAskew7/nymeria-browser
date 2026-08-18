@@ -167,10 +167,13 @@ describe('settle transport deadline', () => {
  * These EXECUTE the probe expression in happy-dom instead of matching it as
  * a string, the gap backlog #160 recorded for this exact probe ("a string no
  * test ever executes"). The mock resolves the expression's promise the way
- * `awaitPromise` does, so the MutationObserver logic that IS the settle
- * mechanism, tally included (#180), runs for real.
+ * `awaitPromise` does, so the MutationObserver quiescence logic that IS the
+ * settle mechanism runs for real. (The mutation TALLY deliberately does not
+ * live here: #180's QA round measured a settle-window tally blind to
+ * synchronous handler reactions; it rides the delivery probe now, and its
+ * executing tests live in delivery.test.ts.)
  */
-describe('settle probe execution (#180)', () => {
+describe('settle probe execution', () => {
   function installRunningMock(): void {
     resetDebugger()
     ;(chrome.debugger.sendCommand as unknown) = vi.fn(
@@ -184,7 +187,7 @@ describe('settle probe execution (#180)', () => {
     )
   }
 
-  it('counts the mutations the page makes during the window', async () => {
+  it('waits out a mutating page and resolves quiet once it stills', async () => {
     installRunningMock()
 
     const pending = settle(TAB, { quietMs: 40, maxMs: 2_000 })
@@ -198,18 +201,8 @@ describe('settle probe execution (#180)', () => {
     }
     const result = await pending
 
+    expect(result.settled).toBe(true)
     expect(result.reason).toBe('quiet')
-    expect(result.mutations).toBeGreaterThanOrEqual(1)
-  })
-
-  it('reports an honest zero when the page never reacted', async () => {
-    // Zero is the STRONG signal (the phantom add-to-cart shape): it must be
-    // a measured tally of a quiet window, never an omission or a default.
-    installRunningMock()
-
-    const result = await settle(TAB, { quietMs: 40, maxMs: 2_000 })
-
-    expect(result.reason).toBe('quiet')
-    expect(result.mutations).toBe(0)
+    expect(result.ms).toBeGreaterThanOrEqual(40)
   })
 })

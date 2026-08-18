@@ -35,6 +35,10 @@ function cdpEmitter(): CdpListener {
 interface MockOpts {
   /** Rect the element reports inside its own frame. */
   frameLocalRect?: { x: number; y: number; w: number; h: number }
+  /** Answer the delivery probe's arm/read/tally (#180): most tests here
+   * leave the probe unarmable (delivery has its own executed-for-real
+   * tests), but the tally tests need a live probe in the FRAME's world. */
+  deliveryArmed?: boolean
 }
 
 function installCdpMock(opts: MockOpts = {}) {
@@ -73,8 +77,14 @@ function installCdpMock(opts: MockOpts = {}) {
       }
       if (method === 'Runtime.evaluate') {
         const expression = String(params.expression ?? '')
-        if (expression.includes('MutationObserver')) return { result: { value: { s: 'quiet', m: 0 } } }
+        if (expression.includes('readyState')) return { result: { value: 'quiet' } }
         if (expression.includes('activeElement')) return { result: { value: null } }
+        if (opts.deliveryArmed === true) {
+          if (expression.includes('addEventListener')) return { result: { value: true } }
+          if (expression.includes('nymTally')) return { result: { value: 2 } }
+          if (expression.includes('nymPeek')) return { result: { value: null } }
+          if (expression.includes('__nymDelivery')) return { result: { value: { n: 1 } } }
+        }
         return { result: { value: undefined } }
       }
       return {}
@@ -2478,12 +2488,13 @@ describe('act payload frame attribution (#201)', () => {
     expect('resolved_frame' in (result.data as Record<string, unknown>)).toBe(false)
   })
 
-  it('an in-frame act withholds the settle mutation tally (#180 review, H1)', async () => {
-    // The tally's observer watches the ROOT document; an act that resolved
-    // into a subframe mutates the frame's own document, which the observer
-    // can never see, so a truthful-looking zero would teach "the page did
-    // nothing" about the one document it never watched. Absent, not zero.
-    installCdpMock()
+  it("an in-frame act's tally watches the FRAME's own document (#180 QA round 2)", async () => {
+    // The first tally build observed the ROOT document from the settle
+    // probe and had to be withheld for in-frame acts (a truthful-looking
+    // zero about a document it never watched). The probe-world tally arms
+    // on the frame's OWN session, so an in-frame act now carries a valid
+    // count instead of a hole in its flagship path.
+    installCdpMock({ deliveryArmed: true })
     await attachFrame()
     setRefs(TAB, frameRef('https://pay.example/card'), TAB_URL)
 
@@ -2493,9 +2504,7 @@ describe('act payload frame attribution (#201)', () => {
     expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(
       'https://pay.example/card',
     )
-    const settled = (result.data as { settled?: { mutations?: number } }).settled
-    expect(settled).toBeDefined()
-    expect(settled?.mutations).toBeUndefined()
+    expect((result.data as { dom_mutations?: number }).dom_mutations).toBe(2)
   })
 
   it('a disabled refusal on a frame element still names the frame', async () => {

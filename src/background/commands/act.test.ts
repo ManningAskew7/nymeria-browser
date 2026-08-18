@@ -56,8 +56,11 @@ interface MockOptions {
   value?: string | null
   resolveNode?: boolean
   settleValue?: string
-  /** Mutation-record count the settle probe reports (#180); null omits `m`. */
-  settleMutations?: number | null
+  /** What the delivery probe's tally read (nymTally) answers (#180). */
+  deliveryTally?: number
+  /** Thrown for the tally read; defaults to deliveryReadThrows (a dead
+   * context kills the read and the tally alike). */
+  deliveryTallyThrows?: string
   bodyText?: string
   selectMatches?: boolean
   /** false models a tab where the delivery probe's world cannot be created. */
@@ -181,7 +184,8 @@ function installCdpMock(opts: MockOptions = {}) {
     value = 'old value',
     resolveNode = true,
     settleValue = 'quiet',
-    settleMutations = 3,
+    deliveryTally = 3,
+    deliveryTallyThrows = opts.deliveryReadThrows,
     bodyText = '',
     selectMatches = true,
     deliveryWorld = true,
@@ -371,6 +375,10 @@ function installCdpMock(opts: MockOptions = {}) {
         if (expression.includes('nymPeek')) {
           return { result: { value: deliveryPeek ?? null } }
         }
+        if (expression.includes('nymTally')) {
+          if (deliveryTallyThrows) throw new Error(deliveryTallyThrows)
+          return { result: { value: deliveryTally } }
+        }
         if (deliveryReadThrows) throw new Error(deliveryReadThrows)
         if (deliveryRead) return { result: { value: deliveryRead } }
         return { result: { value: { n: deliveryCount, f: fileChooserOpened } } }
@@ -396,13 +404,7 @@ function installCdpMock(opts: MockOptions = {}) {
       if (expression.includes('elementFromPoint')) {
         return { result: { value: { description: pointDescription, opensFileChooser: isFileInput } } }
       }
-      if (expression.includes('MutationObserver')) {
-        return {
-          result: {
-            value: { s: settleValue, ...(settleMutations === null ? {} : { m: settleMutations }) },
-          },
-        }
-      }
+      if (expression.includes('readyState')) return { result: { value: settleValue } }
       if (expression.includes('activeElement')) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
       }
@@ -1032,39 +1034,52 @@ describe('verification payload', () => {
     expect((result.data as { settled: { reason: string } }).settled.reason).toBe('deadline')
   })
 
-  it('the settle verdict carries the mutation tally: did the page react at all (#180)', async () => {
+  it('dom_mutations rides the payload: did the acted document react at all (#180)', async () => {
     // The measured phantom add-to-cart carried every per-field truth and
-    // no page reaction; the observer was already watching and threw the
-    // tally away. Now it rides the settled object.
+    // no page reaction. The tally is the delivery probe's own observer,
+    // armed BEFORE dispatch (QA round 2 measured a settle-window tally
+    // blind to synchronous handler reactions) and read after settle.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
-    installCdpMock({ settleValue: 'quiet', settleMutations: 7 })
+    installCdpMock({ deliveryTally: 7 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    expect((result.data as { settled: { mutations?: number } }).settled.mutations).toBe(7)
+    expect((result.data as { dom_mutations?: number }).dom_mutations).toBe(7)
   })
 
-  it('ZERO mutations is reported, not omitted: it is the strong signal (#180)', async () => {
+  it('ZERO dom_mutations is reported, not omitted: it is the strong signal (#180)', async () => {
     // Nonzero is weak (dynamic pages mutate constantly); zero says the
-    // page did nothing observable with the input, which is exactly the
-    // fact both live drives had to invent per-site controls to learn.
+    // acted document did nothing observable with the input, which is
+    // exactly the fact both live drives invented per-site controls to learn.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
-    installCdpMock({ settleValue: 'quiet', settleMutations: 0 })
+    installCdpMock({ deliveryTally: 0 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    expect((result.data as { settled: { mutations?: number } }).settled.mutations).toBe(0)
+    expect((result.data as { dom_mutations?: number }).dom_mutations).toBe(0)
   })
 
-  it('a settle whose probe never ran reports no tally rather than a fake zero (#180)', async () => {
+  it('a NAVIGATING act carries no tally: the observer died with the document (#180)', async () => {
+    // The settle-window version leaked the DESTINATION document's count
+    // (measured live: mutations 5 on a navigating click). The probe-world
+    // tally dies with the acted document, so the key is honestly absent.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
-    installCdpMock({ settleValue: 'unavailable', settleMutations: null })
+    installCdpMock({ deliveryReadThrows: 'Cannot find context with specified id' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    const settled = (result.data as { settled: { reason: string; mutations?: number } }).settled
-    expect(settled.reason).toBe('unavailable')
-    expect(settled.mutations).toBeUndefined()
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    expect((result.data as { dom_mutations?: number }).dom_mutations).toBeUndefined()
+  })
+
+  it('an unprobed verb (hover) carries no tally rather than a guess (#180)', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ deliveryTally: 7 })
+
+    const result = await execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { dom_mutations?: number }).dom_mutations).toBeUndefined()
   })
 
   it('reports not-found on timeout instead of claiming success', async () => {
@@ -1407,7 +1422,7 @@ describe('verification payload', () => {
     expect('found' in data).toBe(false)
     expect(data.settled?.reason).toBe('quiet')
     const settleProbes = cdp.mock.calls.filter(
-      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('MutationObserver'),
+      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('readyState'),
     )
     expect(settleProbes, 'one settle, not a settle plus a second probe').toHaveLength(1)
     expect(String((settleProbes[0][2] as { expression: string }).expression)).toContain('3000')
@@ -1426,7 +1441,7 @@ describe('verification payload', () => {
       expect('condition' in data).toBe(false)
       expect('found' in data).toBe(false)
       const settleProbes = cdp.mock.calls.filter(
-        (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('MutationObserver'),
+        (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('readyState'),
       )
       expect(settleProbes).toHaveLength(1)
       expect(
@@ -4241,19 +4256,13 @@ describe('wall-clock budget (#162)', () => {
     const data = result.data as Record<string, unknown>
     expect(data.budget_clamped, 'an unsettled clamped window must carry the marker').toBe(true)
     const settleProbes = cdp.mock.calls.filter(
-      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('MutationObserver'),
+      (c) => c[1] === 'Runtime.evaluate' && String((c[2] as { expression?: string }).expression).includes('readyState'),
     )
     expect(settleProbes).toHaveLength(1)
     const expr = String((settleProbes[0][2] as { expression: string }).expression)
     const deadlineMs = Number(expr.match(/Date\.now\(\) \+ (\d+)/)?.[1])
     expect(deadlineMs, 'the 20s ask must shrink to the ~1.5s remaining').toBeLessThanOrEqual(1_500)
     expect(deadlineMs).toBeGreaterThan(0)
-    // A tally from the budget-shrunken window would read as "the page did
-    // nothing" about time nobody watched (#180 plan E5): absent, not zero.
-    expect(
-      (data.settled as { mutations?: number }).mutations,
-      'a clamped unsettled window must not report a tally',
-    ).toBeUndefined()
   })
 
   it('a budget dying on the preparatory hover says NO click was pressed, not "mid-action"', async () => {

@@ -130,6 +130,22 @@ export interface DeliveryProbe {
    * stores nothing.
    */
   peek(): Promise<void>
+  /**
+   * The mutation tally: DOM changes to the PROBED document since the arm,
+   * read once after the action settled, disconnecting the observer (#180
+   * QA round 2). The observer installs WITH the arm, before any input goes
+   * out, because live QA measured the settle-window version blind to
+   * synchronous handler reactions (a status line demonstrably rewritten,
+   * tally 0): most real reactions ARE synchronous, so a post-dispatch
+   * watch gutted the zero-is-strong signal. Armed pre-dispatch, the window
+   * covers handler-time writes AND the settle window. It lives in the
+   * probe's isolated world, so it watches the document the act actually
+   * targeted (a frame ref's own document included) and a hostile page
+   * cannot feed it a number. Returns null when nothing can be said: the
+   * document died (a navigating act: the new document is the reaction),
+   * the world never armed, or the read failed.
+   */
+  tally(): Promise<number | null>
 }
 
 /**
@@ -260,6 +276,7 @@ function armExpression(types: readonly string[], id: string): string {
       for (var k in reg) {
         if (reg[k] && now - reg[k].t > ${ORPHAN_MS}) {
           try { reg[k].off(); } catch (e) {}
+          try { if (reg[k].moOff) reg[k].moOff(); } catch (e) {}
           delete reg[k];
         }
       }
@@ -269,6 +286,12 @@ function armExpression(types: readonly string[], id: string): string {
       var clickTarget = null;
       var uaEvent = null;
       var offs = [];
+      var muts = 0;
+      var mo = null;
+      try {
+        mo = new MutationObserver(function(rs){ muts += rs.length; });
+        mo.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
+      } catch (err) { mo = null; }
       var push = function(){
         try {
           if (typeof g.${PUSH_BINDING} === 'function') {
@@ -310,7 +333,9 @@ function armExpression(types: readonly string[], id: string): string {
       reg[id] = {
         t: now,
         snap: function(){ return { n: n, types: counts, prevented: prevented, target: clickTarget, uae: uaEvent }; },
-        off: function(){ for (var j = 0; j < offs.length; j++) { try { offs[j](); } catch (e) {} } }
+        off: function(){ for (var j = 0; j < offs.length; j++) { try { offs[j](); } catch (e) {} } },
+        muts: mo ? function(){ return muts; } : null,
+        moOff: function(){ try { if (mo) mo.disconnect(); } catch (e) {} }
       };
       return true;
     } catch (e) {
@@ -349,7 +374,9 @@ function readExpression(id: string): string {
         out.ua = ua ? { a: ua.isActive === true, h: ua.hasBeenActive === true } : null;
       } catch (e) { out.ua = null; }
       try { p.off(); } catch (e) {}
-      delete reg[id];
+      // The entry survives the read: its MutationObserver keeps watching
+      // until the post-settle tally read disconnects it (or the orphan
+      // sweep does). Only the input listeners come off here.
       return out;
     };
     var pre = p.snap ? p.snap() : { n: 0 };
@@ -357,6 +384,23 @@ function readExpression(id: string): string {
     var composed = ((t.click || 0) + (t.contextmenu || 0) + (t.dblclick || 0)) > 0;
     if (!composed || pre.prevented !== null) return finish();
     return new Promise(function(resolve){ setTimeout(resolve, 0); }).then(finish);
+  })(${JSON.stringify(id)})`
+}
+
+/** The tally read (marker: nymTally): the observer's count since arm, then
+ * disconnect and drop the registry entry. Runs AFTER settle, so the window
+ * spans handler-time writes through the settled page. */
+function tallyExpression(id: string): string {
+  return `(function(id){ /* nymTally */
+    var g = globalThis;
+    var reg = g.__nymDelivery;
+    if (!reg) return null;
+    var p = reg[id];
+    if (!p) return null;
+    var m = p.muts ? p.muts() : null;
+    try { if (p.moOff) p.moOff(); } catch (e) {}
+    delete reg[id];
+    return m;
   })(${JSON.stringify(id)})`
 }
 
@@ -454,6 +498,7 @@ const UNARMED: DeliveryProbe = {
     reason: 'the delivery probe could not be armed in the target document',
   }),
   peek: async () => {},
+  tally: async () => null,
 }
 
 /**
@@ -550,6 +595,14 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
         return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
       return enrich({ outcome: value.n > 0 ? 'yes' : 'no' }, value)
+    },
+    async tally(): Promise<number | null> {
+      const result = await evaluateInWorld<number | null>(target, world, tallyExpression(id))
+      if (result.ok && typeof result.value === 'number') return result.value
+      // A dead context (the act navigated) or any read failure: nothing
+      // can be said, and null keeps the payload key honestly absent.
+      if (!result.ok && result.contextGone) clearWorld(target)
+      return null
     },
   }
 }

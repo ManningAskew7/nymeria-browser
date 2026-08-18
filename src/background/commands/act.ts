@@ -3637,20 +3637,6 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // be false. Marked only when the clamp plausibly changed the verdict.
   if (settleWindowMs < settleAskedMs && !settleResult.settled) {
     extra.budget_clamped = true
-    // A tally from a window the budget cut to ~nothing reads as "the page
-    // did nothing", which is the strong-signal lie: absent means unwatched.
-    delete settleResult.mutations
-  }
-  // The tally watches the ROOT document, and an act that resolved into a
-  // subframe mutates the frame's own document, which the observer can
-  // never see (review round, H1): a truthful-looking zero there is the
-  // phantom-success advice run backwards, so the tally is withheld rather
-  // than allowed to under-claim on the surface's flagship frame paths.
-  // Both attribution sources land in `extra` by this point: the
-  // target-backed bag (Object.assign above) and the ref-less keyboard
-  // path's confirmed-frame claim.
-  if (extra.resolved_frame !== undefined) {
-    delete settleResult.mutations
   }
   // A dialog can open DURING settle too (a deferred handler); the check must
   // come before `buildVerification`, whose probes are renderer-bound and
@@ -3711,6 +3697,17 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         resolution: describeResolution(resolved),
       }
     }
+  }
+  // The mutation tally (#180, QA round 2): the delivery probe's observer
+  // has watched the ACTED document since before dispatch; read it now,
+  // after settle and the fused wait, so the window spans synchronous
+  // handler reactions through the settled page. Null (a navigated
+  // document, an unarmable world, a failed read) keeps the key absent:
+  // zero is a strong claim and is only ever a measured one. Skipped past
+  // the budget deadline like the other renderer-bound enrichment.
+  if (probe && !budgetSpent(budgetDeadline)) {
+    const tally = await probe.tally()
+    if (tally !== null) extra.dom_mutations = tally
   }
   const data = await buildVerification({
     action: a.action,

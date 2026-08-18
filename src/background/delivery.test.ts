@@ -40,9 +40,9 @@ function installPushChannel(): (payload: string) => void {
  * event dispatch, so there is no reason to repeat that here.
  */
 function installCdpMock(
-  opts: { world?: boolean; readThrows?: string; armThrows?: string } = {},
+  opts: { world?: boolean; readThrows?: string; armThrows?: string; tallyThrows?: string } = {},
 ) {
-  const { world = true, readThrows, armThrows } = opts
+  const { world = true, readThrows, armThrows, tallyThrows } = opts
   const run = (expression: string): unknown =>
     (new Function(`return (${expression})`) as () => unknown)()
 
@@ -58,10 +58,12 @@ function installCdpMock(
         const expression = String(params.expression ?? '')
         const isArm = expression.includes('addEventListener')
         const isPeek = expression.includes('nymPeek')
+        const isTally = expression.includes('nymTally')
         if (isArm && armThrows) throw new Error(armThrows)
+        if (isTally && tallyThrows) throw new Error(tallyThrows)
         // `readThrows` models the document dying with the final read; the
         // peek (taken earlier, while the document lived) stays runnable.
-        if (!isArm && !isPeek && readThrows) throw new Error(readThrows)
+        if (!isArm && !isPeek && !isTally && readThrows) throw new Error(readThrows)
         // Real CDP resolves the value when `awaitPromise` is set; the read
         // expression yields a macrotask in the page (#180), so the mock
         // must await the same way or it would hand back a pending Promise.
@@ -412,6 +414,47 @@ describe('delivery probe', () => {
     expect(reading.events).toBeUndefined()
   })
 
+  it('the tally counts document mutations from the arm, surviving the read (#180 QA round 2)', async () => {
+    // Live QA measured the settle-window tally blind to synchronous
+    // handler reactions: the status line demonstrably changed and the
+    // count read 0, a false negative on the strong signal. The observer
+    // now installs WITH the arm, before any input, and keeps watching
+    // through the read until the post-settle tally collects it.
+    installCdpMock()
+
+    const probe = await armDelivery(TAB, ['click'])
+    document.body.appendChild(document.createElement('div')) // handler-time write
+    firePageEvent('click')
+    await probe.read()
+    document.body.appendChild(document.createElement('div')) // settle-window write
+    await new Promise((r) => setTimeout(r, 0)) // flush observer microtasks
+
+    const tally = await probe.tally()
+    expect(tally).not.toBeNull()
+    expect(tally as number).toBeGreaterThanOrEqual(2)
+  })
+
+  it('an untouched document tallies an honest zero (#180)', async () => {
+    installCdpMock()
+
+    const probe = await armDelivery(TAB, ['click'])
+    await new Promise((r) => setTimeout(r, 0))
+
+    expect(await probe.tally()).toBe(0)
+  })
+
+  it('a dead context tallies null, never a fake zero (#180 QA round 2)', async () => {
+    // The settle-window version leaked the DESTINATION document's count on
+    // a navigating act (measured live: 5). The probe-world observer dies
+    // with the acted document, and null keeps the payload key absent.
+    installCdpMock({ tallyThrows: 'Cannot find context with specified id' })
+
+    const probe = await armDelivery(TAB, ['click'])
+    firePageEvent('click')
+
+    expect(await probe.tally()).toBeNull()
+  })
+
   it('installs the push binding scoped to the delivery world, never the page (#180)', async () => {
     // `executionContextName` is the security property: a binding without it
     // would hand page script a callable straight into the background.
@@ -516,21 +559,29 @@ describe('delivery probe', () => {
     expect((await first.read()).outcome).toBe('yes')
   })
 
-  it('removes its listener and its global once read', async () => {
+  it('removes its listeners at read and its global once tallied (#180)', async () => {
     installCdpMock()
+    const registry = () =>
+      (globalThis as Record<string, unknown>).__nymDelivery as Record<string, unknown>
 
     const probe = await armDelivery(TAB, ['mousedown'])
     await probe.read()
 
-    const registry = (globalThis as Record<string, unknown>).__nymDelivery as Record<
-      string,
-      unknown
-    >
-    expect(Object.keys(registry ?? {})).toHaveLength(0)
-    // A later event has nothing stale left to count it twice.
+    // The read strips the input listeners but the entry SURVIVES: its
+    // mutation observer keeps watching until the post-settle tally
+    // collects it (#180 QA round 2 is why the window must reach settle).
+    expect(Object.keys(registry() ?? {})).toHaveLength(1)
+    // A later event still has no stale LISTENER left to count it twice.
     const next = await armDelivery(TAB, ['mousedown'])
     firePageEvent('mousedown')
-    expect((await next.read()).outcome).toBe('yes')
+    const reading = await next.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toEqual({ mousedown: 1 })
+
+    // The tally is the true end of life: both entries drain to nothing.
+    await probe.tally()
+    await next.tally()
+    expect(Object.keys(registry() ?? {})).toHaveLength(0)
   })
 
   it('is one-shot: a second read reports unknown rather than re-reading', async () => {

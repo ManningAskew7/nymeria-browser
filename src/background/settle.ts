@@ -27,19 +27,6 @@ export interface SettleResult {
   settled: boolean
   reason: SettleReason
   ms: number
-  /**
-   * MutationObserver records seen during the settle window (#180): the
-   * observer was already watching for quiescence and throwing the tally
-   * away, while "did the page visibly react AT ALL" is exactly what an
-   * act's verification lacks (the measured phantom add-to-cart carried
-   * every per-field truth and no page reaction). ZERO is the strong
-   * signal, a page that did nothing observable; nonzero is weak, since
-   * dynamic pages mutate constantly. Root document, main world (a page
-   * faking its own mutation count only fails itself, the settle probe's
-   * standing decision); absent when the probe never ran (`navigated`,
-   * `unavailable`).
-   */
-  mutations?: number
 }
 
 export const DEFAULT_QUIET_MS = 250
@@ -58,34 +45,35 @@ function isContextGone(message: string): boolean {
 
 function probeExpression(quietMs: number, maxMs: number): string {
   // Runs in the page. `Date.now()` here is page JS, not extension JS.
-  // Resolves { s: reason, m: mutation-record count }: the observer was
-  // already watching, and the tally is the payload's "did the page react
-  // at all" fact (#180; see SettleResult.mutations).
+  // Quiescence ONLY, deliberately: a mutation TALLY lived here for one
+  // build (#180) and live QA measured it blind to synchronous handler
+  // reactions (the observer installs after dispatch) and leaking the
+  // destination document's count on navigating acts. The tally now rides
+  // the delivery probe, armed before dispatch (delivery.ts::tally).
   return `new Promise((resolve) => {
     try {
       const quietMs = ${quietMs};
       const deadline = Date.now() + ${maxMs};
       let last = Date.now();
-      let muts = 0;
-      const obs = new MutationObserver((records) => { last = Date.now(); muts += records.length; });
+      const obs = new MutationObserver(() => { last = Date.now(); });
       obs.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
       const tick = () => {
         const now = Date.now();
         if (document.readyState === 'complete' && now - last >= quietMs) {
           obs.disconnect();
-          resolve({ s: 'quiet', m: muts });
+          resolve('quiet');
           return;
         }
         if (now >= deadline) {
           obs.disconnect();
-          resolve({ s: 'deadline', m: muts });
+          resolve('deadline');
           return;
         }
         setTimeout(tick, 50);
       };
       tick();
     } catch (e) {
-      resolve({ s: 'unavailable' });
+      resolve('unavailable');
     }
   })`
 }
@@ -308,18 +296,10 @@ export async function settle(
     if (resp.exceptionDetails) {
       return { settled: false, reason: 'unavailable', ms: elapsed() }
     }
-    const value = resp.result?.value as { s?: unknown; m?: unknown } | null | undefined
-    const status = value && typeof value === 'object' ? value.s : undefined
+    const value = resp.result?.value
     const reason: SettleReason =
-      status === 'quiet' ? 'quiet' : status === 'deadline' ? 'deadline' : 'unavailable'
-    const mutations =
-      value && typeof value === 'object' && typeof value.m === 'number' ? value.m : null
-    return {
-      settled: reason === 'quiet',
-      reason,
-      ms: elapsed(),
-      ...(mutations === null ? {} : { mutations }),
-    }
+      value === 'quiet' ? 'quiet' : value === 'deadline' ? 'deadline' : 'unavailable'
+    return { settled: reason === 'quiet', reason, ms: elapsed() }
   } catch (e) {
     const message = e instanceof Error ? e.message : String(e)
     if (isContextGone(message)) {
