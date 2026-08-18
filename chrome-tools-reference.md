@@ -955,6 +955,12 @@ Read console messages and uncaught exceptions from a Chrome tab.
     The browser's OWN refusals (X-Frame-Options, CSP, mixed content, CORS)
     appear as entries marked "browser": true, so a silently blocked action
     usually names its blocker here in one read.
+
+    Capture runs while the tab is being driven, not continuously, and the
+    gaps are flagged the same way chrome_network flags them: a first read
+    starts capture (nothing before it was seen), a read after a pause says
+    the lapse and how long it went unwatched. An answer the limit cut says
+    how many entries it cut (200 are buffered per tab).
 ````
 
 ---
@@ -1012,7 +1018,8 @@ Read the network requests a Chrome tab made, with status codes.
     It is not continuous, and the gaps are flagged rather than left to look
     like silence. A first read of a tab attaches it, so nothing was captured
     before that read; a read after a pause re-attaches it, so what the page
-    did between your commands was not seen. Separately, a frame's LOAD-TIME
+    did between your commands was not seen (the note says how long the lapse
+    lasted when that is known). Separately, a frame's LOAD-TIME
     requests often precede capture reaching that frame (its session attaches
     moments after the frame starts loading), so an iframe's early requests
     being absent is not evidence they never happened. A load-time failure
@@ -1071,6 +1078,51 @@ Answer the JS dialog standing on a tab you are driving.
     command had touched the tab. Ownership cannot be taken retroactively
     (measured), so that case returns an honest explanation, and the recovery
     is the user clearing it on screen or closing the tab.
+````
+
+---
+
+## chrome_health
+
+Args schema:
+
+```json
+{
+  "tab_id": {
+    "title": "Tab Id",
+    "type": "integer"
+  }
+}
+```
+
+Description (verbatim docstring):
+
+````
+One read that says whether a Chrome tab is healthy and what state it is in.
+
+    Reach for it when a tab has gone quiet, after a pause, or before retrying
+    something that failed: it replaces scattering probes across chrome_console,
+    chrome_network and a throwaway action. It has NO side effects: it does not
+    attach the tab, start capture, or touch the page.
+
+    The payload carries: the tab itself (url, title, load status); whether the
+    debugger is attached and whether capture ever ran this worker life;
+    console/network buffer sizes (unfiltered, up to 200 per tab; a filtered
+    read like chrome_console's errors-only default may return fewer) and,
+    when capture lapsed, how long the tab went unwatched; any standing dialog
+    (answer it with chrome_dialog), recently auto-resolved dialog, or
+    intercepted file chooser; a navigation still in flight or the last one
+    that died; the last main-frame HTTP status when the page-status grant is
+    on (absent means unknown, never OK); how many refs are held and minted
+    (refs survive worker recycles; a navigation invalidates them); when the
+    tab was last driven and by which command; and input_swallowed, evidence
+    from the last action whose trusted input was observed to be discarded
+    (Chrome exposes no readable flag, so this is evidence with an age, not
+    live state: a navigation since may have cleared the condition, and it is
+    cleared here once input is seen flowing again).
+
+    Absent keys mean unknown or none, never fine. Ages are age_ms
+    (milliseconds ago).
 ````
 
 ---
