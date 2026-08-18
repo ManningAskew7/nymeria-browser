@@ -2171,7 +2171,7 @@ describe('input delivery', () => {
     expect(await suppressionEvidence(TAB)).toBeNull()
   })
 
-  it('stamps positive delivery evidence on a COUNTED yes, with its document (#202)', async () => {
+  it('stamps positive delivery evidence on a trusted yes, tied to the pre-action document (#202)', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryCount: 1 })
 
@@ -2181,34 +2181,36 @@ describe('input delivery', () => {
     expect(ok?.action).toBe('click')
     expect(typeof ok?.at).toBe('number')
     expect(ok?.url).toBe(TAB_URL)
+    expect(typeof ok?.navSeq).toBe('number')
   })
 
-  it('a context-gone "yes" clears negative evidence but never mints positive (#202)', async () => {
-    // The navigated inference is proof enough to SPEND a swallow stamp, not
-    // to CLAIM delivery: a positive built on it is the stale-claim trap the
-    // filing names.
+  it('a NAVIGATING click stamps too: input_ok carries input_delivered\'s own verdict (#202 QA)', async () => {
+    // The v0.13.0 QA round measured the counted-only gate leaving the
+    // navigating click, the field's design case, unstamped while
+    // input_delivered said yes beside it. The context-gone read IS this
+    // module's delivery verdict, so the stamp follows it; the stamp's url
+    // is the PRE-navigation document, which is what makes health's
+    // on_current_url: false the good-news shape the docstring teaches.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ deliveryReadThrows: 'Cannot find context with specified id' })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
-    expect(await provenDelivery(TAB)).toBeNull()
+    const ok = await provenDelivery(TAB)
+    expect(ok?.action).toBe('click')
+    expect(ok?.url).toBe(TAB_URL)
   })
 
-  it('a zero-count peek on the navigated path never mints positive evidence (#202)', async () => {
-    // The peek proves counts only when it COUNTED: n === 0 restores nothing,
-    // and the navigated "yes" stays an inference (review round: this guard
-    // was the one unpinned line).
+  it('a SYNTHETIC act never stamps positive evidence (#202)', async () => {
+    // The stamp sits inside the trusted-mode gate: a synthetic degrade
+    // proves nothing about browser-level delivery.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
-    installCdpMock({
-      deliveryReadThrows: 'Cannot find context with specified id',
-      deliveryPeek: { n: 0, types: {} },
-    })
+    installCdpMock({ geometry: null, deliveryCount: 1 })
 
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
-    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    expect((result.data as { input?: string }).input).toBe('synthetic')
     expect(await provenDelivery(TAB)).toBeNull()
   })
 

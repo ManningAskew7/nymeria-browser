@@ -88,14 +88,6 @@ export interface DeliveryReading {
    */
   events?: Record<string, number>
   /**
-   * Set ONLY when a "yes" rests on a nonzero in-page COUNT (a direct read,
-   * or the peek's snapshot taken just after dispatch on the navigated
-   * path). A bare context-gone "yes" is an inference and never carries it:
-   * the positive evidence stamp (#202) gates on this, because a claim
-   * minted from an inference is the stale-claim trap by another name.
-   */
-  counted?: true
-  /**
    * `defaultPrevented` of the last COMPOSED click-family event (`click`,
    * `contextmenu`, `dblclick`), sampled a tick after dispatch so page
    * handlers have had their turn (our capture listener runs FIRST, before
@@ -369,11 +361,7 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
         if (result.contextGone) {
           clearWorld(target)
           const reading: DeliveryReading = { outcome: 'yes' }
-          if (peeked) {
-            if (peeked.n > 0) reading.counted = true
-            return enrich(reading, peeked)
-          }
-          return reading
+          return peeked ? enrich(reading, peeked) : reading
         }
         return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
@@ -381,10 +369,7 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
       if (!value || typeof value.n !== 'number') {
         return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
-      return enrich(
-        { outcome: value.n > 0 ? 'yes' : 'no', ...(value.n > 0 ? { counted: true as const } : {}) },
-        value,
-      )
+      return enrich({ outcome: value.n > 0 ? 'yes' : 'no' }, value)
     },
   }
 }
@@ -512,19 +497,26 @@ export async function suppressionEvidence(tabId: number): Promise<SuppressionEvi
 }
 
 /**
- * Positive delivery EVIDENCE, per tab (#202): the last act whose probe
- * COUNTED trusted events arriving in the page. The suppression store's
- * twin, with a deliberately HIGHER bar: a context-gone "yes" (the document
- * navigated away before the probe could be read) is proof enough to CLEAR
- * negative evidence, but it is an inference, and a positive claim built on
- * it would be exactly the stale-claim trap the #202 filing names. Only a
- * counted event stamps.
+ * Positive delivery EVIDENCE, per tab (#202): the last act whose trusted
+ * input was proven delivered. The suppression store's twin, and it carries
+ * the SAME verdict `input_delivered: "yes"` ships, context-gone included:
+ * this module's own measured position is that a destroyed probe world
+ * means the action navigated the document, which IS delivery (see read()).
+ * A stricter counted-only gate shipped first and QA measured the
+ * incoherence: the navigating click, the case the field was designed for,
+ * never stamped (v0.13.0, operator-reproduced), while input_delivered
+ * said yes beside it. One system, one verdict.
  *
  * `url` is the TAB URL the delivery was proven under (browser-API truth
  * from the act's own pre-dispatch read, null when that read failed; for an
- * in-frame act it is still the tab's top-level URL, not the frame's): the
- * health read compares it against the tab's current URL so a stamp from an
- * earlier page reads as what it is.
+ * in-frame act it is still the tab's top-level URL, not the frame's).
+ * `navSeq` is the tab's commit seq sampled BEFORE the action: the proof
+ * belongs to the pre-navigation document, so the click's own commit makes
+ * the seq differ and health's `on_current_url` reads false immediately,
+ * the designed good-news shape. It also kills the measured
+ * coincidental-return lie: a later navigation BACK to the stamp's URL
+ * matches on text but not on seq. Per-worker (navWatch is in-memory), so
+ * health only judges identity for same-worker stamps.
  *
  * Same storage rationale as the suppression store above: storage-only,
  * fire-and-forget writes, shape-validated reads, health the sole reader.
@@ -535,6 +527,7 @@ export interface DeliveryEvidence {
   at: number
   action: string
   url: string | null
+  navSeq: number | null
 }
 
 const OK_PREFIX = 'nymInputOk:'
@@ -543,9 +536,14 @@ function okKey(tabId: number): string {
   return `${OK_PREFIX}${tabId}`
 }
 
-/** An act's trusted input was COUNTED arriving in the page. */
-export function recordProvenDelivery(tabId: number, action: string, url: string | null): void {
-  const evidence: DeliveryEvidence = { at: Date.now(), action, url }
+/** An act's trusted input was proven delivered. */
+export function recordProvenDelivery(
+  tabId: number,
+  action: string,
+  url: string | null,
+  navSeq: number | null,
+): void {
+  const evidence: DeliveryEvidence = { at: Date.now(), action, url, navSeq }
   try {
     void chrome.storage.session.set({ [okKey(tabId)]: evidence }).catch(() => undefined)
   } catch {
@@ -566,9 +564,19 @@ export function clearProvenDelivery(tabId: number): void {
 export async function provenDelivery(tabId: number): Promise<DeliveryEvidence | null> {
   try {
     const got = await chrome.storage.session.get(okKey(tabId))
-    const raw = got?.[okKey(tabId)] as { at?: unknown; action?: unknown; url?: unknown } | undefined
+    const raw = got?.[okKey(tabId)] as {
+      at?: unknown
+      action?: unknown
+      url?: unknown
+      navSeq?: unknown
+    } | undefined
     if (raw && typeof raw.at === 'number' && typeof raw.action === 'string') {
-      return { at: raw.at, action: raw.action, url: typeof raw.url === 'string' ? raw.url : null }
+      return {
+        at: raw.at,
+        action: raw.action,
+        url: typeof raw.url === 'string' ? raw.url : null,
+        navSeq: typeof raw.navSeq === 'number' ? raw.navSeq : null,
+      }
     }
   } catch {
     /* fall through */

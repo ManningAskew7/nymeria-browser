@@ -289,7 +289,7 @@ describe('execHealth', () => {
   })
 
   it('reports positive delivery evidence with its document check (#202)', async () => {
-    recordProvenDelivery(TAB, 'click', TAB_URL)
+    recordProvenDelivery(TAB, 'click', TAB_URL, 0)
     await Promise.resolve()
 
     const data = payload(await execHealth({ tab_id: TAB }))
@@ -304,7 +304,7 @@ describe('execHealth', () => {
   it('a stamp from an EARLIER document says so instead of masquerading (#202)', async () => {
     // The stale-claim guard: proof about a previous document must not read
     // as evidence about the one the tab now shows.
-    recordProvenDelivery(TAB, 'fill', 'https://example.com/checkout/step-1')
+    recordProvenDelivery(TAB, 'fill', 'https://example.com/checkout/step-1', 0)
     await Promise.resolve()
 
     const data = payload(await execHealth({ tab_id: TAB }))
@@ -312,14 +312,53 @@ describe('execHealth', () => {
     expect((data.input_ok as Record<string, unknown>).on_current_url).toBe(false)
   })
 
-  it('positive evidence survives a worker recycle via its storage mirror (#202)', async () => {
+  it('a coincidental RETURN to the stamped URL never reads true: identity is the seq (#202 QA)', async () => {
+    // Measured live (v0.13.0 round): a 21s-old stamp read on_current_url
+    // true because the tab had navigated AWAY and BACK to the URL the
+    // stamp was earned on. Same URL text, different document. The stamp's
+    // pre-action commit seq is the identity; a mismatch is false no
+    // matter what the URL says.
+    recordProvenDelivery(TAB, 'click', TAB_URL, 5)
+    await Promise.resolve()
+
+    const data = payload(await execHealth({ tab_id: TAB }))
+
+    const ok = data.input_ok as Record<string, unknown>
+    expect(ok.url).toBe(TAB_URL)
+    expect(ok.on_current_url).toBe(false)
+  })
+
+  it('a cross-recycle stamp shows its url but OMITS the identity claim (#202)', async () => {
+    // navWatch's seq lives in worker memory: a stamp from a previous
+    // worker cannot be judged against it, and unknown must be absence,
+    // never a guess in either direction.
     await chrome.storage.session.set({
-      [`nymInputOk:${TAB}`]: { at: Date.now() - 5_000, action: 'click', url: TAB_URL },
+      [`nymInputOk:${TAB}`]: {
+        at: WORKER_STARTED_AT - 5_000,
+        action: 'click',
+        url: TAB_URL,
+        navSeq: 0,
+      },
     })
 
     const data = payload(await execHealth({ tab_id: TAB }))
 
-    expect((data.input_ok as Record<string, unknown>).action).toBe('click')
+    const ok = data.input_ok as Record<string, unknown>
+    expect(ok.action).toBe('click')
+    expect(ok.url).toBe(TAB_URL)
+    expect('on_current_url' in ok).toBe(false)
+  })
+
+  it('a stamp without a usable seq also omits the identity claim (#202)', async () => {
+    await chrome.storage.session.set({
+      [`nymInputOk:${TAB}`]: { at: Date.now(), action: 'click', url: TAB_URL, navSeq: 'zero' },
+    })
+
+    const data = payload(await execHealth({ tab_id: TAB }))
+
+    const ok = data.input_ok as Record<string, unknown>
+    expect(ok.url).toBe(TAB_URL)
+    expect('on_current_url' in ok).toBe(false)
   })
 
   it('ignores a malformed positive stamp instead of reporting garbage (#202)', async () => {

@@ -3548,15 +3548,14 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           recordSwallowedInput(tabId, a.action)
         }
       } else if (delivered === 'yes') {
-        // Proven delivered: whatever was swallowing input has stopped.
+        // Proven delivered: whatever was swallowing input has stopped, and
+        // the positive stamp carries the SAME verdict this payload ships
+        // (#202 QA round: a counted-only gate left the navigating click,
+        // the field's design case, unstamped while input_delivered said
+        // yes beside it). `urlBefore`/`navSeqBefore` tie the proof to the
+        // PRE-navigation document; health judges identity from them.
         clearSwallowedInput(tabId)
-        // The POSITIVE stamp holds a higher bar than the clear (#202): a
-        // bare context-gone "yes" is an inference (good enough to spend
-        // negative evidence, not to mint positive), so only a reading whose
-        // verdict rests on a nonzero in-page COUNT stamps (delivery.ts sets
-        // `counted` at the two read sites). `urlBefore` is the document the
-        // count was proven on; health compares it to the tab's current URL.
-        if (reading.counted === true) recordProvenDelivery(tabId, a.action, urlBefore)
+        recordProvenDelivery(tabId, a.action, urlBefore, navSeqBefore)
       }
       extra.input_delivered = delivered
       if (delivered === 'unknown' && unknownReason) {

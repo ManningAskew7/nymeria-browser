@@ -50,7 +50,7 @@ import {
   standingDialogPayload,
 } from '../dialogs'
 import { readDriveStamp, WORKER_STARTED_AT } from '../driveStamp'
-import { navigationState } from '../navWatch'
+import { commitSeq, navigationState } from '../navWatch'
 import { count as networkCount } from '../networkBuffer'
 import { mintedCount, size as heldRefs, snapshotUrl } from '../snapshotRefs'
 import { isAuthChallenge, lastStatus } from '../statusWatch'
@@ -141,21 +141,33 @@ export async function execHealth(args: unknown): Promise<CommandResult> {
           }
         : {}),
       ...(swallowed ? { input_swallowed: { action: swallowed.action, age_ms: age(now, swallowed.at) } } : {}),
-      // The positive twin (#202): the last act whose probe COUNTED trusted
-      // events arriving. Cross-cleared with the store above, so NORMALLY at
-      // most one renders (two sequential storage reads mean a verdict
-      // landing between them can briefly show both; the smaller age_ms is
-      // the newer verdict). `on_current_url` compares the TAB URL the count
-      // was proven under against the tab's URL now, exact: false is common
-      // and often good news (a navigating click is proven on the page it
-      // was sent from). Absent url on the stamp says nothing either way.
+      // The positive twin (#202): the last act whose trusted input was
+      // proven delivered (input_delivered's own verdict, context-gone
+      // included). Cross-cleared with the store above, so NORMALLY at most
+      // one renders (two sequential storage reads mean a verdict landing
+      // between them can briefly show both; the smaller age_ms is the
+      // newer verdict). `on_current_url` judges DOCUMENT identity, not URL
+      // text: true needs the URL to match AND no page load committed since
+      // the proof (the stamp's pre-action commit seq against the tab's
+      // now), which kills the measured coincidental-return lie (a later
+      // navigation BACK to the stamp's URL is a different document). The
+      // seq lives in worker memory, so a stamp from before this worker
+      // cannot be judged: the key is OMITTED (unknown, never a guess) and
+      // the url still shows. false is common and often good news: a
+      // navigating click is proven on the page it was sent from.
       ...(inputOk
         ? {
             input_ok: {
               action: inputOk.action,
               age_ms: age(now, inputOk.at),
-              ...(inputOk.url !== null
-                ? { url: inputOk.url, on_current_url: inputOk.url === (tab.url ?? null) }
+              ...(inputOk.url !== null ? { url: inputOk.url } : {}),
+              ...(inputOk.url !== null &&
+              inputOk.navSeq !== null &&
+              inputOk.at >= WORKER_STARTED_AT
+                ? {
+                    on_current_url:
+                      inputOk.url === (tab.url ?? null) && commitSeq(tabId) === inputOk.navSeq,
+                  }
                 : {}),
             },
           }
