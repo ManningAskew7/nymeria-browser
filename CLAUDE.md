@@ -212,12 +212,20 @@ POSTs results. Consequences:
   hydration tombstone the tab so a navigated map cannot resurrect). A
   `no-snapshot` refusal now means never-read or navigation-invalidated, and
   the copy says which; mid-QA it is no longer explainable as the recycle.
-  Since v0.11.0 (#188) two more facts ride `chrome.storage.session`, both
+  Since v0.11.0 (#188) more facts ride `chrome.storage.session`, all
   storage-only (no hydration gate, health is their one reader): the per-tab
   last-driven stamp (`driveStamp.ts`, written in `runSingle` for every
-  tab_id command EXCEPT health) and swallowed-input evidence
-  (`delivery.ts`, stamped on a conclusive probe "no", cleared on a proven
-  "yes"). Attach state, buffers, dialogs and statusWatch still reset with
+  tab_id command EXCEPT health), swallowed-input evidence (`delivery.ts`,
+  stamped on a conclusive probe "no", cleared on a proven "yes"), and
+  since v0.13.1 (#202) its positive twin, the delivery-proof stamp
+  (`nymInputOk:`, also `delivery.ts`): written on EVERY trusted
+  `delivered === 'yes'` (context-gone included, carrying the PRE-nav URL
+  and the pre-action commit seq; synthetic never stamps), cross-cleared
+  with the swallow store both ways, cleared on tab close. Its `navSeq` is
+  per-worker navWatch memory, so health omits `on_current_url` for a
+  stamp older than the worker (do not "fix" that by persisting the seq).
+  The three stamps are one copy-pasted pattern; a `sessionStamp` factory
+  is backlog #204. Attach state, buffers, dialogs and statusWatch still reset with
   the worker; `chrome_health` says `worker_recycled_since_drive` when its
   stamp predates the worker.
 - `chrome_health` (v0.11.0, #188): the one-call tab diagnostic. LOCAL READS
@@ -231,7 +239,16 @@ POSTs results. Consequences:
   path (worker-scoped like `capturedEver`, same-lifetime rule), and the
   shared `commands/captureFlags.ts` sampler gives BOTH `chrome_network` and
   `chrome_console` the started-now/resumed split plus `capture_gap_ms`
-  (sample BEFORE the command's own withSession or the lapse is gone).
+  (sample BEFORE the command's own withSession or the lapse is gone); the
+  same sample backs `capture_active: true` on warm reads (v0.13.0, #202),
+  which claims live-at-THIS-read, never continuity. `input_ok` (#202)
+  surfaces the delivery-proof stamp (recycle bullet above) with age,
+  action, url and `on_current_url` = DOCUMENT identity: url match AND
+  `commitSeq(tabId) === stamp.navSeq`; false is the normal navigating-
+  click reading (proven on the page it was sent from), and a doc-level
+  container ref degrades synthetic with a reason that says nothing
+  specific was clicked. Normally at most one of input_ok/input_swallowed
+  appears (two sequential storage reads; smaller age_ms wins).
 - `resolved_frame` (v0.12.0, #201): act payloads attribute the frame the
   TARGET RESOLVED into; `focused` is state, never attribution (hover and
   scroll_to do not move it). Carriage is the post-resolution facts bag
@@ -428,7 +445,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 14-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `c38f0023` / extension `b24db79` (v0.12.0,
+live code at backend commit `2bed5835` / extension `31890b7` (v0.13.1,
 2026-08-18).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):

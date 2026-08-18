@@ -568,7 +568,11 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     Input goes in as real browser-level events, which is what sites that ignore
     script-synthesized clicks (checkout and payment flows especially) require.
     Where that is impossible the result says input was "synthetic" and why, so
-    you can judge whether a site is likely to have honoured it.
+    you can judge whether a site is likely to have honoured it. One shape to
+    know: a ref that names the page itself rather than a control (a
+    document-level container) degrades to a synthetic click whose reason says
+    nothing specific was clicked; when you meant a link or button, act on
+    that element's own ref instead.
 
     Going in at browser level is not the same as arriving: the browser can
     discard the event after accepting it, which is what happens on a tab held by
@@ -973,8 +977,11 @@ Read console messages and uncaught exceptions from a Chrome tab.
     Capture runs while the tab is being driven, not continuously, and the
     gaps are flagged the same way chrome_network flags them: a first read
     starts capture (nothing before it was seen), a read after a pause says
-    the lapse and how long it went unwatched. An answer the limit cut says
-    how many entries it cut (200 are buffered per tab).
+    the lapse and how long it went unwatched, and a read that found capture
+    already live says so positively with "capture_active": true (live when
+    THIS read arrived; a lapse that an earlier command already ended was
+    that command's, so this is not a continuity claim). An answer the limit
+    cut says how many entries it cut (200 are buffered per tab).
 ````
 
 ---
@@ -1033,7 +1040,8 @@ Read the network requests a Chrome tab made, with status codes.
     like silence. A first read of a tab attaches it, so nothing was captured
     before that read; a read after a pause re-attaches it, so what the page
     did between your commands was not seen (the note says how long the lapse
-    lasted when that is known). Separately, a frame's LOAD-TIME
+    lasted when that is known); and a read that found capture already live
+    says so positively with "capture_active": true. Separately, a frame's LOAD-TIME
     requests often precede capture reaching that frame (its session attaches
     moments after the frame starts loading), so an iframe's early requests
     being absent is not evidence they never happened. A load-time failure
@@ -1132,13 +1140,28 @@ One read that says whether a Chrome tab is healthy and what state it is in.
     that died; the last main-frame HTTP status when the page-status grant is
     on (absent means unknown, never OK); how many refs are held and minted
     (refs survive worker recycles; a navigation invalidates them); when the
-    tab was last driven and by which command (the wire command name:
-    "snapshot" is chrome_read_page's, "extract_text" is chrome_read_text's,
-    the rest match their chrome_* tool); and input_swallowed, evidence
-    from the last action whose trusted input was observed to be discarded
+    tab was last driven and by which command (the WIRE name, and a note
+    translates the ones that do not guess to their tool: "snapshot" serves
+    chrome_read_page and chrome_find, "extract_text" is chrome_read_text,
+    "history" is chrome_navigate's back/forward; after a chrome_batch the
+    last sub-action's wire name appears); input_swallowed, evidence from
+    the last action whose trusted input was observed to be discarded
     (Chrome exposes no readable flag, so this is evidence with an age, not
     live state: a navigation since may have cleared the condition, and it is
-    cleared here once input is seen flowing again).
+    cleared here once input is seen flowing again); and input_ok, the
+    positive twin: the last action whose trusted input was proven
+    delivered, with the tab URL it was proven under. on_current_url judges
+    DOCUMENT identity, not URL text: true means the same URL AND no page
+    load since the proof, so a later navigation BACK to that URL still
+    reads false (different document), and the key is omitted when identity
+    cannot be judged (the proof predates the extension worker). false is
+    common and usually GOOD news: a click that navigates is proven on the
+    page it was sent from, so a fresh stamp with on_current_url false next
+    to a navigation is the input working; only an OLD stamp on a different
+    page is mere history. Each verdict spends the other store, so normally
+    at most one of input_ok / input_swallowed appears; a verdict landing
+    exactly as health reads can briefly show both, and the smaller age_ms
+    is the newer one.
 
     Absent keys mean unknown or none, never fine. Ages are age_ms
     (milliseconds ago).
