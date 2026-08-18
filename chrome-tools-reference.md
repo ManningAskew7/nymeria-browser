@@ -189,6 +189,16 @@ Read a Chrome tab's accessibility tree: the map you act on.
     (relabeled, repurposed by a re-render) is refused with what it was and
     what it is now. Re-read when you see either.
 
+    Refs mark what can be ACTED ON, and nothing else: a link, a button, a
+    field. Static text, list rows and headings never carry one, at ANY
+    detail level, so a page of pure prose renders every row and no refs,
+    which is the read working, not failing (a note says so when it happens).
+    "full" widens what is SHOWN, never what mints. To act where there is no
+    ref, target by css= selector or coordinate. Each document root carries a
+    ref too (its "RootWebArea" line, one per frame): those SCROLL rather than
+    click, and the header's count deliberately leaves them out, so a tree can
+    hold more ref tags than the count names.
+
     detail: "interactive" (default: controls plus enough structure to place
         them), "full" (everything, large), or "minimal" (controls and headings).
     ref: re-root the read at one element, e.g. "@e12" to read just one form.
@@ -319,6 +329,10 @@ Find elements on a Chrome tab by describing them in plain language.
     with ``chrome_act(ref="css=input[type=file]", action="upload")``, which
     resolves through the DOM (open shadow roots included) and does not care
     whether it is visible.
+
+    It searches ACTABLE elements only (the ones a read tags ``[ref=@eN]``),
+    so a miss means "nothing to act on by that description", never "those
+    words are absent": read the page for content that is merely displayed.
 
     Returns "no matches" rather than an error when nothing fits, so a failed
     search costs you a note instead of a dead turn. Prefer this over reading a
@@ -537,19 +551,34 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     direction / amount_px: for scroll (default down, 500px). action="scroll"
         with a ref wheels AT that element (at its visible point), which
         scrolls the scrollable pane UNDER it: inner panes, chat lists,
-        dropdown menus. A ref that is entirely off-screen refuses (wheel
-        input is positional): scroll_to it first, or wheel by
-        coordinate. An unknown or stale ref refuses rather than wheeling
-        the page blind. With coordinate it wheels at that point; with
+        dropdown menus. An ELEMENT ref that is entirely off-screen refuses
+        (wheel input is positional): scroll_to it first, or wheel by
+        coordinate. A document ref has no rect to judge and gets no
+        such check: inside a frame scrolled out of view, judge the
+        result by scroll_moved rather than assuming it landed. An unknown or stale ref refuses rather than wheeling
+        the page blind. A pane made of plain text mints no ref of its
+        own: target it as ref="css=..." (same selector syntax as every
+        other verb, root document only), which wheels at that element
+        exactly as an @e ref does. INSIDE a frame, where selectors do
+        not reach, use the frame's own document ref (the
+        "RootWebArea [ref=@eN]" line of its section in the page read):
+        that wheels at the middle of that frame and measures what moves
+        there. That works for CROSS-ORIGIN frames, which dispatch in
+        their own coordinate space; a same-origin frame's document ref
+        refuses and says to use an element ref inside it instead. With coordinate it wheels at that point; with
         neither it wheels the viewport centre, scrolling the page. The
-        payload answers with "scroll_moved" {dx, dy, scroller}: for a
-        ref scroll the target's own container and the document are both
+        payload answers with "scroll_moved" {dx, dy, scroller}: the
+        scrollable container under the wheel and the document are both
         watched and the one that moved is reported (a wheel at the end
-        of a pane CHAINS to the page, and that is named "document"); a
-        coordinate or bare scroll watches the document only, and when
-        the wheel point sits over an embedded frame the zero is
-        withheld (the frame's own scrolling is not measured; a page
-        that really moved still reports). {0,0} is a
+        of a pane CHAINS to the page, and that is named "document";
+        with a frame's document ref, "document" means THAT frame's
+        document, since that is the one being scrolled).
+        When the wheel lands where this cannot be measured, the zero is
+        withheld rather than reported: over an embedded frame, or with
+        the frame element itself as the ref (the frame's own scrolling
+        is not measured from outside; a page that really moved still
+        reports, and the frame's document ref measures it properly).
+        {0,0} is a
         MEASURED nothing-moved (end of scroll, a pane that ignored the
         wheel, or rarely a smooth animation still in flight at the
         read); the key ABSENT means it could not be measured. A wheel

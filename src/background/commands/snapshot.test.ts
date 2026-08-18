@@ -118,6 +118,55 @@ describe('execSnapshot', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/tab_id/)
   })
+
+  // #208. Chrome marks every document focusable, so a document root mints a
+  // ref through the property path even on a page with nothing to click. A
+  // ref count alone therefore looks healthy on an all-static page, which is
+  // exactly how a live round twice read the mint rule as a minting bug.
+  const focusable = [{ name: 'focusable', value: { value: true } }]
+
+  it('counts document-root refs apart from control refs on an all-static page', async () => {
+    const nodes = [
+      {
+        nodeId: '1',
+        role: av('RootWebArea'),
+        name: av('Static page'),
+        backendDOMNodeId: 1,
+        properties: focusable,
+        childIds: ['2'],
+      },
+      { nodeId: '2', role: av('listitem'), name: av(''), backendDOMNodeId: 7, parentId: '1' },
+    ]
+    chrome.debugger.sendCommand = (async () => ({ nodes })) as unknown as typeof chrome.debugger.sendCommand
+
+    const result = await execSnapshot({ tab_id: 1, detail: 'interactive' })
+
+    const data = (result as { data: Record<string, unknown> }).data
+    expect(data.ref_count).toBe(1)
+    // The honest number: nothing on this page can be clicked or typed into.
+    expect(data.control_ref_count).toBe(0)
+  })
+
+  it('counts a real control, so an ordinary page carries no zero', async () => {
+    const nodes = [
+      {
+        nodeId: '1',
+        role: av('RootWebArea'),
+        name: av('Ordinary page'),
+        backendDOMNodeId: 1,
+        properties: focusable,
+        childIds: ['2'],
+      },
+      { nodeId: '2', role: av('link'), name: av('Learn more'), backendDOMNodeId: 42, parentId: '1' },
+    ]
+    chrome.debugger.sendCommand = (async () => ({ nodes })) as unknown as typeof chrome.debugger.sendCommand
+
+    const result = await execSnapshot({ tab_id: 1, detail: 'interactive' })
+
+    const data = (result as { data: Record<string, unknown> }).data
+    expect(data.ref_count).toBe(2)
+    expect(data.control_ref_count).toBe(1)
+  })
 })
 
 describe('monotonic minting at the exec level (#160)', () => {
@@ -216,6 +265,22 @@ describe('monotonic minting at the exec level (#160)', () => {
     // And the scoped read's fresh ref resolves too.
     expect((scoped.data as { tree: string }).tree).toMatch(/\[ref=@e3\]/)
     expect(snapshotRefs.resolve(1, '@e3', 'https://example.com')).toMatchObject({ ok: true })
+  })
+
+  it('a scoped read withholds the control count, which is a claim about the PAGE', async () => {
+    // #208 review round. The backend turns a zero control count into "this
+    // page has no controls", rendered outside the untrusted fence. A scoped
+    // read renders one subtree and cannot support that claim, so the count
+    // is withheld exactly as the frame counts already are, and the backend
+    // degrades to its pre-#208 wording rather than asserting a subtree fact
+    // about the whole page.
+    installTreeMock()
+
+    const full = await execSnapshot({ tab_id: 1, detail: 'interactive' })
+    const scoped = await execSnapshot({ tab_id: 1, detail: 'interactive', scope_ref: '@e1' })
+
+    expect((full.data as Record<string, unknown>).control_ref_count).toBe(2)
+    expect('control_ref_count' in (scoped.data as Record<string, unknown>)).toBe(false)
   })
 })
 

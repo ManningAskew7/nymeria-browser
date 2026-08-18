@@ -243,6 +243,20 @@ function formatTree(
   return { text: lines.join('\n'), refs, nextCounter: refCounter, hiddenDropped }
 }
 
+/** The AX roles that are a DOCUMENT rather than a control (#208). They mint
+ *  refs only because Chrome marks documents focusable, and a document ref
+ *  does exactly one useful thing: `scroll` wheels inside it. Kept minting
+ *  (it is the only handle a static in-frame pane has), but counted apart so
+ *  a read can say "scrollable, nothing clickable" instead of leaving the
+ *  reader to infer it from a ref count that looks healthy. */
+const DOCUMENT_ROLES = new Set(['RootWebArea', 'WebArea'])
+
+function countControlRefs(refs: Map<string, RefTarget>): number {
+  let n = 0
+  for (const t of refs.values()) if (!DOCUMENT_ROLES.has(t.role)) n += 1
+  return n
+}
+
 /** Roots of an AX node list: the nodes whose parent is not in the list. */
 function rootsOf(nodes: AXNode[]): string[] {
   const ids = new Set(nodes.map((n) => n.nodeId))
@@ -749,6 +763,18 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
         // the fence (review round).
         ...(scopeNodeId == null
           ? {
+              // #208: how many refs are CONTROLS. Chrome marks every document
+              // `focusable`, so each document root mints a ref through the
+              // property path: a page of pure static text answers
+              // `ref_count: 2` (root plus a frame) while nothing on it can be
+              // clicked or typed into, which read live as a minting bug twice
+              // (#205, closed invalid). It must come off THIS map, never off
+              // the tree text, which is page content and could forge a
+              // ref-shaped line into the note the backend renders outside the
+              // fence. Withheld on a SCOPED read for the same reason the
+              // frame counts are: a subtree cannot support the page-level
+              // claim the backend's note makes from it (review round).
+              control_ref_count: countControlRefs(allRefs),
               frames_oopif: framesOopifRendered,
               frames_same_process: framesLocalRendered,
               // Sections rendered INSIDE another frame rather than in the

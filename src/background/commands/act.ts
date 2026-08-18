@@ -2044,6 +2044,84 @@ const SCROLL_DOC_SNIPPET = `
   var bodyEl = read('body', document);
   var doc = read('scrollingElement', document) || docEl;`
 
+/** The nearest scrollable ancestor of a node, self included (#208). Shared
+ * by all three pre-wheel reads so "which scroller is being watched" is one
+ * rule: an element target walks up from itself, a document target and a
+ * coordinate wheel walk up from whatever sits under the wheel point. Before
+ * #208 the point-dispatched pair watched the document ALONE, which reported
+ * an honest-looking {0,0} whenever the wheel moved an inner pane instead of
+ * the page (the docstring's "some OTHER pane" case): the walk closes that
+ * for the common shape. Computed-overflow gated so an overflow:visible giant
+ * is not mistaken for a scroller, and the host hop crosses shadow
+ * boundaries. */
+/** Scroll metrics read through the PROTOTYPE CHAIN, never as a plain lookup
+ *  (#208 review round). An isolated world does not stop named-property
+ *  access: `<form><input name="clientHeight">` makes `form.clientHeight` an
+ *  element, which would silently make a real scroller undetectable, and a
+ *  forged `scrollTop` on one side of a baseline/after pair would have the
+ *  two reads SUBTRACT different quantities into a fabricated delta. Same
+ *  idiom as SCROLL_DOC_SNIPPET's `read`, which covers `document.*`; this
+ *  one covers element metrics. A non-number answers -1, which fails the
+ *  scrollable test and reads as "not measurable" rather than as zero. */
+const SCROLL_METRIC_SNIPPET = `
+  var metric = function (el, name) {
+    try {
+      var p = el ? Object.getPrototypeOf(el) : null;
+      while (p) {
+        var d = Object.getOwnPropertyDescriptor(p, name);
+        if (d && d.get) {
+          var v = d.get.call(el);
+          return typeof v === 'number' ? v : -1;
+        }
+        p = Object.getPrototypeOf(p);
+      }
+      // No accessor anywhere on the chain. In a real isolated world the
+      // prototypes are pristine and this never happens for these names, so
+      // the plain read is the test environment's path (happy-dom has no
+      // layout and stubs metrics as own properties), not a forgery window:
+      // the same shape as SCROLL_DOC_SNIPPET's \`read(...) || docEl\`.
+      var own = el ? el[name] : undefined;
+      return typeof own === 'number' ? own : -1;
+    } catch (e) {}
+    return -1;
+  };`
+
+const SCROLL_WALK_SNIPPET = `
+  ${SCROLL_METRIC_SNIPPET}
+  var scrollerFrom = function (start) {
+    try {
+      var n = start;
+      while (n) {
+        var scrollable = (metric(n, 'scrollHeight') > metric(n, 'clientHeight') + 1) ||
+                         (metric(n, 'scrollWidth') > metric(n, 'clientWidth') + 1);
+        if (scrollable && n !== docEl && n !== bodyEl) {
+          var cs = getComputedStyle(n);
+          var oy = cs.overflowY, ox = cs.overflowX;
+          if (oy === 'auto' || oy === 'scroll' || oy === 'overlay' ||
+              ox === 'auto' || ox === 'scroll' || ox === 'overlay') { return n; }
+        }
+        n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
+      }
+    } catch (e) {}
+    return null;
+  };
+  var frameTagged = function (el) {
+    try {
+      var tag = el && el.tagName;
+      // Case-folded: an XHTML document reports "iframe", and a case-exact
+      // compare would drop the withhold on exactly those pages (review round).
+      tag = typeof tag === 'string' ? tag.toUpperCase() : '';
+      return tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED';
+    } catch (e) { return false; }
+  };
+  var elementAt = function (x, y) {
+    try {
+      return Document.prototype.elementFromPoint
+        ? Document.prototype.elementFromPoint.call(document, x, y)
+        : null;
+    } catch (e) { return null; }
+  };`
+
 /** The one pre-wheel read for a TARGETED scroll (#203): the dispatch point
  * and the baseline offsets, and the registration that makes the after-read
  * honest. Three answers in one round trip:
@@ -2067,29 +2145,45 @@ const SCROLL_DOC_SNIPPET = `
  * elements into a fabricated delta (review round). */
 const SCROLL_BASE_FN = `function(id){
   ${SCROLL_DOC_SNIPPET}
-  var p = null;
-  try {
-    var r = this.getBoundingClientRect();
-    if (r && r.width > 0 && r.height > 0) {
-      var x0 = Math.max(r.left, 0), y0 = Math.max(r.top, 0);
-      var x1 = Math.min(r.right, window.innerWidth), y1 = Math.min(r.bottom, window.innerHeight);
-      p = (x1 - x0 < 4 || y1 - y0 < 4) ? { off: true } : { x: (x0 + x1) / 2, y: (y0 + y1) / 2 };
-    }
-  } catch (e) { p = null; }
-  var c = null;
-  try {
-    var n = this;
-    while (n) {
-      var scrollable = (n.scrollHeight > n.clientHeight + 1) || (n.scrollWidth > n.clientWidth + 1);
-      if (scrollable && n !== docEl && n !== bodyEl) {
-        var cs = getComputedStyle(n);
-        var oy = cs.overflowY, ox = cs.overflowX;
-        if (oy === 'auto' || oy === 'scroll' || oy === 'overlay' ||
-            ox === 'auto' || ox === 'scroll' || ox === 'overlay') { c = n; break; }
+  ${SCROLL_WALK_SNIPPET}
+  var p = null, c = null, over = false;
+  var isDoc = false;
+  try { isDoc = this.nodeType === 9; } catch (e) {}
+  if (isDoc) {
+    // #208: a DOCUMENT target (a frame's RootWebArea ref, or the page's
+    // own) has no box, so the old rect read threw and the caller refused a
+    // ref the read had just handed out. A document's wheel point is the
+    // centre of its OWN viewport, which for an OOPIF session is the frame's
+    // viewport: that is the only handle a static in-frame pane has, since
+    // it mints no ref of its own and css= never leaves the root document.
+    // The scroller watched is whatever sits under that point, so the pane
+    // is measured rather than the frame's document reading a false zero.
+    try {
+      var vw = window.innerWidth, vh = window.innerHeight;
+      if (vw > 0 && vh > 0) {
+        p = { x: vw / 2, y: vh / 2 };
+        var mid = elementAt(p.x, p.y);
+        over = frameTagged(mid);
+        c = scrollerFrom(mid);
       }
-      n = n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
-    }
-  } catch (e) { c = null; }
+    } catch (e) { p = null; }
+  } else {
+    try {
+      var r = this.getBoundingClientRect();
+      if (r && r.width > 0 && r.height > 0) {
+        var x0 = Math.max(r.left, 0), y0 = Math.max(r.top, 0);
+        var x1 = Math.min(r.right, window.innerWidth), y1 = Math.min(r.bottom, window.innerHeight);
+        p = (x1 - x0 < 4 || y1 - y0 < 4) ? { off: true } : { x: (x0 + x1) / 2, y: (y0 + y1) / 2 };
+      }
+    } catch (e) { p = null; }
+    c = scrollerFrom(this);
+    // An element target that IS an embedded frame takes the wheel into a
+    // document this probe never watches, the same false-zero shape the
+    // coordinate path already withholds for (#203 QA). Flagged here so one
+    // rule covers both spellings of "the wheel went somewhere we cannot
+    // measure".
+    over = frameTagged(this);
+  }
   try {
     var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
     reg[id] = { c: c, d: doc, ts: Date.now() };
@@ -2099,8 +2193,10 @@ const SCROLL_BASE_FN = `function(id){
   } catch (e) {}
   return {
     p: p,
-    c: c ? { t: c.scrollTop, l: c.scrollLeft } : null,
-    d: doc ? { t: doc.scrollTop, l: doc.scrollLeft } : null
+    c: c ? { t: metric(c, 'scrollTop'), l: metric(c, 'scrollLeft') } : null,
+    d: doc ? { t: metric(doc, 'scrollTop'), l: metric(doc, 'scrollLeft') } : null,
+    f: over,
+    doc: isDoc
   };
 }`
 
@@ -2115,23 +2211,32 @@ const SCROLL_BASE_FN = `function(id){
 function scrollBaseExpression(id: string, point: Point | null): string {
   return `(function(){
   ${SCROLL_DOC_SNIPPET}
-  var over = false;
+  ${SCROLL_WALK_SNIPPET}
+  var over = false, c = null;
   try {
     var pt = ${point ? JSON.stringify({ x: point.x, y: point.y }) : 'null'};
-    if (pt && Document.prototype.elementFromPoint) {
-      var el = Document.prototype.elementFromPoint.call(document, pt.x, pt.y);
-      var tag = el && el.tagName;
-      over = tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED';
+    if (pt) {
+      var el = elementAt(pt.x, pt.y);
+      over = frameTagged(el);
+      // #208: the pane under the wheel point is watched here too, so a
+      // coordinate wheel that scrolls an inner list stops reporting the
+      // document's honest {0,0} about a pane it never measured.
+      c = scrollerFrom(el);
     }
   } catch (e) {}
   try {
     var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
-    reg[${JSON.stringify(id)}] = { c: null, d: doc, ts: Date.now() };
+    reg[${JSON.stringify(id)}] = { c: c, d: doc, ts: Date.now() };
     for (var k in reg) {
       if (reg[k] && reg[k] !== reg[${JSON.stringify(id)}] && (!reg[k].ts || Date.now() - reg[k].ts > 60000)) { delete reg[k]; }
     }
   } catch (e) {}
-  return { p: null, c: null, d: doc ? { t: doc.scrollTop, l: doc.scrollLeft } : null, f: over };
+  return {
+    p: null,
+    c: c ? { t: metric(c, 'scrollTop'), l: metric(c, 'scrollLeft') } : null,
+    d: doc ? { t: metric(doc, 'scrollTop'), l: metric(doc, 'scrollLeft') } : null,
+    f: over
+  };
 })()`
 }
 
@@ -2141,12 +2246,17 @@ function scrollBaseExpression(id: string, point: Point | null): string {
  * wholesale, which keeps scroll_moved absent. */
 function scrollAfterExpression(id: string): string {
   return `(function(){
+  ${SCROLL_METRIC_SNIPPET}
   var reg = globalThis.__nymScroll;
   var s = reg && reg[${JSON.stringify(id)}];
   if (reg) { delete reg[${JSON.stringify(id)}]; }
   if (!s) return null;
-  var c = s.c && s.c.isConnected ? { t: s.c.scrollTop, l: s.c.scrollLeft } : null;
-  var d = s.d && s.d.isConnected ? { t: s.d.scrollTop, l: s.d.scrollLeft } : null;
+  // The SAME hardened read as the baseline, deliberately: a mismatched pair
+  // (prototype getter one side, named-property lookup the other) would not
+  // just read a forged number, it would SUBTRACT two different quantities
+  // and report the difference as a measured scroll (review round).
+  var c = s.c && s.c.isConnected ? { t: metric(s.c, 'scrollTop'), l: metric(s.c, 'scrollLeft') } : null;
+  var d = s.d && s.d.isConnected ? { t: metric(s.d, 'scrollTop'), l: metric(s.d, 'scrollLeft') } : null;
   return { c: c, d: d };
 })()`
 }
@@ -2160,8 +2270,14 @@ interface ScrollSnap {
   p: { x: number; y: number } | { off: true } | null
   c: ScrollPair | null
   d: ScrollPair | null
-  /** The wheel point sits over an embedded frame (targetless reads only). */
+  /** The wheel lands somewhere this read cannot measure: the point sits over
+   *  an embedded frame, or (targeted) the target IS one. Both spellings
+   *  withhold the zero (#203 QA, widened in #208). */
   f: boolean
+  /** The probe took its DOCUMENT branch: `this` was a document, so `p` is
+   *  that document's own viewport centre rather than an element's rect
+   *  (#208). The caller needs it to know the point is frame-local. */
+  doc: boolean
 }
 
 function scrollPair(v: unknown): ScrollPair | null {
@@ -2179,7 +2295,13 @@ function parseScrollSnap(v: unknown): ScrollSnap | null {
       : raw && raw.off === true
         ? ({ off: true } as const)
         : null
-  return { p, c: scrollPair(o.c), d: scrollPair(o.d), f: (o as { f?: unknown }).f === true }
+  return {
+    p,
+    c: scrollPair(o.c),
+    d: scrollPair(o.d),
+    f: (o as { f?: unknown }).f === true,
+    doc: (o as { doc?: unknown }).doc === true,
+  }
 }
 
 /** Slot names for the scroll registry, unique per act within a worker. */
@@ -3545,6 +3667,34 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               },
             }
           }
+          if (base.doc && frameIdOf(elementSession)) {
+            // A DOCUMENT target in a SAME-PROCESS frame. Its point is
+            // frame-local, and composing it into dispatch space needs the
+            // element's quads, which a Document has no useful ones of: the
+            // quads a LayoutView answers describe the whole document, whose
+            // centre is not the viewport centre the baseline measured, so
+            // the wheel would go in at a point nothing here watched. Refused
+            // EXPLICITLY rather than left to whatever getContentQuads
+            // happens to answer (review round: relying on that failing was
+            // an assumption, and its failure mode was a mis-aimed trusted
+            // wheel reported as a measured zero).
+            return {
+              ok: false,
+              status: 'error',
+              error:
+                'a document ref scrolls only inside a CROSS-ORIGIN frame, which dispatches ' +
+                'in its own coordinate space; this frame shares the page\'s process, so its ' +
+                'document has no dispatch point of its own. Nothing was dispatched; scroll ' +
+                'an element inside the frame by its own ref, or wheel by coordinate over the ' +
+                'frame.',
+              data: {
+                action: 'scroll',
+                ...(target ? { target } : {}),
+                ...selectorFacts,
+                input: 'none',
+              },
+            }
+          }
           const dp = await dispatchPointFor(elementSession, elementBackendNodeId, base.p)
           if (!dp) {
             // Same-process frame with no readable quads: the element has
@@ -3571,6 +3721,11 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           at = dp
           wheelTarget = elementSession
           scrollBaseline = base.c || base.d ? { c: base.c, d: base.d } : null
+          // #208: a targeted wheel can also land somewhere unmeasurable (an
+          // iframe element as the ref, or a document target whose centre
+          // sits over a nested frame), so the withholding rule reads the
+          // same flag on both paths instead of trusting target shape.
+          scrollOverFrame = base.f === true
         } else {
           at = pointFrom(a.coordinate) ?? (await viewportCentre(tabId, budgetDeadline))
           scrollSlotId = `s${++scrollSlot}`
@@ -4083,14 +4238,18 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         extra.scroll_moved = { ...cd, scroller: 'container' }
       } else if (dd && (dd.dx !== 0 || dd.dy !== 0)) {
         extra.scroll_moved = { ...dd, scroller: 'document' }
-      } else if (cd) {
+        // A wheel that landed where this read cannot watch scrolls a
+        // document neither registered scroller covers (#203 QA round: the
+        // frame visibly scrolled while the root's honest zero read as
+        // "nothing moved"). BOTH zero branches are withheld there, not just
+        // the document one: until #208 the point paths never watched a
+        // container, so `cd` could not be reached with the flag set, and
+        // watching the pane under the point re-opened that door for an
+        // iframe sitting inside a scrollable pane (review round). Absence
+        // means unmeasured; a real movement still reports above.
+      } else if (cd && !scrollOverFrame) {
         extra.scroll_moved = { dx: 0, dy: 0, scroller: 'container' }
       } else if (dd && !scrollOverFrame) {
-        // A wheel over an embedded frame scrolls a document this probe
-        // never watched (#203 QA round: the frame visibly scrolled while
-        // the root's honest zero read as "nothing moved"). The zero is
-        // withheld there: absence means unmeasured; a real root movement
-        // (chaining) still reports above.
         extra.scroll_moved = { dx: 0, dy: 0, scroller: 'document' }
       }
     }

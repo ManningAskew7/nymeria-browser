@@ -277,6 +277,64 @@ describe('frame input dispatch', () => {
     expect(after?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
   })
 
+  it("a cross-origin frame's DOCUMENT ref scrolls inside that frame and measures it there (#208)", async () => {
+    // The handle for a pane that mints no ref of its own: a static in-frame
+    // pane cannot be reached by a ref (nothing static mints one) or by a
+    // selector (those never leave the root document), so before #208 it was
+    // coordinate-only and unverifiable. The frame's own RootWebArea ref now
+    // wheels at the middle of the frame's viewport, ON the frame session,
+    // and the after-read measures that frame's scrollers.
+    const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const method = args[1]
+      const params = (args[2] ?? {}) as { functionDeclaration?: string; expression?: string }
+      if (
+        method === 'Runtime.callFunctionOn' &&
+        String(params.functionDeclaration ?? '').includes('__nymScroll')
+      ) {
+        // What the document branch answers: the frame's own viewport centre,
+        // the pane under it, and the flag saying which branch ran.
+        return {
+          result: {
+            value: { p: { x: 200, y: 150 }, c: { t: 0, l: 0 }, d: { t: 0, l: 0 }, f: false, doc: true },
+          },
+        }
+      }
+      if (
+        method === 'Runtime.evaluate' &&
+        String(params.expression ?? '').includes('__nymScroll') &&
+        !String(params.expression ?? '').includes('scrollingElement')
+      ) {
+        return { result: { value: { c: { t: 420, l: 0 }, d: { t: 0, l: 0 } } } }
+      }
+      return base(...args)
+    })
+    await attachFrame()
+    setRefs(
+      TAB,
+      new Map([['e1', { backendNodeId: 3, frameTargetId: FRAME_TARGET, role: 'RootWebArea', name: 'Pay frame' }]]),
+      TAB_URL,
+    )
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    const wheel = cdp.mock.calls.find(
+      (c) => c[1] === 'Input.dispatchMouseEvent' && (c[2] as { type: string }).type === 'mouseWheel',
+    )
+    // Frame-local point, frame session: an OOPIF session takes its own
+    // coordinate space, so no composition happens and none should.
+    expect(wheel?.[2]).toMatchObject({ x: 200, y: 150, deltaY: 500 })
+    expect(wheel?.[0]).toEqual({ tabId: TAB, sessionId: FRAME_SESSION })
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 420,
+      scroller: 'container',
+    })
+  })
+
   it('dispatches a main-document click on the root session, un-offset', async () => {
     const cdp = installCdpMock({ frameLocalRect: { x: 30, y: 40, w: 100, h: 20 } })
     await attachFrame()
@@ -1712,6 +1770,43 @@ describe('same-process frame refs (reads-honesty pass)', () => {
     )
     expect(pressed?.[0]).toEqual({ tabId: TAB })
     expect(pressed?.[2]).toMatchObject({ x: 280, y: 350 })
+  })
+
+  it("a same-process frame's DOCUMENT ref refuses instead of wheeling at a composed point (#208)", async () => {
+    // A Document has no quads worth composing: what getContentQuads answers
+    // for one describes the whole document, whose centre is not the viewport
+    // centre the baseline measured. Dispatching there would wheel at a point
+    // nothing watched and then report the untouched scrollers as a MEASURED
+    // zero, so the refusal is explicit rather than left to whatever the
+    // protocol happens to return for a document node.
+    const cdp = installCdpMock()
+    overrideSameProcess()
+    const send = chrome.debugger.sendCommand as unknown as ReturnType<typeof vi.fn>
+    const base = send.getMockImplementation() as (...a: unknown[]) => Promise<unknown>
+    send.mockImplementation(async (...args: unknown[]) => {
+      const params = (args[2] ?? {}) as { functionDeclaration?: string }
+      if (
+        args[1] === 'Runtime.callFunctionOn' &&
+        String(params.functionDeclaration ?? '').includes('__nymScroll')
+      ) {
+        return {
+          result: {
+            value: { p: { x: 200, y: 150 }, c: { t: 0, l: 0 }, d: { t: 0, l: 0 }, f: false, doc: true },
+          },
+        }
+      }
+      return base(...args)
+    })
+    localRef({ role: 'RootWebArea', name: 'Widget frame' })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toContain('document ref scrolls only inside a CROSS-ORIGIN frame')
+    expect((result.data as { input?: string }).input).toBe('none')
+    // Nothing was sent: a refusal that dispatched first would be the exact
+    // mis-aimed wheel this branch exists to prevent.
+    expect(cdp.mock.calls.some((c) => String(c[1]).startsWith('Input.'))).toBe(false)
   })
 
   it('a same-process frame ref scroll wheels the SHARED session at page coordinates (#203)', async () => {

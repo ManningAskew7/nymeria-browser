@@ -332,9 +332,45 @@ POSTs results. Consequences:
   text plainly present in the tree. An all-static page (fixture 11)
   mints only RootWebAreas BY DESIGN: that shape produced two false
   "frame mint gap" filings before the root-document control settled it
-  (#205 closed invalid 2026-08-18; honesty + scrollable-pane
-  capability follow-up is backend backlog #208). Before filing any
-  mint finding, run the same-shape control in the ROOT document.
+  (#205 closed invalid 2026-08-18). Before filing any mint finding,
+  run the same-shape control in the ROOT document. Document roots mint
+  through the `focusable` property, not the role list, so `ref_count`
+  alone overstates: since #208 the payload also carries
+  `control_ref_count` (refs minus document roots), which is what the
+  backend header counts and what triggers its one "nothing here is
+  clickable" note. Keep that count structured; the backend must never
+  derive it from tree text, which is page content and could forge a
+  ref-shaped line into the region outside the fence.
+- Scrolling a pane that mints no ref (#208): `css=` targets already
+  worked and nothing said so; inside a frame, where selectors cannot
+  reach, the frame's own document ref is now the handle. A DOCUMENT
+  target (nodeType 9) wheels at that document's own viewport centre on
+  its own session and watches the scroller under that point, so an
+  in-frame pane scroll is VERIFIED, not silent. Cross-origin only: a
+  same-process frame's document ref is refused EXPLICITLY (its point is
+  frame-local and a Document's quads describe the whole document, not
+  the viewport, so composing would wheel where nothing was watched;
+  the first cut left that to whatever `getContentQuads` returns, which
+  a review round flagged as an assumption whose failure mode is a
+  mis-aimed trusted wheel). The over-frame withhold now covers the
+  targeted path AND both zero branches: watching the pane under the
+  point (which is what lets a coordinate wheel finally measure what it
+  moved) re-opened the false zero through `cd` for an iframe inside a
+  scrollable pane. Scroll metrics ride a prototype-chain read on BOTH
+  sides of the baseline/after pair: a mismatched pair would subtract
+  two different quantities into a fabricated delta, and named-property
+  access (`<form><input name="clientHeight">`) is the forgery an
+  isolated world does not stop. Test note: `metrics()` in act.test
+  stages values as per-element PROTOTYPE accessors for that reason;
+  own-property stubs would leave the hardened read untested and
+  happy-dom's own Element getters shadow them anyway.
+- Known residual (#208, not a regression): the point-based walks start
+  from `Document.prototype.elementFromPoint`, which retargets a shadow
+  hit to the HOST, so a scroller INSIDE an open shadow root is not
+  found and the wheel reads as a document zero. Pre-existing for
+  coordinate wheels and inherited by the document-ref route. Fix it
+  with the other point predicates (`HIT_TEST_FN` already pierces),
+  filed as backlog #209, not one-off here.
 - Reads-honesty traps (v0.5.0, measured): the same-process occlusion gate
   must test the OUTERMOST local ancestor's owner (`LocalFrame.path[0]`),
   never the immediate one, and must SKIP (fail open) when no ancestor

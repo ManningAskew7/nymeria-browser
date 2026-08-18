@@ -73,7 +73,8 @@ interface MockOptions {
     p?: { x: number; y: number } | { off: true } | null
     c?: { t: number; l: number } | null
     d?: { t: number; l: number } | null
-    /** The wheel point sits over an embedded frame (targetless reads). */
+    /** The wheel lands where this read cannot measure: over an embedded
+     *  frame, or (targeted) the target is one (#208 widened it to both). */
     f?: boolean
   } | null
   /** The post-settle re-read of the STORED scrollers (a distinct fixture
@@ -440,8 +441,13 @@ function installCdpMock(opts: MockOptions = {}) {
       // targetless baseline also carries that marker for its over-frame
       // check.
       if (expression.includes('__nymScroll')) {
+        // The point-dispatched baseline answers no dispatch point (the
+        // caller already has one) but DOES answer a container since #208:
+        // it walks to the scroller under the wheel point. Forcing c null
+        // here was the pre-#208 shape and made an over-frame withhold test
+        // pass through the document branch instead of the container one.
         return expression.includes('scrollingElement')
-          ? { result: { value: scrollBase && { ...scrollBase, p: null, c: null } } }
+          ? { result: { value: scrollBase && { ...scrollBase, p: null } } }
           : { result: { value: scrollAfter } }
       }
       // The coordinate-target probe, which has no objectId to ask: one call
@@ -4817,6 +4823,42 @@ describe('scroll at a ref (#203)', () => {
     expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
   })
 
+  it('a wheel over a frame withholds its zero even when a container was watched (#208)', async () => {
+    // The regression #208 introduced and this pins shut: watching the pane
+    // under the wheel point (so inner-pane scrolls stop reading {0,0}) means
+    // the point paths can now arrive at the zero branch with a container in
+    // hand. An iframe INSIDE a scrollable pane is the ordinary shape: the
+    // wheel scrolls the frame's own document, the pane and the page both
+    // stand still, and reporting the pane's zero would be the exact false
+    // "measured nothing moved" the over-frame withhold exists to prevent.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 }, f: true },
+      scrollAfter: { c: { t: 0, l: 0 }, d: { t: 0, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', coordinate: [249, 679], direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('a wheel over a frame still reports the PANE when the pane really moved (#208)', async () => {
+    // Only the zero is withheld. A pane that genuinely moved is a watched,
+    // measured fact and stays reported, exactly as the document half does.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 }, f: true },
+      scrollAfter: { c: { t: 260, l: 0 }, d: { t: 0, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', coordinate: [249, 679], direction: 'down' })
+
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 260,
+      scroller: 'container',
+    })
+  })
+
   it('a coordinate wheel over a frame still reports the page when the page moved', async () => {
     // Only the ZERO is withheld: a wheel that chained to the root is a
     // real, watched movement and stays reported.
@@ -4831,6 +4873,39 @@ describe('scroll at a ref (#203)', () => {
     expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
       dx: 0,
       dy: 500,
+      scroller: 'document',
+    })
+  })
+
+  it('a TARGETED wheel that lands in a frame withholds its zero too (#208)', async () => {
+    // The targeted path used to trust target shape: only the coordinate
+    // branch could report "unmeasurable". A ref that IS an iframe, or a
+    // document ref whose viewport centre sits over a nested frame, wheels
+    // into a document this read never watched, so the same rule applies.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      scrollBase: { p: { x: 120, y: 90 }, c: null, d: { t: 0, l: 0 }, f: true },
+      scrollAfter: { c: null, d: { t: 0, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('a TARGETED wheel into a frame still reports a page that really moved (#208)', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      scrollBase: { p: { x: 120, y: 90 }, c: null, d: { t: 0, l: 0 }, f: true },
+      scrollAfter: { c: null, d: { t: 300, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', ref: '@e1', direction: 'down' })
+
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 300,
       scroller: 'document',
     })
   })
@@ -4913,7 +4988,13 @@ describe('scroll probes (executed in-page)', () => {
       new Function(`return (${__test.SCROLL_BASE_FN}).apply(this, arguments)`) as (
         this: Element,
         id: string,
-      ) => { p: { x: number; y: number } | { off: true } | null; c: Pair | null; d: Pair | null }
+      ) => {
+        p: { x: number; y: number } | { off: true } | null
+        c: Pair | null
+        d: Pair | null
+        f: boolean
+        doc: boolean
+      }
     ).call(el, id)
   const runAfter = (id: string) =>
     (
@@ -4923,14 +5004,39 @@ describe('scroll probes (executed in-page)', () => {
       } | null
     )()
 
+  /** Stage scroll metrics the way a real browser exposes them: as ACCESSORS
+   *  on the prototype chain, not as instance properties. happy-dom has no
+   *  layout, so the values must be faked, but faking them as own properties
+   *  would leave the probes' hardened prototype-chain read (#208 review
+   *  round: `<form><input name="clientHeight">` can forge a plain lookup)
+   *  untested, and happy-dom's own Element getters would shadow them
+   *  anyway. Each element gets a private prototype layer, so per-element
+   *  values stay independent and `scrollTop` stays writable. */
   function metrics(el: Element, over: { sh?: number; ch?: number; st?: number } = {}) {
-    Object.defineProperty(el, 'scrollHeight', { value: over.sh ?? 500, configurable: true })
-    Object.defineProperty(el, 'clientHeight', { value: over.ch ?? 200, configurable: true })
-    Object.defineProperty(el, 'scrollTop', {
-      value: over.st ?? 0,
-      configurable: true,
-      writable: true,
-    })
+    const state = { sh: over.sh ?? 500, ch: over.ch ?? 200, st: over.st ?? 0, sl: 0 }
+    Object.setPrototypeOf(
+      el,
+      Object.create(Object.getPrototypeOf(el) as object, {
+        scrollHeight: { get: () => state.sh, configurable: true },
+        clientHeight: { get: () => state.ch, configurable: true },
+        scrollWidth: { get: () => 0, configurable: true },
+        clientWidth: { get: () => 0, configurable: true },
+        scrollTop: {
+          get: () => state.st,
+          set: (v: number) => {
+            state.st = v
+          },
+          configurable: true,
+        },
+        scrollLeft: {
+          get: () => state.sl,
+          set: (v: number) => {
+            state.sl = v
+          },
+          configurable: true,
+        },
+      }),
+    )
   }
 
   function rect(el: Element, r: { left: number; top: number; right: number; bottom: number }) {
@@ -5109,6 +5215,130 @@ describe('scroll probes (executed in-page)', () => {
 
     rect(target, { left: 0, top: 0, right: 0, bottom: 0 })
     expect(runBase(target, 'x11').p).toBeNull()
+  })
+
+  /** Swap `Document.prototype.elementFromPoint` (happy-dom has no layout, so
+   *  hit testing must be staged) for the length of one call. */
+  function withPointHit<T>(hit: () => Element | null, body: () => T): T {
+    const proto = Document.prototype as unknown as Record<string, unknown>
+    const had = 'elementFromPoint' in proto
+    const saved = proto.elementFromPoint
+    proto.elementFromPoint = hit
+    try {
+      return body()
+    } finally {
+      if (had) proto.elementFromPoint = saved
+      else delete proto.elementFromPoint
+    }
+  }
+
+  const runBaseOn = (thisArg: unknown, id: string) =>
+    (
+      new Function(`return (${__test.SCROLL_BASE_FN}).apply(this, arguments)`) as (
+        this: unknown,
+        id: string,
+      ) => {
+        p: { x: number; y: number } | { off: true } | null
+        c: Pair | null
+        d: Pair | null
+        f: boolean
+      }
+    ).call(thisArg, id)
+
+  it('a DOCUMENT target wheels at its own viewport centre and watches the pane under it', () => {
+    // #208: the shape a frame's RootWebArea ref resolves to. Before it, the
+    // rect read threw and the caller refused a ref the page read had just
+    // handed out, which is how a live round concluded in-frame panes were
+    // unreachable.
+    document.body.innerHTML = '<div id="pane"><span id="row">frame row 3</span></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 120 })
+
+    const snap = withPointHit(
+      () => document.getElementById('row'),
+      () => runBaseOn(document, 'd1'),
+    )
+
+    expect(snap.p).toEqual({ x: window.innerWidth / 2, y: window.innerHeight / 2 })
+    expect(snap.c).toEqual({ t: 120, l: 0 })
+    expect(snap.f).toBe(false)
+    // The pane itself is registered, so the after-read measures the element
+    // the wheel actually moved rather than re-walking to another one.
+    const reg = (globalThis as { __nymScroll?: Record<string, { c: unknown }> }).__nymScroll
+    expect(reg?.d1?.c).toBe(pane)
+  })
+
+  it('both scroll reads ignore a forged own-property metric, so no delta is fabricated', () => {
+    // An isolated world keeps its prototypes pristine but does NOT stop
+    // named-property access on page objects (`<form><input name="scrollTop">`
+    // is the live shape; an own data property is the same shadowing in
+    // miniature). The danger is not a wrong number, it is an ASYMMETRIC
+    // pair: if one of the baseline/after reads takes the accessor and the
+    // other takes the forged value, the two SUBTRACT different quantities
+    // and the payload reports a scroll that never happened.
+    document.body.innerHTML = '<div id="pane"><span id="target">x</span></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 40 })
+    Object.defineProperty(pane, 'scrollTop', { value: 9999, configurable: true })
+
+    const snap = runBase(document.getElementById('target') as Element, 'forge1')
+    expect(snap.c).toEqual({ t: 40, l: 0 })
+
+    // The after-read rides the SAME hardened read, so the pair agrees and
+    // the delta is zero rather than 9959.
+    expect(runAfter('forge1')?.c).toEqual({ t: 40, l: 0 })
+  })
+
+  it('a DOCUMENT target whose centre sits over a frame flags the unmeasurable wheel', () => {
+    document.body.innerHTML = '<iframe id="inner"></iframe>'
+    const snap = withPointHit(
+      () => document.getElementById('inner'),
+      () => runBaseOn(document, 'd2'),
+    )
+
+    expect(snap.f).toBe(true)
+  })
+
+  it('an element target that IS an embedded frame flags it too', () => {
+    // Same false zero as the coordinate case: the wheel goes into a document
+    // this probe never watches, so the caller must withhold the zero rather
+    // than report the parent standing still.
+    document.body.innerHTML = '<iframe id="frame"></iframe>'
+    const frame = document.getElementById('frame') as Element
+    rect(frame, { left: 0, top: 0, right: 300, bottom: 200 })
+
+    expect(runBase(frame, 'd3').f).toBe(true)
+
+    document.body.innerHTML = '<div id="plain"></div>'
+    const plain = document.getElementById('plain') as Element
+    rect(plain, { left: 0, top: 0, right: 300, bottom: 200 })
+    expect(runBase(plain, 'd4').f).toBe(false)
+  })
+
+  it('a coordinate wheel now watches the pane under its point, not the document alone', () => {
+    // #208: this pair is what made a coordinate wheel over an inner list
+    // report the document's honest {0,0} about a pane it never measured.
+    document.body.innerHTML = '<div id="pane"><span id="row">x</span></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 75 })
+
+    const snap = withPointHit(
+      () => document.getElementById('row'),
+      () =>
+        (
+          new Function(
+            `return (${__test.scrollBaseExpression('c1', { x: 10, y: 10 })})`,
+          ) as () => { c: Pair | null; f: boolean }
+        )(),
+    )
+
+    expect(snap.c).toEqual({ t: 75, l: 0 })
+    expect(snap.f).toBe(false)
+    const reg = (globalThis as { __nymScroll?: Record<string, { c: unknown }> }).__nymScroll
+    expect(reg?.c1?.c).toBe(pane)
   })
 })
 
