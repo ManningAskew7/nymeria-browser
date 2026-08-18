@@ -1109,13 +1109,18 @@ One read that says whether a Chrome tab is healthy and what state it is in.
     debugger is attached and whether capture ever ran this worker life;
     console/network buffer sizes (unfiltered, up to 200 per tab; a filtered
     read like chrome_console's errors-only default may return fewer) and,
-    when capture lapsed, how long the tab went unwatched; any standing dialog
+    when capture lapsed, how long the tab has gone unwatched AS OF THIS
+    READ (health does not re-attach, so that number keeps growing until
+    something drives the tab; the same field on a console/network read
+    measures the lapse that read just ended); any standing dialog
     (answer it with chrome_dialog), recently auto-resolved dialog, or
     intercepted file chooser; a navigation still in flight or the last one
     that died; the last main-frame HTTP status when the page-status grant is
     on (absent means unknown, never OK); how many refs are held and minted
     (refs survive worker recycles; a navigation invalidates them); when the
-    tab was last driven and by which command; and input_swallowed, evidence
+    tab was last driven and by which command (the wire command name:
+    "snapshot" is chrome_read_page's, "extract_text" is chrome_read_text's,
+    the rest match their chrome_* tool); and input_swallowed, evidence
     from the last action whose trusted input was observed to be discarded
     (Chrome exposes no readable flag, so this is evidence with an age, not
     live state: a navigation since may have cleared the condition, and it is
