@@ -593,13 +593,22 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     press arrived but never composed into a click); on the click family,
     "default_prevented" says whether a page handler cancelled the composed
     click, "click_target" names the element it composed on (tag, and the
-    enclosing link's URL when there is one), and "user_activation" reports the
-    frame's activation state after dispatch. Together these turn "the click
-    did nothing" from a four-call investigation into one read: delivered plus
-    a composed, un-prevented click on the link you meant, with no navigation
-    following, means the page or browser declined the default action, not
-    that your input missed. A fill reports "input_delivered" through its
-    trusted input event the same way.
+    enclosing link's URL when there is one), and "user_activation" reports
+    the activation state the input itself produced. Presence is the norm,
+    not luck: a delivered click on a page that survived it always carries
+    these fields (the read waits out the sampling), and a click that
+    NAVIGATES usually keeps them too, because the evidence is streamed out
+    at event time and survives the document being torn down; the fastest
+    teardowns can still lose "default_prevented", rarely the rest. A click
+    whose delivery reads "unknown" (a nested frame below the target, an
+    unarmable document) carries none of them: absence there means
+    unmeasured, never "no click composed". Together these turn "the click
+    did nothing" from a
+    four-call investigation into one read: delivered plus a composed,
+    un-prevented click on the link you meant, with no navigation following,
+    means the page or browser declined the default action, not that your
+    input missed. A fill reports "input_delivered" through its trusted input
+    event the same way.
 
     Frames are full targets, not blind spots. A ref inside an iframe, whether
     cross-origin or same-origin, gets its input dispatched into that frame
@@ -645,6 +654,19 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     console errors and failed requests caused by the action, and whether the
     page settled. READ IT. A click that "succeeded"
     while its request came back 500 is a failure, and this is where that shows.
+    "dom_mutations" counts DOM changes to the ACTED document (an in-frame
+    act counts the frame's own document) from just before the input went
+    in until after the page settled, and it reads asymmetrically: ZERO is
+    the strong signal, the document made nothing observable of your input
+    (the phantom-success shape where every delivery field is truthful and
+    nothing happened): verify a page fact before retrying rather than
+    re-firing blind. A nonzero count is weak evidence, since dynamic pages
+    mutate constantly. Synchronous handler reactions ARE counted (the
+    watch starts before dispatch); reactions inside shadow roots are not.
+    The key is ABSENT wherever nothing can be measured: a navigating act
+    (the watch died with the document; the navigation is the reaction),
+    hover and scroll (no delivery probe), a document the probe could not
+    arm in, or a budget that died before the read.
     Each failed_requests entry carries "same_origin" where it can be judged,
     and the capped list is ranked so a broken first-party POST is never
     crowded out by third-party telemetry beacons; weigh same-origin data

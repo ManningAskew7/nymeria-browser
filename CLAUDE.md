@@ -224,8 +224,10 @@ POSTs results. Consequences:
   with the swallow store both ways, cleared on tab close. Its `navSeq` is
   per-worker navWatch memory, so health omits `on_current_url` for a
   stamp older than the worker (do not "fix" that by persisting the seq).
-  The three stamps are one copy-pasted pattern; a `sessionStamp` factory
-  is backlog #204. Attach state, buffers, dialogs and statusWatch still reset with
+  All three stamps ride the `sessionStamp.ts` factory (#204): stores are
+  side-effect-free, the two cross-clears sit adjacent at the act.ts
+  verdict site, and reader-side age gating stays in health.ts by design.
+  Attach state, buffers, dialogs and statusWatch still reset with
   the worker; `chrome_health` says `worker_recycled_since_drive` when its
   stamp predates the worker.
 - `chrome_health` (v0.11.0, #188): the one-call tab diagnostic. LOCAL READS
@@ -249,6 +251,26 @@ POSTs results. Consequences:
   container ref degrades synthetic with a reason that says nothing
   specific was clicked. Normally at most one of input_ok/input_swallowed
   appears (two sequential storage reads; smaller age_ms wins).
+- Delivery evidence is deterministic and teardown-proof (v0.14.x, #180):
+  the probe's read yields one macrotask IN the page, conditional on a
+  pending `defaultPrevented` sample (hidden tabs throttle timers to ~1s,
+  so the yield must stay conditional), and the arm expression PUSHES its
+  snapshot after every trusted event over a `Runtime.addBinding` channel
+  (`__nymDeliveryPush`, `executionContextName`-scoped to the delivery
+  world, installed per arm, uncached BY DESIGN: bindings die with the
+  debugger session). Probe ids carry a per-worker tag and push slots key
+  on tab+id; a held push rescues a non-context read failure into a
+  proven yes. `dom_mutations` is the SAME probe's MutationObserver,
+  armed with the arm (before dispatch, so synchronous handler reactions
+  count: QA measured the settle-window version blind to them), watching
+  the ACTED document, surviving the read (the registry entry dies at
+  the post-settle `tally()`, not at read), absent on navigating acts by
+  construction. Settle is quiescence-ONLY: do not put a tally back
+  there (it leaked the destination document's count, measured live).
+  Test traps: the settle-probe marker in mocks/filters is `readyState`,
+  NOT `MutationObserver` (the arm contains one too); the delivery mock
+  serializes evaluate results like `returnByValue` (by-reference peeks
+  alias live counters and defang merge tests).
 - `resolved_frame` (v0.12.0, #201): act payloads attribute the frame the
   TARGET RESOLVED into; `focused` is state, never attribution (hover and
   scroll_to do not move it). Carriage is the post-resolution facts bag
@@ -445,7 +467,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 14-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `2bed5835` / extension `31890b7` (v0.13.1,
+live code at backend commit `efb655eb` / extension `7b23dfc` (v0.14.2,
 2026-08-18).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):
