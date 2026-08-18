@@ -72,6 +72,8 @@ interface MockOptions {
     p?: { x: number; y: number } | { off: true } | null
     c?: { t: number; l: number } | null
     d?: { t: number; l: number } | null
+    /** The wheel point sits over an embedded frame (targetless reads). */
+    f?: boolean
   } | null
   /** The post-settle re-read of the STORED scrollers (a distinct fixture
    *  from `scrollBase` on a distinct marker, so a cross-wired read goes
@@ -428,23 +430,25 @@ function installCdpMock(opts: MockOptions = {}) {
           `trust probe ran outside the probe world: ${expression.slice(0, 60)}`,
         )
       }
+      // The scroll reads (#203). Base and after are DISTINCT fixtures on
+      // distinct markers (only the baseline contains the document-scroller
+      // lookup), so a cross-wired read (the after-read re-running the
+      // lookup, or the baseline hitting the registry read) answers the
+      // wrong fixture and goes red: the first cut's shared queue hid
+      // exactly that (review round). Routed BEFORE elementFromPoint: the
+      // targetless baseline also carries that marker for its over-frame
+      // check.
+      if (expression.includes('__nymScroll')) {
+        return expression.includes('scrollingElement')
+          ? { result: { value: scrollBase && { ...scrollBase, p: null, c: null } } }
+          : { result: { value: scrollAfter } }
+      }
       // The coordinate-target probe, which has no objectId to ask: one call
       // answers both the file-input guard and what the point landed on.
       if (expression.includes('elementFromPoint')) {
         return { result: { value: { description: pointDescription, opensFileChooser: isFileInput } } }
       }
       if (expression.includes('readyState')) return { result: { value: settleValue } }
-      // The scroll reads (#203). Base and after are DISTINCT fixtures on
-      // distinct markers (only the baseline contains the document-scroller
-      // lookup), so a cross-wired read (the after-read re-running the
-      // lookup, or the baseline hitting the registry read) answers the
-      // wrong fixture and goes red: the first cut's shared queue hid
-      // exactly that (review round).
-      if (expression.includes('__nymScroll')) {
-        return expression.includes('scrollingElement')
-          ? { result: { value: scrollBase && { ...scrollBase, p: null, c: null } } }
-          : { result: { value: scrollAfter } }
-      }
       if (expression.includes('activeElement')) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
       }
@@ -4772,6 +4776,40 @@ describe('scroll at a ref (#203)', () => {
     expect(cdp.mock.calls.some((c) => String(c[1]).startsWith('Input.'))).toBe(false)
   })
 
+  it('a coordinate wheel over an embedded frame never reports a false zero', async () => {
+    // The #203 QA round measured a cross-origin frame visibly scrolling
+    // under a coordinate wheel while the root's honest {0,0} read as
+    // "nothing moved". The zero is withheld when the point sits over a
+    // frame: absence means unmeasured.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, f: true },
+      scrollAfter: { c: null, d: { t: 0, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', coordinate: [249, 679], direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('a coordinate wheel over a frame still reports the page when the page moved', async () => {
+    // Only the ZERO is withheld: a wheel that chained to the root is a
+    // real, watched movement and stays reported.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, f: true },
+      scrollAfter: { c: null, d: { t: 500, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', coordinate: [249, 679], direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 500,
+      scroller: 'document',
+    })
+  })
+
   it('a laid-out but off-viewport ref refuses: wheel input is positional', async () => {
     // The old shape wheeled at the off-screen geometric centre, scrolled
     // whatever happened to be there (usually the root), and then reported
@@ -4929,6 +4967,32 @@ describe('scroll probes (executed in-page)', () => {
 
   it('a missing slot answers null, never a fabricated pair', () => {
     expect(runAfter('never-registered')).toBeNull()
+  })
+
+  it('the targetless read flags a wheel point over an embedded frame', () => {
+    const runTargetless = (id: string, point: { x: number; y: number } | null) =>
+      (
+        new Function(`return (${__test.scrollBaseExpression(id, point)})`) as () => { f: boolean }
+      )()
+    const iframe = document.createElement('iframe')
+    document.body.appendChild(iframe)
+    const proto = Document.prototype as unknown as Record<string, unknown>
+    const had = 'elementFromPoint' in proto
+    const saved = proto.elementFromPoint
+    proto.elementFromPoint = function () {
+      return iframe
+    }
+    try {
+      expect(runTargetless('x12', { x: 10, y: 10 }).f).toBe(true)
+      proto.elementFromPoint = function () {
+        return document.body
+      }
+      expect(runTargetless('x13', { x: 10, y: 10 }).f).toBe(false)
+      expect(runTargetless('x14', null).f).toBe(false)
+    } finally {
+      if (had) proto.elementFromPoint = saved
+      else delete proto.elementFromPoint
+    }
   })
 
   it('the dispatch point is the visible-region centre, off:true past the fold, null with no box', () => {

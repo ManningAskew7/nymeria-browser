@@ -2102,15 +2102,30 @@ const SCROLL_BASE_FN = `function(id){
 }`
 
 /** The targetless twin: the document is the only watchable scroller, read
- * and registered in the probe world the same way. */
-function scrollBaseExpression(id: string): string {
+ * and registered in the probe world the same way. It also answers whether
+ * the wheel point sits over an embedded frame (`f`), because a wheel
+ * routed into a frame scrolls a document this probe never watched: the
+ * #203 QA round measured a cross-origin frame visibly scrolling while the
+ * root's honest {0,0} read as "nothing moved". The method ride is
+ * prototype-direct (the extract_text idiom for methods), same forgery
+ * reasoning as the getters. */
+function scrollBaseExpression(id: string, point: Point | null): string {
   return `(function(){
   ${SCROLL_DOC_SNIPPET}
+  var over = false;
+  try {
+    var pt = ${point ? JSON.stringify({ x: point.x, y: point.y }) : 'null'};
+    if (pt && Document.prototype.elementFromPoint) {
+      var el = Document.prototype.elementFromPoint.call(document, pt.x, pt.y);
+      var tag = el && el.tagName;
+      over = tag === 'IFRAME' || tag === 'FRAME' || tag === 'OBJECT' || tag === 'EMBED';
+    }
+  } catch (e) {}
   try {
     var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
     reg[${JSON.stringify(id)}] = { c: null, d: doc };
   } catch (e) {}
-  return { p: null, c: null, d: doc ? { t: doc.scrollTop, l: doc.scrollLeft } : null };
+  return { p: null, c: null, d: doc ? { t: doc.scrollTop, l: doc.scrollLeft } : null, f: over };
 })()`
 }
 
@@ -2139,6 +2154,8 @@ interface ScrollSnap {
   p: { x: number; y: number } | { off: true } | null
   c: ScrollPair | null
   d: ScrollPair | null
+  /** The wheel point sits over an embedded frame (targetless reads only). */
+  f: boolean
 }
 
 function scrollPair(v: unknown): ScrollPair | null {
@@ -2156,7 +2173,7 @@ function parseScrollSnap(v: unknown): ScrollSnap | null {
       : raw && raw.off === true
         ? ({ off: true } as const)
         : null
-  return { p, c: scrollPair(o.c), d: scrollPair(o.d) }
+  return { p, c: scrollPair(o.c), d: scrollPair(o.d), f: (o as { f?: unknown }).f === true }
 }
 
 /** Slot names for the scroll registry, unique per act within a worker. */
@@ -2188,12 +2205,13 @@ async function scrollBase(
 async function scrollBaseTargetless(
   tabId: number,
   id: string,
+  point: Point | null,
   deadline: number | null,
 ): Promise<ScrollSnap | null> {
   if (budgetSpent(deadline)) return null
   const v = await evaluateInProbeWorld<unknown>(
     tabId,
-    scrollBaseExpression(id),
+    scrollBaseExpression(id, point),
     deadline === null ? {} : { deadlineMs: clampToDeadline(15_000, deadline) },
   )
   return v === undefined ? null : parseScrollSnap(v)
@@ -2912,6 +2930,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
    *  compared post-settle so smooth scrolling has finished animating. */
   let scrollBaseline: { c: ScrollPair | null; d: ScrollPair | null } | null = null
   let scrollSlotId: string | null = null
+  let scrollOverFrame = false
   // Only ever set for a coordinate act: a ref act already names its target,
   // and `target_exists` answers the same question for it more directly. On a
   // drag the point is the SOURCE, so it is named as such rather than left to
@@ -3549,8 +3568,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         } else {
           at = pointFrom(a.coordinate) ?? (await viewportCentre(tabId, budgetDeadline))
           scrollSlotId = `s${++scrollSlot}`
-          const base = await scrollBaseTargetless(tabId, scrollSlotId, budgetDeadline)
+          const base = await scrollBaseTargetless(tabId, scrollSlotId, at, budgetDeadline)
           scrollBaseline = base && (base.c || base.d) ? { c: base.c, d: base.d } : null
+          scrollOverFrame = base?.f === true
         }
         await trustedWheel(wheelTarget, at, { x: deltaX, y: deltaY }, modifiers)
         inputMode = 'trusted'
@@ -4040,7 +4060,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         extra.scroll_moved = { ...dd, scroller: 'document' }
       } else if (cd) {
         extra.scroll_moved = { dx: 0, dy: 0, scroller: 'container' }
-      } else if (dd) {
+      } else if (dd && !scrollOverFrame) {
+        // A wheel over an embedded frame scrolls a document this probe
+        // never watched (#203 QA round: the frame visibly scrolled while
+        // the root's honest zero read as "nothing moved"). The zero is
+        // withheld there: absence means unmeasured; a real root movement
+        // (chaining) still reports above.
         extra.scroll_moved = { dx: 0, dy: 0, scroller: 'document' }
       }
     }
