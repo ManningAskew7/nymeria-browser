@@ -8,6 +8,7 @@ import {
   InputDispatchStalled,
   insertText,
   modifierMask,
+  resetWheelAckLatchForTests,
   SELECTOR_FACTS_FN,
   TEXT_ENTRY_FN,
   trustedClick,
@@ -236,11 +237,8 @@ describe('dispatch ack deadline', () => {
     const dispatches: Array<{ label: string; hangFrom: number; run: () => Promise<unknown> }> = [
       { label: 'Input.insertText', hangFrom: 1, run: () => insertText(TAB, 'hello') },
       { label: 'Input.dispatchKeyEvent (keyUp half)', hangFrom: 2, run: () => dispatchKey(TAB, 'a') },
-      {
-        label: 'Input.dispatchMouseEvent (wheel)',
-        hangFrom: 1,
-        run: () => trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 }),
-      },
+      // The wheel is deadlined too but resolves 'timeout' instead of
+      // throwing (#207: its ack is not load-bearing); its own test below.
       {
         label: 'Input.dispatchMouseEvent (hover)',
         hangFrom: 1,
@@ -275,6 +273,90 @@ describe('dispatch ack deadline', () => {
       } finally {
         vi.useRealTimers()
       }
+    }
+  })
+
+  it('the wheel is deadlined too, resolving timeout instead of throwing (#207)', async () => {
+    // The wheel's ack is the one that Chromium can mislay while the input
+    // still lands (a coalesced-away wheel never acks), so its deadline
+    // reports rather than fails. A forgotten wrapper would hang forever
+    // and time this test out.
+    vi.useFakeTimers()
+    resetWheelAckLatchForTests()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) =>
+        method.startsWith('Input.') ? new Promise<never>(() => {}) : Promise.resolve({}),
+      )
+      let outcome: unknown = null
+      const pending = trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 }).then((v) => {
+        outcome = v
+      })
+      await vi.advanceTimersByTimeAsync(60_000)
+      await pending
+      expect(outcome).toBe('timeout')
+    } finally {
+      vi.useRealTimers()
+      resetWheelAckLatchForTests()
+    }
+  })
+
+  it('latches the widget after a wheel-ack timeout so later wheels pay the short tolerance (#207)', async () => {
+    // A desynced widget never acks again; without the latch every later
+    // scroll on it would burn the full deadline in wall clock.
+    vi.useFakeTimers()
+    resetWheelAckLatchForTests()
+    try {
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn((_t: unknown, method: string) =>
+        method.startsWith('Input.') ? new Promise<never>(() => {}) : Promise.resolve({}),
+      )
+      const first = trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 })
+      await vi.advanceTimersByTimeAsync(8_100)
+      expect(await first).toBe('timeout')
+
+      let outcome: unknown = null
+      const second = trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 }).then((v) => {
+        outcome = v
+      })
+      await vi.advanceTimersByTimeAsync(600)
+      await second
+      expect(outcome).toBe('timeout')
+    } finally {
+      vi.useRealTimers()
+      resetWheelAckLatchForTests()
+    }
+  })
+
+  it('an arriving ack clears the wheel latch, restoring the full deadline (#207)', async () => {
+    vi.useFakeTimers()
+    resetWheelAckLatchForTests()
+    try {
+      const hang = vi.fn((_t: unknown, method: string) =>
+        method.startsWith('Input.') ? new Promise<never>(() => {}) : Promise.resolve({}),
+      )
+      ;(chrome.debugger.sendCommand as unknown) = hang
+      const first = trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 })
+      await vi.advanceTimersByTimeAsync(8_100)
+      expect(await first).toBe('timeout')
+
+      // The widget recovers: an ack arrives, which must clear the latch.
+      ;(chrome.debugger.sendCommand as unknown) = vi.fn(() => Promise.resolve({}))
+      expect(await trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 })).toBe('acked')
+
+      // Latch cleared: a fresh hang gets the FULL deadline again, so the
+      // short tolerance must NOT resolve it.
+      ;(chrome.debugger.sendCommand as unknown) = hang
+      let resolved = false
+      const third = trustedWheel(TAB, { x: 5, y: 5 }, { x: 0, y: 100 }).then((v) => {
+        resolved = true
+        return v
+      })
+      await vi.advanceTimersByTimeAsync(600)
+      expect(resolved).toBe(false)
+      await vi.advanceTimersByTimeAsync(7_600)
+      expect(await third).toBe('timeout')
+    } finally {
+      vi.useRealTimers()
+      resetWheelAckLatchForTests()
     }
   })
 

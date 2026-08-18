@@ -1,5 +1,5 @@
 import { budgetSpent } from './budget'
-import { sendCommand, type Cdp, type SendCommandOpts } from './debuggerSession'
+import { sendCommand, sessionOf, tabOf, type Cdp, type SendCommandOpts } from './debuggerSession'
 import { cssMatchCountExpression } from './shadowWalk'
 
 /**
@@ -690,27 +690,69 @@ export async function trustedDrag(
 }
 
 /**
+ * Widgets whose wheel acks are known-desynced (#207). Chromium's
+ * MouseWheelEventQueue coalesces a wheel when its queue is two deep, and a
+ * coalesced-away wheel NEVER acks while its delta still lands (merged into
+ * the queued event); DevTools' per-widget pending-callback FIFO then stays
+ * desynced for that widget's lifetime, so every later wheel ack times out
+ * too. No protocol command drains it (the Input domain has no disable).
+ * The latch caps the cost: the first timeout pays the full deadline once,
+ * later wheels on that widget wait only a short tolerance, and an ack
+ * arriving again (a recreated widget) clears it.
+ */
+const wheelAckBroken = new Set<string>()
+const WHEEL_ACK_RETRY_MS = 500
+
+function wheelWidgetKey(target: Cdp): string {
+  return `${tabOf(target)}:${sessionOf(target) ?? 'root'}`
+}
+
+export function resetWheelAckLatchForTests(): void {
+  wheelAckBroken.clear()
+}
+
+/**
  * Wheel scroll. Lives here rather than at the call site so that every
  * `Input.*` dispatch in the extension goes through this module, and therefore
  * through the ack deadline: a call site that builds its own dispatch is the
  * one that gets forgotten.
+ *
+ * Unlike every other dispatch, the wheel's ack is NOT load-bearing (#207):
+ * a missing ack is the browser mislaying the receipt, not the wheel (see
+ * `wheelAckBroken`), so a timeout reports `'timeout'` instead of throwing
+ * and the caller's offset verification carries the verdict. A suspended
+ * renderer still fails the act at the caller's liveness gate. Non-timeout
+ * errors rethrow unchanged.
  */
 export async function trustedWheel(
   target: Cdp,
   point: Point,
   delta: { x: number; y: number },
   modifiers = 0,
-): Promise<void> {
-  await ackWithinDeadline(
-    sendCommand(target, 'Input.dispatchMouseEvent', {
-      type: 'mouseWheel',
-      x: Math.round(point.x),
-      y: Math.round(point.y),
-      deltaX: delta.x,
-      deltaY: delta.y,
-      modifiers,
-    }),
-  )
+): Promise<'acked' | 'timeout'> {
+  const key = wheelWidgetKey(target)
+  const opts = wheelAckBroken.has(key) ? { ms: WHEEL_ACK_RETRY_MS } : {}
+  try {
+    await ackWithinDeadline(
+      sendCommand(target, 'Input.dispatchMouseEvent', {
+        type: 'mouseWheel',
+        x: Math.round(point.x),
+        y: Math.round(point.y),
+        deltaX: delta.x,
+        deltaY: delta.y,
+        modifiers,
+      }),
+      opts,
+    )
+    wheelAckBroken.delete(key)
+    return 'acked'
+  } catch (e) {
+    if (e instanceof InputDispatchStalled) {
+      wheelAckBroken.add(key)
+      return 'timeout'
+    }
+    throw e
+  }
 }
 
 export async function focusElement(target: Cdp, objectId: string): Promise<void> {

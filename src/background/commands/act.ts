@@ -2092,7 +2092,10 @@ const SCROLL_BASE_FN = `function(id){
   } catch (e) { c = null; }
   try {
     var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
-    reg[id] = { c: c, d: doc };
+    reg[id] = { c: c, d: doc, ts: Date.now() };
+    for (var k in reg) {
+      if (reg[k] && reg[k].ts && Date.now() - reg[k].ts > 60000) { delete reg[k]; }
+    }
   } catch (e) {}
   return {
     p: p,
@@ -2123,7 +2126,10 @@ function scrollBaseExpression(id: string, point: Point | null): string {
   } catch (e) {}
   try {
     var reg = (globalThis.__nymScroll = globalThis.__nymScroll || {});
-    reg[${JSON.stringify(id)}] = { c: null, d: doc };
+    reg[${JSON.stringify(id)}] = { c: null, d: doc, ts: Date.now() };
+    for (var k in reg) {
+      if (reg[k] && reg[k].ts && Date.now() - reg[k].ts > 60000) { delete reg[k]; }
+    }
   } catch (e) {}
   return { p: null, c: null, d: doc ? { t: doc.scrollTop, l: doc.scrollLeft } : null, f: over };
 })()`
@@ -3572,7 +3578,17 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           scrollBaseline = base && (base.c || base.d) ? { c: base.c, d: base.d } : null
           scrollOverFrame = base?.f === true
         }
-        await trustedWheel(wheelTarget, at, { x: deltaX, y: deltaY }, modifiers)
+        {
+          const ack = await trustedWheel(wheelTarget, at, { x: deltaX, y: deltaY }, modifiers)
+          if (ack === 'timeout') {
+            // #207: the browser mislaid the RECEIPT, not the wheel (a
+            // coalesced-away wheel never acks while its delta still lands;
+            // measured live, the page scrolled through every "failed" ack).
+            // Not a failure: scroll_moved and settle carry the verdict, and
+            // the widget latch in input.ts caps what later wheels pay.
+            extra.wheel_ack = 'timeout'
+          }
+        }
         inputMode = 'trusted'
         extra.scrolled = { direction, amount_px: amount }
         break
@@ -3786,7 +3802,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         data: {
           action: a.action,
           url: urlBefore,
-          ...(landed ? { input: 'trusted' } : {}),
+          // #207: the two dispatched-then-stalled raise sites were
+          // payload-indistinguishable, which cost an investigation a round
+          // trip; the key names which gate gave up.
+          ...(landed ? { input: 'trusted', stall_at: 'dispatch-ack' } : {}),
           ...localDiagnostics(tabId, startedAt, urlBefore),
         },
       }
@@ -3834,7 +3853,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       ok: false,
       status: 'error',
       error: dispatchedThenStalledError(a.action),
-      data: { action: a.action, url: urlBefore, input: inputMode, ...localDiagnostics(tabId, startedAt, urlBefore) },
+      data: {
+        action: a.action,
+        url: urlBefore,
+        input: inputMode,
+        stall_at: 'liveness',
+        ...localDiagnostics(tabId, startedAt, urlBefore),
+      },
     }
   }
 

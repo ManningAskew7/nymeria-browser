@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { execAct, __test } from './act'
 import { CdpCallTimeout, resetForTests as resetDebugger } from '../debuggerSession'
+import { resetWheelAckLatchForTests } from '../input'
 import { push as pushConsole, resetForTests as resetConsole } from '../consoleBuffer'
 import { push as pushNetwork, resetForTests as resetNetwork } from '../networkBuffer'
 import { provenDelivery, resetForTests as resetDelivery, suppressionEvidence } from '../delivery'
@@ -1913,6 +1914,29 @@ describe('input delivery', () => {
       // scripts" was retired for the probe-shaped fact.
       expect(error).toMatch(/did not answer the verification probe/i)
       expect(error).not.toMatch(/stopped running scripts/i)
+      // #207: the two stall sites were payload-indistinguishable, which
+      // cost an investigation a round trip. This is the LIVENESS gate.
+      expect((result.data as { stall_at?: string }).stall_at).toBe('liveness')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a dispatch-ack stall names its site, distinct from the liveness gate (#207)', async () => {
+    // The other raise site: the ack deadline fired with the input landed
+    // and no dialog recorded, so the generic catch reports.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+      installCdpMock({ inputAckHangsFrom: 2 })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      expect(String(result.error)).toMatch(/did not answer the verification probe/i)
+      expect((result.data as { stall_at?: string }).stall_at).toBe('dispatch-ack')
     } finally {
       vi.useRealTimers()
     }
@@ -4810,6 +4834,51 @@ describe('scroll at a ref (#203)', () => {
     })
   })
 
+  it('a scroll whose wheel ack never arrives succeeds with wheel_ack: "timeout" (#207)', async () => {
+    // Measured live: Chromium coalesces queue-deep wheels, a coalesced-away
+    // wheel never acks while its delta still lands, and the desync is
+    // permanent per widget. The ack is therefore not load-bearing for
+    // scroll: the act proceeds, reports the mislaid receipt honestly, and
+    // scroll_moved carries the verdict. Reverting to a throwing ack turns
+    // this red (the act would fail with the stall copy).
+    vi.useFakeTimers()
+    resetWheelAckLatchForTests()
+    try {
+      installCdpMock({
+        inputAckHangsFrom: 1,
+        scrollBase: { d: { t: 0, l: 0 } },
+        scrollAfter: { c: null, d: { t: 500, l: 0 } },
+      })
+
+      const pending = execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+      await vi.advanceTimersByTimeAsync(9_000)
+      const result = await pending
+
+      expect(result.ok).toBe(true)
+      expect((result.data as { wheel_ack?: string }).wheel_ack).toBe('timeout')
+      expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+        dx: 0,
+        dy: 500,
+        scroller: 'document',
+      })
+    } finally {
+      vi.useRealTimers()
+      resetWheelAckLatchForTests()
+    }
+  })
+
+  it('an acked wheel carries no wheel_ack key', async () => {
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 } },
+      scrollAfter: { c: null, d: { t: 500, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect('wheel_ack' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
   it('a laid-out but off-viewport ref refuses: wheel input is positional', async () => {
     // The old shape wheeled at the off-screen geometric centre, scrolled
     // whatever happened to be there (usually the root), and then reported
@@ -4967,6 +5036,24 @@ describe('scroll probes (executed in-page)', () => {
 
   it('a missing slot answers null, never a fabricated pair', () => {
     expect(runAfter('never-registered')).toBeNull()
+  })
+
+  it('each registration prunes slots older than a minute (#207 hygiene)', () => {
+    // A scroll that fails before its after-read leaks its slot; ids are
+    // monotonic so leaked slots are never read, but they must not grow
+    // the registry unboundedly on a long-lived document.
+    document.body.innerHTML = '<span id="target">x</span>'
+    const target = document.getElementById('target') as Element
+
+    runBase(target, 'stale-slot')
+    const reg = (globalThis as { __nymScroll?: Record<string, { ts?: number }> }).__nymScroll
+    expect(reg?.['stale-slot']).toBeTruthy()
+    reg!['stale-slot']!.ts = Date.now() - 61_000
+
+    runBase(target, 'fresh-slot')
+
+    expect(reg?.['stale-slot']).toBeUndefined()
+    expect(reg?.['fresh-slot']).toBeTruthy()
   })
 
   it('the targetless read flags a wheel point over an embedded frame', () => {
