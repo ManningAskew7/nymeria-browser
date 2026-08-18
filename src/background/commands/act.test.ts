@@ -56,6 +56,8 @@ interface MockOptions {
   value?: string | null
   resolveNode?: boolean
   settleValue?: string
+  /** Mutation-record count the settle probe reports (#180); null omits `m`. */
+  settleMutations?: number | null
   bodyText?: string
   selectMatches?: boolean
   /** false models a tab where the delivery probe's world cannot be created. */
@@ -179,6 +181,7 @@ function installCdpMock(opts: MockOptions = {}) {
     value = 'old value',
     resolveNode = true,
     settleValue = 'quiet',
+    settleMutations = 3,
     bodyText = '',
     selectMatches = true,
     deliveryWorld = true,
@@ -393,7 +396,13 @@ function installCdpMock(opts: MockOptions = {}) {
       if (expression.includes('elementFromPoint')) {
         return { result: { value: { description: pointDescription, opensFileChooser: isFileInput } } }
       }
-      if (expression.includes('MutationObserver')) return { result: { value: settleValue } }
+      if (expression.includes('MutationObserver')) {
+        return {
+          result: {
+            value: { s: settleValue, ...(settleMutations === null ? {} : { m: settleMutations }) },
+          },
+        }
+      }
       if (expression.includes('activeElement')) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
       }
@@ -1021,6 +1030,41 @@ describe('verification payload', () => {
 
     expect(result.ok).toBe(true)
     expect((result.data as { settled: { reason: string } }).settled.reason).toBe('deadline')
+  })
+
+  it('the settle verdict carries the mutation tally: did the page react at all (#180)', async () => {
+    // The measured phantom add-to-cart carried every per-field truth and
+    // no page reaction; the observer was already watching and threw the
+    // tally away. Now it rides the settled object.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ settleValue: 'quiet', settleMutations: 7 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect((result.data as { settled: { mutations?: number } }).settled.mutations).toBe(7)
+  })
+
+  it('ZERO mutations is reported, not omitted: it is the strong signal (#180)', async () => {
+    // Nonzero is weak (dynamic pages mutate constantly); zero says the
+    // page did nothing observable with the input, which is exactly the
+    // fact both live drives had to invent per-site controls to learn.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ settleValue: 'quiet', settleMutations: 0 })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect((result.data as { settled: { mutations?: number } }).settled.mutations).toBe(0)
+  })
+
+  it('a settle whose probe never ran reports no tally rather than a fake zero (#180)', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ settleValue: 'unavailable', settleMutations: null })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const settled = (result.data as { settled: { reason: string; mutations?: number } }).settled
+    expect(settled.reason).toBe('unavailable')
+    expect(settled.mutations).toBeUndefined()
   })
 
   it('reports not-found on timeout instead of claiming success', async () => {

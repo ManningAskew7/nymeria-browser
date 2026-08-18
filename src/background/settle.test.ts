@@ -162,3 +162,54 @@ describe('settle transport deadline', () => {
     }
   })
 })
+
+/**
+ * These EXECUTE the probe expression in happy-dom instead of matching it as
+ * a string, the gap backlog #160 recorded for this exact probe ("a string no
+ * test ever executes"). The mock resolves the expression's promise the way
+ * `awaitPromise` does, so the MutationObserver logic that IS the settle
+ * mechanism, tally included (#180), runs for real.
+ */
+describe('settle probe execution (#180)', () => {
+  function installRunningMock(): void {
+    resetDebugger()
+    ;(chrome.debugger.sendCommand as unknown) = vi.fn(
+      async (_target: unknown, method: string, params: Record<string, unknown> = {}) => {
+        if (method === 'Runtime.evaluate') {
+          const value = (new Function(`return (${String(params.expression)})`) as () => unknown)()
+          return { result: { value: params.awaitPromise ? await value : value } }
+        }
+        return {}
+      },
+    )
+  }
+
+  it('counts the mutations the page makes during the window', async () => {
+    installRunningMock()
+
+    const pending = settle(TAB, { quietMs: 40, maxMs: 2_000 })
+    // Let the probe install its observer (settle's attach + evaluate are
+    // async), then the page reacts: three DOM changes land while it watches.
+    await new Promise((r) => setTimeout(r, 20))
+    for (let i = 0; i < 3; i++) {
+      const el = document.createElement('div')
+      el.textContent = `reaction-${i}`
+      document.body.appendChild(el)
+    }
+    const result = await pending
+
+    expect(result.reason).toBe('quiet')
+    expect(result.mutations).toBeGreaterThanOrEqual(1)
+  })
+
+  it('reports an honest zero when the page never reacted', async () => {
+    // Zero is the STRONG signal (the phantom add-to-cart shape): it must be
+    // a measured tally of a quiet window, never an omission or a default.
+    installRunningMock()
+
+    const result = await settle(TAB, { quietMs: 40, maxMs: 2_000 })
+
+    expect(result.reason).toBe('quiet')
+    expect(result.mutations).toBe(0)
+  })
+})

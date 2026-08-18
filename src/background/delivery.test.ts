@@ -1,9 +1,32 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { armDelivery, clearWorld, resetForTests } from './delivery'
-import { resetForTests as resetDebugger } from './debuggerSession'
+import { installCdpEventRouter, resetForTests as resetDebugger } from './debuggerSession'
 
 const TAB = 1
 const CONTEXT = 7
+
+/**
+ * Simulate CDP's binding channel (#180). Real Chrome exposes the
+ * `Runtime.addBinding` function as a global in the delivery world and
+ * delivers each call as a `Runtime.bindingCalled` event; the fake routes
+ * a page-side call through the REAL event router, so the name check, the
+ * payload parse and the per-probe slot routing are all exercised, not
+ * mocked around.
+ */
+function installPushChannel(): (payload: string) => void {
+  installCdpEventRouter()
+  const addListener = chrome.debugger.onEvent.addListener as unknown as ReturnType<typeof vi.fn>
+  const route = addListener.mock.calls.at(-1)?.[0] as (
+    source: { tabId: number },
+    method: string,
+    params: unknown,
+  ) => void
+  const emit = (payload: string): void => {
+    route({ tabId: TAB }, 'Runtime.bindingCalled', { name: '__nymDeliveryPush', payload })
+  }
+  ;(globalThis as Record<string, unknown>).__nymDeliveryPush = emit
+  return emit
+}
 
 /**
  * A CDP mock that RUNS the probe's page-side JavaScript instead of matching it
@@ -39,7 +62,11 @@ function installCdpMock(
         // `readThrows` models the document dying with the final read; the
         // peek (taken earlier, while the document lived) stays runnable.
         if (!isArm && !isPeek && readThrows) throw new Error(readThrows)
-        return { result: { value: run(expression) } }
+        // Real CDP resolves the value when `awaitPromise` is set; the read
+        // expression yields a macrotask in the page (#180), so the mock
+        // must await the same way or it would hand back a pending Promise.
+        const value = run(expression)
+        return { result: { value: params.awaitPromise ? await value : value } }
       }
       return {}
     },
@@ -68,6 +95,7 @@ beforeEach(() => {
   resetDebugger()
   resetForTests()
   delete (globalThis as Record<string, unknown>).__nymDelivery
+  delete (globalThis as Record<string, unknown>).__nymDeliveryPush
   document.body.innerHTML = ''
 })
 
@@ -146,10 +174,15 @@ describe('delivery probe', () => {
     expect(reading.clickDefaultPrevented).toBeUndefined()
   })
 
-  it('samples defaultPrevented after the page handlers have run', async () => {
+  it('samples defaultPrevented deterministically: an immediate read still sees it (#180)', async () => {
     // Our capture listener on window is the FIRST hop, before any page
     // handler can call preventDefault, so reading the flag inline would
-    // always say false. The sample rides a later tick instead.
+    // always say false; the sample rides a later tick. The read used to
+    // win that race only by the accident of CDP round trips between
+    // dispatch and read (measured present-sometimes across one session,
+    // the #180 filing). Now the read itself yields one macrotask in the
+    // page before snapping, so this test deliberately does NOT yield:
+    // reading straight after dispatch must still see the settled flag.
     installCdpMock()
 
     const probe = await armDelivery(TAB, ['click'])
@@ -157,14 +190,12 @@ describe('delivery probe', () => {
     document.body.addEventListener('click', cancel)
     try {
       firePageEvent('click')
-      await new Promise((r) => setTimeout(r, 0))
+      const reading = await probe.read()
+      expect(reading.outcome).toBe('yes')
+      expect(reading.clickDefaultPrevented).toBe(true)
     } finally {
       document.body.removeEventListener('click', cancel)
     }
-
-    const reading = await probe.read()
-    expect(reading.outcome).toBe('yes')
-    expect(reading.clickDefaultPrevented).toBe(true)
   })
 
   it("reads the frame's user-activation state at read time", async () => {
@@ -227,6 +258,108 @@ describe('delivery probe', () => {
     const reading = await probe.read()
     expect(reading.outcome).toBe('yes')
     expect(reading.events).toEqual({ mousedown: 1 })
+  })
+
+  it('a navigating click keeps its whole diagnosis through the push channel (#180)', async () => {
+    // The facts live in a page-world closure that dies with the document,
+    // and on a fast navigation the read AND the peek both arrive after
+    // teardown: the filing measured the entire diagnostic set absent on
+    // the exact case it matters most for. The handler pushes after every
+    // trusted event through the CDP binding, so the background already
+    // holds the diagnosis when the world dies. Deliberately NO peek here:
+    // the evidence must come from the pushes alone.
+    installCdpMock({ readThrows: 'Cannot find context with specified id' })
+    installPushChannel()
+    Object.defineProperty(navigator, 'userActivation', {
+      value: { isActive: true, hasBeenActive: true },
+      configurable: true,
+    })
+    document.body.innerHTML = '<a href="https://dest.example/x">go</a>'
+    try {
+      const probe = await armDelivery(TAB, ['click'])
+      firePageEvent('click', { target: document.querySelector('a') as Element })
+      // One macrotask so the deferred defaultPrevented push lands, as it
+      // does in reality: a real navigation commit needs at least a network
+      // round trip, a macrotask does not.
+      await new Promise((r) => setTimeout(r, 0))
+
+      const reading = await probe.read()
+      expect(reading.outcome).toBe('yes')
+      expect(reading.events).toEqual({ click: 1 })
+      expect(reading.clickTarget).toEqual({ tag: 'a', href: 'https://dest.example/x' })
+      expect(reading.clickDefaultPrevented).toBe(false)
+      expect(reading.userActivation).toEqual({ active: true, hasBeenActive: true })
+    } finally {
+      delete (navigator as unknown as Record<string, unknown>).userActivation
+    }
+  })
+
+  it('the sync per-event push alone carries evidence when teardown beats the macrotask (#180)', async () => {
+    // An instantly-committing navigation can kill the document before the
+    // deferred defaultPrevented sample ever runs (measured live on a
+    // hot-cache nav, 2026-08-16). The SYNCHRONOUS push at event time is
+    // the insurance: counts and target survive, and prevented is honestly
+    // absent rather than guessed. No macrotask yield and no peek here, so
+    // only that sync push has run when the read finds the world dead.
+    installCdpMock({ readThrows: 'Cannot find context with specified id' })
+    installPushChannel()
+    document.body.innerHTML = '<a href="https://dest.example/y">go</a>'
+
+    const probe = await armDelivery(TAB, ['click'])
+    firePageEvent('click', { target: document.querySelector('a') as Element })
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toEqual({ click: 1 })
+    expect(reading.clickTarget).toEqual({ tag: 'a', href: 'https://dest.example/y' })
+    expect(reading.clickDefaultPrevented).toBeUndefined()
+  })
+
+  it('the freshest push outranks a stale peek on the navigating path (#180)', async () => {
+    // Both carriers can be populated; the push is event-time truth and
+    // strictly newer, so it must win the merge.
+    installCdpMock({ readThrows: 'Cannot find context with specified id' })
+    installPushChannel()
+
+    const probe = await armDelivery(TAB, ['mousedown'])
+    firePageEvent('mousedown')
+    await probe.peek()
+    firePageEvent('mousedown')
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toEqual({ mousedown: 2 })
+  })
+
+  it('a malformed or misrouted push never becomes evidence (#180)', async () => {
+    // The channel is world-scoped so page script cannot reach it, but the
+    // parse still refuses garbage, and a payload naming a foreign probe id
+    // lands nowhere: the navigating read then reports the bare yes it
+    // always did rather than someone else's counts.
+    installCdpMock({ readThrows: 'Cannot find context with specified id' })
+    const emit = installPushChannel()
+
+    const probe = await armDelivery(TAB, ['mousedown'])
+    emit('{not json')
+    emit(JSON.stringify({ id: 'p999999', n: 5, types: { mousedown: 5 } }))
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toBeUndefined()
+  })
+
+  it('installs the push binding scoped to the delivery world, never the page (#180)', async () => {
+    // `executionContextName` is the security property: a binding without it
+    // would hand page script a callable straight into the background.
+    const cdp = installCdpMock()
+
+    await armDelivery(TAB, ['click'])
+
+    const call = cdp.mock.calls.find((c) => c[1] === 'Runtime.addBinding')
+    expect(call?.[2]).toEqual({
+      name: '__nymDeliveryPush',
+      executionContextName: 'nymeria_delivery_probe',
+    })
   })
 
   it('the peek does not disarm: later events still count and the read stays authoritative', async () => {
@@ -365,7 +498,7 @@ describe('delivery probe', () => {
           }
           return {
             result: {
-              value: (new Function(`return (${expression})`) as () => unknown)(),
+              value: await (new Function(`return (${expression})`) as () => unknown)(),
             },
           }
         }

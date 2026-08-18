@@ -73,7 +73,7 @@ function installCdpMock(opts: MockOpts = {}) {
       }
       if (method === 'Runtime.evaluate') {
         const expression = String(params.expression ?? '')
-        if (expression.includes('MutationObserver')) return { result: { value: 'quiet' } }
+        if (expression.includes('MutationObserver')) return { result: { value: { s: 'quiet', m: 0 } } }
         if (expression.includes('activeElement')) return { result: { value: null } }
         return { result: { value: undefined } }
       }

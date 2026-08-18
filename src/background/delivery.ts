@@ -1,4 +1,4 @@
-import { sendCommand, type Cdp } from './debuggerSession'
+import { onCdpEvent, sendCommand, type Cdp } from './debuggerSession'
 import { callOn } from './input'
 import { sessionStamp } from './sessionStamp'
 import {
@@ -93,10 +93,16 @@ export interface DeliveryReading {
    * `contextmenu`, `dblclick`), sampled a tick after dispatch so page
    * handlers have had their turn (our capture listener runs FIRST, before
    * any of them can call preventDefault). Absent when none composed.
+   * DETERMINISTIC since #180: the read itself yields one macrotask in the
+   * page before snapping, and timer FIFO guarantees the handler's earlier
+   * `setTimeout(0)` has run, so presence no longer depends on which
+   * macrotask the read lands in.
    */
   clickDefaultPrevented?: boolean
-  /** The probed frame's user-activation state at read time (#176: the gate
-   * navigation-class default actions key on). */
+  /** The probed frame's user-activation state (#176: the gate
+   * navigation-class default actions key on). Sampled at EVENT time in the
+   * handler since #180 (so a navigating click keeps it); read-time sample
+   * kept as fallback when no trusted event fired. */
   userActivation?: { active: boolean; hasBeenActive: boolean }
   /**
    * Identity of the last composed click-family event's target: tag name and,
@@ -147,6 +153,60 @@ const ORPHAN_MS = 60_000
 let nextProbeId = 0
 
 /**
+ * The teardown-proof channel (#180): a `Runtime.addBinding` function the
+ * handler calls after every trusted event, delivered to the background as
+ * `Runtime.bindingCalled` (the Runtime domain is enabled on every attach,
+ * root and frame sessions alike). Scoped by `executionContextName` to the
+ * delivery world, so page script never sees it. Installed on EVERY arm,
+ * deliberately uncached: bindings die with the debugger session, and one
+ * try/catch round trip per act is cheaper than session-end bookkeeping
+ * that can go stale (re-adding an existing binding is harmless).
+ */
+const PUSH_BINDING = '__nymDeliveryPush'
+
+/** Freshest pushed snapshot per live probe id. Entries are registered at
+ * arm, consumed and dropped at read, and swept by the next arm when a
+ * probe was abandoned unread (the page-side registry's ORPHAN_MS twin). */
+const pushSlots = new Map<string, { at: number; snap: RawSnap | null }>()
+
+let pushRoutingInstalled = false
+function ensurePushRouting(): void {
+  if (pushRoutingInstalled) return
+  pushRoutingInstalled = true
+  onCdpEvent((_tabId, method, params) => {
+    if (method !== 'Runtime.bindingCalled') return
+    const p = params as { name?: unknown; payload?: unknown } | undefined
+    if (p?.name !== PUSH_BINDING || typeof p.payload !== 'string') return
+    try {
+      const parsed = JSON.parse(p.payload) as { id?: unknown } & RawSnap
+      if (typeof parsed.id === 'string' && typeof parsed.n === 'number') {
+        const slot = pushSlots.get(parsed.id)
+        if (slot) slot.snap = parsed
+      }
+    } catch {
+      /* A malformed payload is dropped: the push is evidence, not control. */
+    }
+  })
+}
+
+async function installPushBinding(target: Cdp): Promise<void> {
+  try {
+    await sendCommand(target, 'Runtime.addBinding', {
+      name: PUSH_BINDING,
+      executionContextName: DELIVERY_WORLD,
+    })
+  } catch {
+    /* Best effort: without the binding the probe degrades to peek-only. */
+  }
+}
+
+function sweepPushSlots(now: number): void {
+  for (const [id, slot] of pushSlots) {
+    if (now - slot.at > ORPHAN_MS) pushSlots.delete(id)
+  }
+}
+
+/**
  * Drop one session's cached delivery world. A committed navigation destroys
  * the isolated world along with the document, so the cached id would resolve
  * to nothing. The creation/caching machinery itself lives in `worlds.ts`
@@ -160,6 +220,18 @@ export function clearWorld(target: Cdp): void {
  * Counts events by type at window capture. Written as an IIFE returning a
  * boolean so a failure to install surfaces as `false` rather than as an
  * exception we would have to guess the meaning of.
+ *
+ * The handler also PUSHES its facts out of the page after every trusted
+ * event (#180), through the `Runtime.addBinding` channel installed per
+ * arm: the closure these facts live in dies with the document, and the
+ * navigating click, the case the diagnosis matters most for, used to lose
+ * them all because the read (and usually the peek) arrived after
+ * teardown. The push is synchronous CDP event emission, so it lands
+ * before a navigation can commit; the `setTimeout(0)` push after it
+ * carries the settled `defaultPrevented`, which still beats a real
+ * navigation's commit in practice (one macrotask vs at least a network
+ * round trip). Best-effort throughout: no binding, no pushes, and the
+ * probe degrades to exactly the peek-only behavior it had before.
  */
 function armExpression(types: readonly string[], id: string): string {
   return `(function(types, id){
@@ -177,7 +249,15 @@ function armExpression(types: readonly string[], id: string): string {
       var counts = {};
       var prevented = null;
       var clickTarget = null;
+      var uaEvent = null;
       var offs = [];
+      var push = function(){
+        try {
+          if (typeof g.${PUSH_BINDING} === 'function') {
+            g.${PUSH_BINDING}(JSON.stringify({ id: id, n: n, types: counts, prevented: prevented, target: clickTarget, uae: uaEvent }));
+          }
+        } catch (err) {}
+      };
       for (var i = 0; i < types.length; i++) {
         (function(type){
           var composed = type === 'click' || type === 'contextmenu' || type === 'dblclick';
@@ -185,8 +265,15 @@ function armExpression(types: readonly string[], id: string): string {
             if (e && e.isTrusted) {
               n += 1;
               counts[type] = (counts[type] || 0) + 1;
+              try {
+                var u = navigator.userActivation;
+                if (u) uaEvent = { a: u.isActive === true, h: u.hasBeenActive === true };
+              } catch (err) {}
               if (composed) {
-                setTimeout(function(){ try { prevented = e.defaultPrevented === true; } catch (err) {} }, 0);
+                setTimeout(function(){
+                  try { prevented = e.defaultPrevented === true; } catch (err) {}
+                  push();
+                }, 0);
                 try {
                   var t = e.target;
                   var info = { tag: t && t.tagName ? String(t.tagName).toLowerCase() : String(t) };
@@ -195,6 +282,7 @@ function armExpression(types: readonly string[], id: string): string {
                   clickTarget = info;
                 } catch (err) {}
               }
+              push();
             }
           };
           window.addEventListener(type, h, true);
@@ -203,7 +291,7 @@ function armExpression(types: readonly string[], id: string): string {
       }
       reg[id] = {
         t: now,
-        snap: function(){ return { n: n, types: counts, prevented: prevented, target: clickTarget }; },
+        snap: function(){ return { n: n, types: counts, prevented: prevented, target: clickTarget, uae: uaEvent }; },
         off: function(){ for (var j = 0; j < offs.length; j++) { try { offs[j](); } catch (e) {} } }
       };
       return true;
@@ -213,6 +301,16 @@ function armExpression(types: readonly string[], id: string): string {
   })(${JSON.stringify(types)}, ${JSON.stringify(id)})`
 }
 
+/**
+ * The read yields ONE macrotask in the page before snapping (#180).
+ * `setTimeout` callbacks run FIFO within the timer source, so the
+ * handler's deferred `defaultPrevented` sample, queued at event time, has
+ * provably run by the time this snap executes: the field's presence no
+ * longer depends on how many CDP round trips happened to sit between
+ * dispatch and read. Evaluated with `awaitPromise`; a document torn down
+ * mid-yield rejects the evaluate with a context-destroyed error, which is
+ * the same navigated-so-delivered path the sync read already took.
+ */
 function readExpression(id: string): string {
   return `(function(id){
     var g = globalThis;
@@ -220,14 +318,16 @@ function readExpression(id: string): string {
     if (!reg) return null;
     var p = reg[id];
     if (!p) return null;
-    var out = p.snap ? p.snap() : { n: 0 };
-    try {
-      var ua = navigator.userActivation;
-      out.ua = ua ? { a: ua.isActive === true, h: ua.hasBeenActive === true } : null;
-    } catch (e) { out.ua = null; }
-    try { p.off(); } catch (e) {}
-    delete reg[id];
-    return out;
+    return new Promise(function(resolve){ setTimeout(resolve, 0); }).then(function(){
+      var out = p.snap ? p.snap() : { n: 0 };
+      try {
+        var ua = navigator.userActivation;
+        out.ua = ua ? { a: ua.isActive === true, h: ua.hasBeenActive === true } : null;
+      } catch (e) { out.ua = null; }
+      try { p.off(); } catch (e) {}
+      delete reg[id];
+      return out;
+    });
   })(${JSON.stringify(id)})`
 }
 
@@ -259,12 +359,18 @@ async function evaluateInWorld<T>(
   target: Cdp,
   contextId: number,
   expression: string,
+  opts: { awaitPromise?: boolean } = {},
 ): Promise<{ ok: true; value: T } | { ok: false; contextGone: boolean }> {
   try {
     const resp = await sendCommand<{
       result?: { value?: T }
       exceptionDetails?: unknown
-    }>(target, 'Runtime.evaluate', { expression, contextId, returnByValue: true })
+    }>(target, 'Runtime.evaluate', {
+      expression,
+      contextId,
+      returnByValue: true,
+      ...(opts.awaitPromise ? { awaitPromise: true } : {}),
+    })
     if (resp.exceptionDetails) return { ok: false, contextGone: false }
     return { ok: true, value: resp.result?.value as T }
   } catch (e) {
@@ -273,12 +379,15 @@ async function evaluateInWorld<T>(
   }
 }
 
-/** The raw shape the page-side snap()/read/peek expressions return. */
+/** The raw shape the page-side snap()/read/peek/push expressions return.
+ * `uae` is the handler's event-time user-activation sample (#180); `ua`
+ * the read/peek-time one. */
 type RawSnap = {
   n: number
   types?: Record<string, number>
   prevented?: boolean | null
   ua?: { a?: boolean; h?: boolean } | null
+  uae?: { a?: boolean; h?: boolean } | null
   target?: { tag?: unknown; href?: unknown } | null
 }
 
@@ -286,8 +395,11 @@ type RawSnap = {
 function enrich(reading: DeliveryReading, value: RawSnap): DeliveryReading {
   if (value.types && typeof value.types === 'object') reading.events = value.types
   if (typeof value.prevented === 'boolean') reading.clickDefaultPrevented = value.prevented
-  if (value.ua && typeof value.ua.a === 'boolean') {
-    reading.userActivation = { active: value.ua.a, hasBeenActive: value.ua.h === true }
+  // Event-time activation outranks the read-time sample: it is the state
+  // the input itself produced, and it is the one a navigating click keeps.
+  const ua = value.uae && typeof value.uae.a === 'boolean' ? value.uae : value.ua
+  if (ua && typeof ua.a === 'boolean') {
+    reading.userActivation = { active: ua.a, hasBeenActive: ua.h === true }
   }
   if (value.target && typeof value.target.tag === 'string') {
     reading.clickTarget = {
@@ -322,11 +434,14 @@ const UNARMED: DeliveryProbe = {
  * page-deferred clicks. See the #169 pass record.
  */
 export async function armDelivery(target: Cdp, types: readonly string[]): Promise<DeliveryProbe> {
+  ensurePushRouting()
   let contextId = await worldFor(target, DELIVERY_WORLD)
   if (contextId === null) return UNARMED
+  await installPushBinding(target)
 
   nextProbeId += 1
   const id = `p${nextProbeId}`
+  sweepPushSlots(Date.now())
   const arm = () => armExpression(types, id)
   let armed = await evaluateInWorld<boolean>(target, contextId, arm())
   if (!armed.ok && armed.contextGone) {
@@ -338,6 +453,7 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
   }
   if (!armed.ok || armed.value !== true) return UNARMED
 
+  pushSlots.set(id, { at: Date.now(), snap: null })
   const world = contextId
   let spent = false
   let peeked: RawSnap | null = null
@@ -352,17 +468,25 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
     async read(): Promise<DeliveryReading> {
       if (spent) return { outcome: 'unknown', reason: 'the delivery probe was already read' }
       spent = true
-      const result = await evaluateInWorld<RawSnap | null>(target, world, readExpression(id))
+      const result = await evaluateInWorld<RawSnap | null>(target, world, readExpression(id), {
+        awaitPromise: true,
+      })
+      const pushed = pushSlots.get(id)?.snap ?? null
+      pushSlots.delete(id)
       if (!result.ok) {
         // The context was destroyed between arming and reading, which means
         // the document went away: the action navigated it. A navigation is
         // proof the input landed, so this is delivery, not ignorance. The
-        // peek's snapshot, taken just after dispatch, restores the per-type
-        // counts the navigation destroyed.
+        // handler's own pushes, emitted at event time through the binding
+        // channel, restore the diagnosis the navigation destroyed (#180);
+        // the peek's post-dispatch snapshot backs them up where the binding
+        // never installed. Pushed enriches LAST so event-time truth wins.
         if (result.contextGone) {
           clearWorld(target)
-          const reading: DeliveryReading = { outcome: 'yes' }
-          return peeked ? enrich(reading, peeked) : reading
+          let reading: DeliveryReading = { outcome: 'yes' }
+          if (peeked) reading = enrich(reading, peeked)
+          if (pushed) reading = enrich(reading, pushed)
+          return reading
         }
         return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }
@@ -539,4 +663,8 @@ export async function provenDelivery(tabId: number): Promise<DeliveryEvidence | 
 
 export function resetForTests(): void {
   resetWorlds()
+  pushSlots.clear()
+  // The debugger module's own reset clears its event handlers, so the
+  // routing latch must drop too or no push would ever route again.
+  pushRoutingInstalled = false
 }
