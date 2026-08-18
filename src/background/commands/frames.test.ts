@@ -2478,6 +2478,26 @@ describe('act payload frame attribution (#201)', () => {
     expect('resolved_frame' in (result.data as Record<string, unknown>)).toBe(false)
   })
 
+  it('an in-frame act withholds the settle mutation tally (#180 review, H1)', async () => {
+    // The tally's observer watches the ROOT document; an act that resolved
+    // into a subframe mutates the frame's own document, which the observer
+    // can never see, so a truthful-looking zero would teach "the page did
+    // nothing" about the one document it never watched. Absent, not zero.
+    installCdpMock()
+    await attachFrame()
+    setRefs(TAB, frameRef('https://pay.example/card'), TAB_URL)
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { resolved_frame?: string }).resolved_frame).toBe(
+      'https://pay.example/card',
+    )
+    const settled = (result.data as { settled?: { mutations?: number } }).settled
+    expect(settled).toBeDefined()
+    expect(settled?.mutations).toBeUndefined()
+  })
+
   it('a disabled refusal on a frame element still names the frame', async () => {
     // Post-resolution refusals know the frame; a refusal about a frame
     // element's state is exactly where attribution earns its keep.

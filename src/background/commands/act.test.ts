@@ -4248,6 +4248,12 @@ describe('wall-clock budget (#162)', () => {
     const deadlineMs = Number(expr.match(/Date\.now\(\) \+ (\d+)/)?.[1])
     expect(deadlineMs, 'the 20s ask must shrink to the ~1.5s remaining').toBeLessThanOrEqual(1_500)
     expect(deadlineMs).toBeGreaterThan(0)
+    // A tally from the budget-shrunken window would read as "the page did
+    // nothing" about time nobody watched (#180 plan E5): absent, not zero.
+    expect(
+      (data.settled as { mutations?: number }).mutations,
+      'a clamped unsettled window must not report a tally',
+    ).toBeUndefined()
   })
 
   it('a budget dying on the preparatory hover says NO click was pressed, not "mid-action"', async () => {

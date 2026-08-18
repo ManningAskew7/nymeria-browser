@@ -1,4 +1,4 @@
-import { onCdpEvent, sendCommand, type Cdp } from './debuggerSession'
+import { onCdpEvent, sendCommand, tabOf, type Cdp } from './debuggerSession'
 import { callOn } from './input'
 import { sessionStamp } from './sessionStamp'
 import {
@@ -149,7 +149,14 @@ const ORPHAN_MS = 60_000
  * counter the second arm would zero the first's count and the first read would
  * delete the second's record, so a genuinely delivered action could read zero
  * and hard-fail. Each probe owns its own entry instead.
+ *
+ * Ids carry a per-worker tag (review round, M1): the page-side registry
+ * outlives an MV3 worker recycle while a bare counter restarts at 1, so a
+ * recycled worker could re-mint an id that a still-armed orphan probe is
+ * pushing under, and last-writer-wins would hand the new act the old act's
+ * counts. A tag no other worker life can repeat makes reuse impossible.
  */
+const WORKER_TAG = `${Date.now().toString(36)}${Math.floor(Math.random() * 46656).toString(36)}`
 let nextProbeId = 0
 
 /**
@@ -160,27 +167,38 @@ let nextProbeId = 0
  * delivery world, so page script never sees it. Installed on EVERY arm,
  * deliberately uncached: bindings die with the debugger session, and one
  * try/catch round trip per act is cheaper than session-end bookkeeping
- * that can go stale (re-adding an existing binding is harmless).
+ * that can go stale (re-adding an existing binding is harmless). The
+ * pushes themselves are per trusted event, so a long type emits one tiny
+ * bindingCalled per keystroke: accepted, since the keystroke dispatches
+ * they shadow each cost a full CDP round trip already, and a mid-typing
+ * navigation (Enter submitting a form) is exactly a case the pushes
+ * exist to survive.
  */
 const PUSH_BINDING = '__nymDeliveryPush'
 
-/** Freshest pushed snapshot per live probe id. Entries are registered at
- * arm, consumed and dropped at read, and swept by the next arm when a
- * probe was abandoned unread (the page-side registry's ORPHAN_MS twin). */
+/** Freshest pushed snapshot per live probe, keyed `${tabId}:${probeId}` so
+ * a push can never land in another tab's slot (review round, M1). Entries
+ * are registered at arm, consumed and dropped at read, and swept by the
+ * next arm when a probe was abandoned unread (the page-side registry's
+ * ORPHAN_MS twin). */
 const pushSlots = new Map<string, { at: number; snap: RawSnap | null }>()
+
+function slotKey(tabId: number, id: string): string {
+  return `${tabId}:${id}`
+}
 
 let pushRoutingInstalled = false
 function ensurePushRouting(): void {
   if (pushRoutingInstalled) return
   pushRoutingInstalled = true
-  onCdpEvent((_tabId, method, params) => {
+  onCdpEvent((tabId, method, params) => {
     if (method !== 'Runtime.bindingCalled') return
     const p = params as { name?: unknown; payload?: unknown } | undefined
     if (p?.name !== PUSH_BINDING || typeof p.payload !== 'string') return
     try {
       const parsed = JSON.parse(p.payload) as { id?: unknown } & RawSnap
       if (typeof parsed.id === 'string' && typeof parsed.n === 'number') {
-        const slot = pushSlots.get(parsed.id)
+        const slot = pushSlots.get(slotKey(tabId, parsed.id))
         if (slot) slot.snap = parsed
       }
     } catch {
@@ -302,14 +320,20 @@ function armExpression(types: readonly string[], id: string): string {
 }
 
 /**
- * The read yields ONE macrotask in the page before snapping (#180).
- * `setTimeout` callbacks run FIFO within the timer source, so the
- * handler's deferred `defaultPrevented` sample, queued at event time, has
- * provably run by the time this snap executes: the field's presence no
- * longer depends on how many CDP round trips happened to sit between
- * dispatch and read. Evaluated with `awaitPromise`; a document torn down
- * mid-yield rejects the evaluate with a context-destroyed error, which is
- * the same navigated-so-delivered path the sync read already took.
+ * The read yields ONE macrotask in the page before snapping, and only
+ * while the handler's deferred `defaultPrevented` sample is actually
+ * pending (#180). `setTimeout` callbacks run FIFO within the timer
+ * source, so the yield's timer provably runs after the sample queued at
+ * event time: the field's presence no longer depends on how many CDP
+ * round trips happened to sit between dispatch and read. The yield is
+ * CONDITIONAL because it rides the page's timer queue, which hidden tabs
+ * throttle to ~1s ticks (review round, M3): a read that finds no composed
+ * event, or a sample already settled, snaps synchronously and pays
+ * nothing; when it does yield, its timer sits in the same throttled queue
+ * as the sample's, so it resolves on the same tick the sample runs.
+ * Evaluated with `awaitPromise`; a document torn down mid-yield rejects
+ * the evaluate with a context-destroyed error, the same
+ * navigated-so-delivered path the sync read already took.
  */
 function readExpression(id: string): string {
   return `(function(id){
@@ -318,7 +342,7 @@ function readExpression(id: string): string {
     if (!reg) return null;
     var p = reg[id];
     if (!p) return null;
-    return new Promise(function(resolve){ setTimeout(resolve, 0); }).then(function(){
+    var finish = function(){
       var out = p.snap ? p.snap() : { n: 0 };
       try {
         var ua = navigator.userActivation;
@@ -327,7 +351,12 @@ function readExpression(id: string): string {
       try { p.off(); } catch (e) {}
       delete reg[id];
       return out;
-    });
+    };
+    var pre = p.snap ? p.snap() : { n: 0 };
+    var t = pre.types || {};
+    var composed = ((t.click || 0) + (t.contextmenu || 0) + (t.dblclick || 0)) > 0;
+    if (!composed || pre.prevented !== null) return finish();
+    return new Promise(function(resolve){ setTimeout(resolve, 0); }).then(finish);
   })(${JSON.stringify(id)})`
 }
 
@@ -391,9 +420,17 @@ type RawSnap = {
   target?: { tag?: unknown; href?: unknown } | null
 }
 
-/** Fold a raw snapshot's optional diagnosis fields into a reading. */
+/** Fold a raw snapshot's optional diagnosis fields into a reading. Every
+ * field is shape-checked: pushes arrive over an event channel, and this is
+ * the one hop between it and the payload the model reads (review, L5). */
 function enrich(reading: DeliveryReading, value: RawSnap): DeliveryReading {
-  if (value.types && typeof value.types === 'object') reading.events = value.types
+  if (
+    value.types &&
+    typeof value.types === 'object' &&
+    Object.values(value.types).every((v) => typeof v === 'number')
+  ) {
+    reading.events = value.types
+  }
   if (typeof value.prevented === 'boolean') reading.clickDefaultPrevented = value.prevented
   // Event-time activation outranks the read-time sample: it is the state
   // the input itself produced, and it is the one a navigating click keeps.
@@ -440,20 +477,31 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
   await installPushBinding(target)
 
   nextProbeId += 1
-  const id = `p${nextProbeId}`
+  const id = `p${WORKER_TAG}x${nextProbeId}`
+  const slot = slotKey(tabOf(target), id)
   sweepPushSlots(Date.now())
+  // The slot exists BEFORE the arm evaluate returns: the page-side
+  // listeners are live the moment the expression runs, so a trusted event
+  // in the ack window would otherwise push into a missing slot and be
+  // dropped (review round, L4).
+  pushSlots.set(slot, { at: Date.now(), snap: null })
   const arm = () => armExpression(types, id)
   let armed = await evaluateInWorld<boolean>(target, contextId, arm())
   if (!armed.ok && armed.contextGone) {
     // The cached world died with its document. Rebuild once and retry.
     clearWorld(target)
     contextId = await createWorld(target, DELIVERY_WORLD)
-    if (contextId === null) return UNARMED
+    if (contextId === null) {
+      pushSlots.delete(slot)
+      return UNARMED
+    }
     armed = await evaluateInWorld<boolean>(target, contextId, arm())
   }
-  if (!armed.ok || armed.value !== true) return UNARMED
+  if (!armed.ok || armed.value !== true) {
+    pushSlots.delete(slot)
+    return UNARMED
+  }
 
-  pushSlots.set(id, { at: Date.now(), snap: null })
   const world = contextId
   let spent = false
   let peeked: RawSnap | null = null
@@ -471,8 +519,8 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
       const result = await evaluateInWorld<RawSnap | null>(target, world, readExpression(id), {
         awaitPromise: true,
       })
-      const pushed = pushSlots.get(id)?.snap ?? null
-      pushSlots.delete(id)
+      const pushed = pushSlots.get(slot)?.snap ?? null
+      pushSlots.delete(slot)
       if (!result.ok) {
         // The context was destroyed between arming and reading, which means
         // the document went away: the action navigated it. A navigation is
@@ -487,6 +535,13 @@ export async function armDelivery(target: Cdp, types: readonly string[]): Promis
           if (peeked) reading = enrich(reading, peeked)
           if (pushed) reading = enrich(reading, pushed)
           return reading
+        }
+        // The read failed some other way (transport deadline, a detach),
+        // but a push counting a trusted event is the same proof a
+        // successful read would have carried: report the delivery instead
+        // of shrugging while holding the evidence (review round, M2).
+        if (pushed && pushed.n > 0) {
+          return enrich({ outcome: 'yes' }, pushed)
         }
         return { outcome: 'unknown', reason: 'the delivery probe could not be read back' }
       }

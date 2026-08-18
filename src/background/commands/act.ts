@@ -3637,6 +3637,20 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // be false. Marked only when the clamp plausibly changed the verdict.
   if (settleWindowMs < settleAskedMs && !settleResult.settled) {
     extra.budget_clamped = true
+    // A tally from a window the budget cut to ~nothing reads as "the page
+    // did nothing", which is the strong-signal lie: absent means unwatched.
+    delete settleResult.mutations
+  }
+  // The tally watches the ROOT document, and an act that resolved into a
+  // subframe mutates the frame's own document, which the observer can
+  // never see (review round, H1): a truthful-looking zero there is the
+  // phantom-success advice run backwards, so the tally is withheld rather
+  // than allowed to under-claim on the surface's flagship frame paths.
+  // Both attribution sources land in `extra` by this point: the
+  // target-backed bag (Object.assign above) and the ref-less keyboard
+  // path's confirmed-frame claim.
+  if (extra.resolved_frame !== undefined) {
+    delete settleResult.mutations
   }
   // A dialog can open DURING settle too (a deferred handler); the check must
   // come before `buildVerification`, whose probes are renderer-bound and

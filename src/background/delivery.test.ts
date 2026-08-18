@@ -65,8 +65,13 @@ function installCdpMock(
         // Real CDP resolves the value when `awaitPromise` is set; the read
         // expression yields a macrotask in the page (#180), so the mock
         // must await the same way or it would hand back a pending Promise.
-        const value = run(expression)
-        return { result: { value: params.awaitPromise ? await value : value } }
+        // And `returnByValue: true` SERIALIZES: returning page objects by
+        // reference let a stored peek alias the live counters and read
+        // fresher than it was, which silently defanged the merge tests
+        // (review round, M4). Clone the way the wire does.
+        const raw = params.awaitPromise ? await run(expression) : run(expression)
+        const value = raw && typeof raw === 'object' ? structuredClone(raw) : raw
+        return { result: { value } }
       }
       return {}
     },
@@ -331,6 +336,65 @@ describe('delivery probe', () => {
     expect(reading.events).toEqual({ mousedown: 2 })
   })
 
+  it("a push from another tab never lands in this probe's slot (#180 review, M1)", async () => {
+    // Slots are keyed by tab AND probe id: a binding call arriving on a
+    // different tab's session, even one naming a live probe id, must be
+    // dropped, or cross-tab contamination hands one act another's counts.
+    installCdpMock({ readThrows: 'Cannot find context with specified id' })
+    installPushChannel()
+    const route = (
+      chrome.debugger.onEvent.addListener as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.at(-1)?.[0] as (s: { tabId: number }, m: string, p: unknown) => void
+
+    const probe = await armDelivery(TAB, ['mousedown'])
+    const reg = (globalThis as Record<string, unknown>).__nymDelivery as Record<string, unknown>
+    const liveId = Object.keys(reg)[0]
+    route({ tabId: TAB + 1 }, 'Runtime.bindingCalled', {
+      name: '__nymDeliveryPush',
+      payload: JSON.stringify({ id: liveId, n: 5, types: { mousedown: 5 } }),
+    })
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toBeUndefined()
+  })
+
+  it('a held push rescues the verdict when the read fails without the context dying (#180)', async () => {
+    // A transport deadline or a DevTools steal fails the read for a
+    // NON-context reason, but a push counting a trusted event is the same
+    // proof a successful read would have carried: shrugging "unknown"
+    // while holding it would discard a free verdict (review round, M2).
+    installCdpMock({ readThrows: 'CDP call deadline exceeded' })
+    installPushChannel()
+
+    const probe = await armDelivery(TAB, ['mousedown'])
+    firePageEvent('mousedown')
+
+    const reading = await probe.read()
+    expect(reading.outcome).toBe('yes')
+    expect(reading.events).toEqual({ mousedown: 1 })
+  })
+
+  it('falls back to the read-time activation sample when the handler saw none (#180)', async () => {
+    // Event-time sampling wins when present; a page whose activation state
+    // only became readable later must still answer through the read-time
+    // sample rather than dropping the field.
+    installCdpMock()
+
+    const probe = await armDelivery(TAB, ['mousedown'])
+    firePageEvent('mousedown') // navigator.userActivation does not exist yet
+    Object.defineProperty(navigator, 'userActivation', {
+      value: { isActive: true, hasBeenActive: true },
+      configurable: true,
+    })
+    try {
+      const reading = await probe.read()
+      expect(reading.userActivation).toEqual({ active: true, hasBeenActive: true })
+    } finally {
+      delete (navigator as unknown as Record<string, unknown>).userActivation
+    }
+  })
+
   it('a malformed or misrouted push never becomes evidence (#180)', async () => {
     // The channel is world-scoped so page script cannot reach it, but the
     // parse still refuses garbage, and a payload naming a foreign probe id
@@ -496,10 +560,9 @@ describe('delivery probe', () => {
             thrown = true
             throw new Error('Cannot find context with specified id')
           }
+          const raw = await (new Function(`return (${expression})`) as () => unknown)()
           return {
-            result: {
-              value: await (new Function(`return (${expression})`) as () => unknown)(),
-            },
+            result: { value: raw && typeof raw === 'object' ? structuredClone(raw) : raw },
           }
         }
         return {}
