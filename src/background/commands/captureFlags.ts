@@ -44,8 +44,13 @@ export function sampleCaptureFlags(tabId: number): CaptureSample {
   const wasAttached = isAttached(tabId)
   const wasCapturedBefore = everAttached(tabId)
   const gapMs = captureGapMs(tabId)
+  // `capture_active` makes the third state EXPLICIT (#202): before it, "no
+  // started_now, no resumed" was the only way to read "capture was already
+  // live", an inference from absence in a payload whose rule is that
+  // absence means unknown. A positive fact costs one key and removes the
+  // ambiguity class the flags were built to remove.
   const flags = wasAttached
-    ? {}
+    ? { capture_active: true }
     : wasCapturedBefore
       ? { capture_resumed: true, ...(gapMs !== null ? { capture_gap_ms: gapMs } : {}) }
       : { capture_started_now: true }

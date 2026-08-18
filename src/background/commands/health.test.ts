@@ -10,6 +10,7 @@ import { installCdpConsoleCapture, resetForTests as resetConsole } from '../cons
 import { installCdpNetworkCapture, resetForTests as resetNetwork } from '../networkBuffer'
 import { resetDialogsForTests } from '../dialogs'
 import {
+  recordProvenDelivery,
   recordSwallowedInput,
   resetForTests as resetDelivery,
 } from '../delivery'
@@ -285,6 +286,48 @@ describe('execHealth', () => {
     const data = payload(await execHealth({ tab_id: TAB }))
 
     expect(data.last_driven).toBeUndefined()
+  })
+
+  it('reports positive delivery evidence with its document check (#202)', async () => {
+    recordProvenDelivery(TAB, 'click', TAB_URL)
+    await Promise.resolve()
+
+    const data = payload(await execHealth({ tab_id: TAB }))
+
+    const ok = data.input_ok as Record<string, unknown>
+    expect(ok.action).toBe('click')
+    expect(typeof ok.age_ms).toBe('number')
+    expect(ok.url).toBe(TAB_URL)
+    expect(ok.on_current_url).toBe(true)
+  })
+
+  it('a stamp from an EARLIER document says so instead of masquerading (#202)', async () => {
+    // The stale-claim guard: proof about a previous document must not read
+    // as evidence about the one the tab now shows.
+    recordProvenDelivery(TAB, 'fill', 'https://example.com/checkout/step-1')
+    await Promise.resolve()
+
+    const data = payload(await execHealth({ tab_id: TAB }))
+
+    expect((data.input_ok as Record<string, unknown>).on_current_url).toBe(false)
+  })
+
+  it('positive evidence survives a worker recycle via its storage mirror (#202)', async () => {
+    await chrome.storage.session.set({
+      [`nymInputOk:${TAB}`]: { at: Date.now() - 5_000, action: 'click', url: TAB_URL },
+    })
+
+    const data = payload(await execHealth({ tab_id: TAB }))
+
+    expect((data.input_ok as Record<string, unknown>).action).toBe('click')
+  })
+
+  it('ignores a malformed positive stamp instead of reporting garbage (#202)', async () => {
+    await chrome.storage.session.set({ [`nymInputOk:${TAB}`]: { at: true, action: 3, url: 9 } })
+
+    const data = payload(await execHealth({ tab_id: TAB }))
+
+    expect(data.input_ok).toBeUndefined()
   })
 
   it('reports swallowed-input evidence, including across a worker recycle', async () => {

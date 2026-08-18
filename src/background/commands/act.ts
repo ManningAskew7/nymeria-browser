@@ -18,6 +18,7 @@ import {
   absenceIsConclusive,
   armDelivery,
   clearSwallowedInput,
+  recordProvenDelivery,
   recordSwallowedInput,
   type DeliveryOutcome,
 } from '../delivery'
@@ -415,6 +416,15 @@ const TELEMETRY_TYPES = new Set(['Ping', 'Beacon', 'Image', 'Media', 'Font', 'Pr
  * pathological page cannot make every act result O(all failures ever).
  */
 const FAILURE_RANK_POOL = 50
+
+/**
+ * Mint-time AX roles that name a DOCUMENT, not a control (#202): a ref to
+ * one is legitimate (reads mint the page container for focus and scroll
+ * targeting) but a click on it can never mean anything specific, and the
+ * no-layout-box synthetic degrade is where that shape lands. Refs only:
+ * selector targets carry no mint role and keep the generic reason.
+ */
+const DOC_LEVEL_ROLES = new Set(['RootWebArea', 'WebArea', 'document'])
 
 function sameOriginAs(url: string, pageUrl: string | null): boolean | undefined {
   if (!pageUrl) return undefined
@@ -2476,6 +2486,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   let elementFrameTargetId: string | undefined
   /** For the same-process dispatch-point read; refs only. */
   let elementBackendNodeId: number | undefined
+  /** Mint-time AX role, refs only: read by the no-layout-box degrade so a
+   *  DOCUMENT-LEVEL target names its real story (#202) instead of the
+   *  generic hidden-or-zero-size text. */
+  let elementMintRole: string | undefined
   /** The widened pre-dispatch probe's answer for the main target, ref or
    *  selector (null when it could not be asked). Read by the refusals below,
    *  by the `target_invisible` annotation, by the selector honesty fields,
@@ -2596,6 +2610,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       elementSession = resolution.session
       elementFrameTargetId = resolution.frameTargetId
       elementBackendNodeId = resolution.backendNodeId
+      elementMintRole = resolution.mintRole
     }
 
     // Checked HERE rather than inside the click case, so it covers every verb
@@ -2921,9 +2936,16 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           } else {
             // No layout box (hidden, zero-size). Synthetic dispatch is the only
             // way in, and the result says so rather than implying a real click.
+            // A DOCUMENT-LEVEL ref (RootWebArea: the whole-page container a
+            // read legitimately mints for focus/scroll targeting) is the
+            // no-box shape most likely to fool an agent into believing it
+            // clicked a control, so it names its real story (#202; the
+            // operator graded refusal worse than the disclosed degrade).
             await callOn(elementSession, objectId, 'function(){ this.click(); }')
             inputMode = 'synthetic'
-            extra.synthetic_reason = 'element has no layout box (hidden or zero-size)'
+            extra.synthetic_reason = DOC_LEVEL_ROLES.has(elementMintRole ?? '')
+              ? 'target is a document-level container, not an interactive control; nothing specific was clicked'
+              : 'element has no layout box (hidden or zero-size)'
           }
         } else if (explicitPoint) {
           await trustedClick(tabId, explicitPoint, {
@@ -2954,6 +2976,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               'function(){ this.dispatchEvent(new MouseEvent("mouseover", {bubbles:true})); this.dispatchEvent(new MouseEvent("mouseenter", {bubbles:true})); }',
             )
             inputMode = 'synthetic'
+            // Every synthetic elsewhere says why; this one predated the rule
+            // (#202 survey catch). Two causes reach here and they are
+            // different stories, so they get different strings (the click
+            // family's convention).
+            extra.synthetic_reason = geo
+              ? 'the dispatch point could not be resolved for a trusted hover; synthetic hover events were dispatched'
+              : 'element has no layout box (hidden or zero-size); synthetic hover events were dispatched'
           }
         } else if (explicitPoint) {
           await trustedHover(tabId, explicitPoint, modifiers)
@@ -3521,6 +3550,13 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       } else if (delivered === 'yes') {
         // Proven delivered: whatever was swallowing input has stopped.
         clearSwallowedInput(tabId)
+        // The POSITIVE stamp holds a higher bar than the clear (#202): a
+        // bare context-gone "yes" is an inference (good enough to spend
+        // negative evidence, not to mint positive), so only a reading whose
+        // verdict rests on a nonzero in-page COUNT stamps (delivery.ts sets
+        // `counted` at the two read sites). `urlBefore` is the document the
+        // count was proven on; health compares it to the tab's current URL.
+        if (reading.counted === true) recordProvenDelivery(tabId, a.action, urlBefore)
       }
       extra.input_delivered = delivered
       if (delivered === 'unknown' && unknownReason) {

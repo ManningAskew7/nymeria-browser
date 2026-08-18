@@ -4,7 +4,7 @@ import { HttpError, ping, whoami } from './api'
 import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs, forgetTab as forgetDebuggerTab } from './debuggerSession'
-import { clearSwallowedInput } from './delivery'
+import { clearProvenDelivery, clearSwallowedInput } from './delivery'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { dropDriveStamp } from './driveStamp'
 import { clearTabWorlds } from './worlds'
@@ -96,6 +96,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   // that closed.
   dropDriveStamp(tabId)
   clearSwallowedInput(tabId)
+  clearProvenDelivery(tabId)
 })
 
 // Per-frame world teardown (Target.detachedFromTarget); the module

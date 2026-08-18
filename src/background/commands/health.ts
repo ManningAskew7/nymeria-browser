@@ -40,7 +40,7 @@
 
 import type { CommandResult } from '../../shared/types'
 import { count as consoleCount } from '../consoleBuffer'
-import { suppressionEvidence } from '../delivery'
+import { provenDelivery, suppressionEvidence } from '../delivery'
 import { everAttached, isAttached } from '../debuggerSession'
 import {
   describeResolution,
@@ -88,6 +88,7 @@ export async function execHealth(args: unknown): Promise<CommandResult> {
   const gapMs = captureGapMs(tabId)
   const driven = await readDriveStamp(tabId)
   const swallowed = await suppressionEvidence(tabId)
+  const inputOk = await provenDelivery(tabId)
 
   return {
     ok: true,
@@ -140,6 +141,25 @@ export async function execHealth(args: unknown): Promise<CommandResult> {
           }
         : {}),
       ...(swallowed ? { input_swallowed: { action: swallowed.action, age_ms: age(now, swallowed.at) } } : {}),
+      // The positive twin (#202): the last act whose probe COUNTED trusted
+      // events arriving. Cross-cleared with the store above, so NORMALLY at
+      // most one renders (two sequential storage reads mean a verdict
+      // landing between them can briefly show both; the smaller age_ms is
+      // the newer verdict). `on_current_url` compares the TAB URL the count
+      // was proven under against the tab's URL now, exact: false is common
+      // and often good news (a navigating click is proven on the page it
+      // was sent from). Absent url on the stamp says nothing either way.
+      ...(inputOk
+        ? {
+            input_ok: {
+              action: inputOk.action,
+              age_ms: age(now, inputOk.at),
+              ...(inputOk.url !== null
+                ? { url: inputOk.url, on_current_url: inputOk.url === (tab.url ?? null) }
+                : {}),
+            },
+          }
+        : {}),
     },
   }
 }

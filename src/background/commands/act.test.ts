@@ -3,7 +3,7 @@ import { execAct, __test } from './act'
 import { CdpCallTimeout, resetForTests as resetDebugger } from '../debuggerSession'
 import { push as pushConsole, resetForTests as resetConsole } from '../consoleBuffer'
 import { push as pushNetwork, resetForTests as resetNetwork } from '../networkBuffer'
-import { resetForTests as resetDelivery, suppressionEvidence } from '../delivery'
+import { provenDelivery, resetForTests as resetDelivery, suppressionEvidence } from '../delivery'
 import {
   chooserInterceptedSince,
   raceStandingDialog,
@@ -497,6 +497,36 @@ describe('trusted input', () => {
     expect(data.input).toBe('synthetic')
     expect(data.synthetic_reason).toMatch(/no layout box/)
     expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('a document-level ref degrades synthetic with its own reason, not the hidden-element one (#202)', async () => {
+    // A RootWebArea ref is legitimate (reads mint the page container for
+    // focus and scroll targeting), but a click on it can never mean
+    // anything specific, and the generic hidden-or-zero-size text read as
+    // "the control was there, just hidden": the exact shape that fools an
+    // agent into believing it clicked a link.
+    setRefs(TAB, new Map([['e1', fpRef(100, { role: 'RootWebArea', name: 'Page' })]]), TAB_URL)
+    const cdp = installCdpMock({ geometry: null, axRole: 'RootWebArea', axName: 'Page' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { input: string; synthetic_reason?: string }
+    expect(data.input).toBe('synthetic')
+    expect(data.synthetic_reason).toMatch(/document-level container/)
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('a synthetic hover says why, like every other synthetic (#202)', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ geometry: null })
+
+    const result = await execAct({ tab_id: TAB, action: 'hover', ref: '@e1' })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { input: string; synthetic_reason?: string }
+    expect(data.input).toBe('synthetic')
+    expect(data.synthetic_reason).toMatch(/synthetic hover/)
   })
 
   it('refuses the click when another element covers the point, and names it', async () => {
@@ -2141,6 +2171,60 @@ describe('input delivery', () => {
     expect(await suppressionEvidence(TAB)).toBeNull()
   })
 
+  it('stamps positive delivery evidence on a COUNTED yes, with its document (#202)', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ deliveryCount: 1 })
+
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const ok = await provenDelivery(TAB)
+    expect(ok?.action).toBe('click')
+    expect(typeof ok?.at).toBe('number')
+    expect(ok?.url).toBe(TAB_URL)
+  })
+
+  it('a context-gone "yes" clears negative evidence but never mints positive (#202)', async () => {
+    // The navigated inference is proof enough to SPEND a swallow stamp, not
+    // to CLAIM delivery: a positive built on it is the stale-claim trap the
+    // filing names.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ deliveryReadThrows: 'Cannot find context with specified id' })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    expect(await provenDelivery(TAB)).toBeNull()
+  })
+
+  it('a zero-count peek on the navigated path never mints positive evidence (#202)', async () => {
+    // The peek proves counts only when it COUNTED: n === 0 restores nothing,
+    // and the navigated "yes" stays an inference (review round: this guard
+    // was the one unpinned line).
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      deliveryReadThrows: 'Cannot find context with specified id',
+      deliveryPeek: { n: 0, types: {} },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect((result.data as { input_delivered?: string }).input_delivered).toBe('yes')
+    expect(await provenDelivery(TAB)).toBeNull()
+  })
+
+  it('a proven swallow spends the positive stamp: the stores tell ONE story (#202)', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ deliveryCount: 1 })
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+    expect(await provenDelivery(TAB)).not.toBeNull()
+
+    installCdpMock({ deliveryCount: 0 })
+    await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(await provenDelivery(TAB)).toBeNull()
+    expect((await suppressionEvidence(TAB))?.action).toBe('click')
+  })
+
   it('stamps no evidence on an INCONCLUSIVE zero count either', async () => {
     // The other route to not-knowing: the probe counted nothing but a nested
     // frame below the target could have received it, so the verdict is
@@ -2300,6 +2384,9 @@ describe('input delivery', () => {
     expect(data.input_delivered).toBe('yes')
     expect(data.input_events).toEqual({ mousedown: 1, mouseup: 1, click: 1 })
     expect(data.click_target).toEqual({ tag: 'a', href: 'https://dest.example/x' })
+    // A peeked NONZERO count is a real count, so the navigated path still
+    // mints positive evidence (#202): only the bare inference never does.
+    expect((await provenDelivery(TAB))?.action).toBe('click')
   })
 
   it('verifies fill delivery through its trusted input event (#176 rider)', async () => {

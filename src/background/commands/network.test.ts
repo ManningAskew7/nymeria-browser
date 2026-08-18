@@ -73,6 +73,7 @@ function payload(result: { data?: unknown }) {
     matched_total?: number
     capture_started_now?: boolean
     capture_resumed?: boolean
+    capture_active?: boolean
     capture_gap_ms?: number
   }
 }
@@ -152,6 +153,8 @@ describe('execNetwork', () => {
     const warm = payload(await execNetwork({ tab_id: TAB }))
     expect(warm.capture_started_now).toBeUndefined()
     expect(warm.capture_gap_ms).toBeUndefined()
+    // The warm read is the one that positively claims live capture (#202).
+    expect(warm.capture_active).toBe(true)
   })
 
   it('says nothing of the kind on a warm read, which reports real history', async () => {

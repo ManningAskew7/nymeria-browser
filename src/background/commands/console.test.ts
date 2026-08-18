@@ -77,6 +77,7 @@ describe('execConsole capture honesty (#183 rider)', () => {
       count: number
       capture_started_now?: boolean
       capture_resumed?: boolean
+      capture_active?: boolean
       capture_gap_ms?: number
     }
   }
@@ -98,6 +99,7 @@ describe('execConsole capture honesty (#183 rider)', () => {
 
     expect(data.capture_started_now).toBe(true)
     expect(data.capture_resumed).toBeUndefined()
+    expect(data.capture_active, 'a cold start is not already-live capture').toBeUndefined()
   })
 
   it('says capture lapsed, and for how long, after a detach', async () => {
@@ -111,16 +113,21 @@ describe('execConsole capture honesty (#183 rider)', () => {
     expect(data.count).toBe(1)
     expect(data.capture_resumed).toBe(true)
     expect(data.capture_started_now).toBeUndefined()
+    expect(data.capture_active, 'a resumed capture was NOT active when asked').toBeUndefined()
     expect(typeof data.capture_gap_ms).toBe('number')
   })
 
-  it('hedges nothing on a warm read', async () => {
+  it('a warm read claims capture_active positively, and hedges nothing else (#202)', async () => {
+    // Before the positive flag, "no started_now, no resumed" was the only
+    // way to read "capture was already live": an inference from absence in
+    // a payload whose rule is that absence means unknown.
     const emit = wireCapture()
     await sendCommand(TAB, 'Runtime.evaluate', { expression: '1' })
     consoleEvent(emit, 'warm')
 
     const data = flags(await execConsole({ tab_id: TAB, only_errors: false }))
 
+    expect(data.capture_active).toBe(true)
     expect(data.capture_started_now).toBeUndefined()
     expect(data.capture_resumed).toBeUndefined()
     expect(data.capture_gap_ms).toBeUndefined()
