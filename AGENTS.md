@@ -286,7 +286,29 @@ POSTs results. Consequences:
   refuse fresh refs as `navigated`). Same pass: cross-origin
   `canceled`/`ERR_BLOCKED_BY_CLIENT` failures with status < 400 tag
   `likely_benign` and rank LAST (a tag can never evict an untagged
-  entry); same-origin/unparseable/error-status never tag.
+  entry); same-origin/unparseable/error-status never tag. Since #203
+  (v0.15.x) resolved_frame is THREE-state: absent=root, null=frame
+  located with an empty URL, string=live URL; both emission sites
+  (target-backed + confirmed keyboard) guard `!== undefined`, never
+  truthiness.
+- Scroll (v0.15.0-0.15.2, #203): scroll is in OPTIONAL_TARGET; a ref
+  wheels AT the element's VISIBLE-region centre on its own session
+  (off-viewport refuses: wheel input is positional; deliberately NO
+  scrollIntoView, it would move the offsets being measured).
+  `scroll_moved` reads the SAME registered scroller elements twice
+  (`__nymScroll` probe-world slots; a re-walk can subtract two different
+  containers): container delta when it moved, else document (a bottomed
+  pane CHAINS), measured {0,0} vs absent; a targetless wheel point over
+  an embedded frame WITHHOLDS zeros (QA-measured false zero). All
+  document.* reads in the scroll probes ride the prototype-CHAIN getter
+  (happy-dom lacks the getters on Document.prototype; instance own-props
+  and the named getter are the forgery surfaces). Test traps: baseline
+  and after-read are DISTINCT mock fixtures on distinct markers
+  (`__nymScroll` + `scrollingElement` = baseline, `__nymScroll` alone =
+  after); the `__nymScroll` evaluate route must precede
+  `elementFromPoint`'s. Measured: root-session wheels DO reach OOPIFs by
+  position, unlike clicks. Known defect filed backend-side (#207):
+  per-tab scroll verification death after repeated over-frame wheels.
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
@@ -467,7 +489,7 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 14-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `efb655eb` / extension `7b23dfc` (v0.14.2,
+live code at backend commit `c9be2f7d` / extension `20d8b78` (v0.15.2,
 2026-08-18).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):

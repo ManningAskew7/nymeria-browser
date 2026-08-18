@@ -527,15 +527,35 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     value: the text for fill/type, the option label or value for select, the
         key name for key (e.g. "Enter", "Tab", "Escape").
     coordinate: [x, y] viewport pixels, as an alternative target for click,
-        hover and drag when there is no usable ref (canvas, custom widgets).
+        hover, drag and scroll when there is no usable ref (canvas, custom
+        widgets).
         Viewport CSS pixels, which are NOT the pixels of a screenshot on a
         HiDPI display or a zoomed page: convert with the image and viewport
         sizes chrome_screenshot reports before aiming at something you saw
         in a picture.
     modifiers: any of ["Ctrl", "Shift", "Alt", "Meta"].
     direction / amount_px: for scroll (default down, 500px). action="scroll"
-        wheels the PAGE and ignores ref; to bring a specific element into
-        view, use action="scroll_to" with its ref.
+        with a ref wheels AT that element (at its visible point), which
+        scrolls the scrollable pane UNDER it: inner panes, chat lists,
+        dropdown menus. A ref that is entirely off-screen refuses (wheel
+        input is positional): scroll_to it first, or wheel by
+        coordinate. An unknown or stale ref refuses rather than wheeling
+        the page blind. With coordinate it wheels at that point; with
+        neither it wheels the viewport centre, scrolling the page. The
+        payload answers with "scroll_moved" {dx, dy, scroller}: for a
+        ref scroll the target's own container and the document are both
+        watched and the one that moved is reported (a wheel at the end
+        of a pane CHAINS to the page, and that is named "document"); a
+        coordinate or bare scroll watches the document only, and when
+        the wheel point sits over an embedded frame the zero is
+        withheld (the frame's own scrolling is not measured; a page
+        that really moved still reports). {0,0} is a
+        MEASURED nothing-moved (end of scroll, a pane that ignored the
+        wheel, or rarely a smooth animation still in flight at the
+        read); the key ABSENT means it could not be measured. A wheel
+        that moved some OTHER pane than the two watched reads {0,0}. To
+        bring a specific element into view, action="scroll_to" with its
+        ref is still the direct verb.
     to_ref: drag destination.
     wait_for_text / wait_for_url / wait_for_ref / timeout_ms: a wait
         condition, honoured on EVERY action, not just action="wait". The
@@ -631,10 +651,10 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     not "focused", which reports where the caret sits and does not move on
     hover or scroll_to (there focused can name the PREVIOUS act's frame;
     resolved_frame is the field to believe). Absent on a ref/selector act
-    it means the root document (rarely: the frame's URL could not be
-    read); on a coordinate act the frame is unknown. Ref-less type/key
-    claim the frame the keystrokes entered the same way, only when it was
-    confirmed.
+    it means the root document; null means a frame WAS located but its
+    URL could not be read; on a coordinate act the frame is unknown.
+    Ref-less type/key claim the frame the keystrokes entered the same
+    way, only when it was confirmed.
 
     Page dialogs your own action raises are OWNED while you drive
     (alert/confirm/prompt/"Leave site?"). An alert is acknowledged
