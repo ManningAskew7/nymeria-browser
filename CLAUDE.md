@@ -578,8 +578,8 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 14-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `e7b27636` / extension `ea972d4` (v0.15.5,
-2026-08-18).
+live code at backend commit `b86e93f7` / extension `b071938` (v0.16.1,
+2026-08-19).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):
 
