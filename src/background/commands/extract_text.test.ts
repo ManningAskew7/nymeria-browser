@@ -363,6 +363,26 @@ describe('the text-loss scan (executed in-page)', () => {
     return document.querySelector('#root') as Element
   }
 
+  it('counts only what is INSIDE the read root, so a scope localises the loss', () => {
+    // The tools promise this: the count describes THIS read, so re-reading one
+    // region tells you whether the loss was in the part you care about. It is
+    // the route that replaced #215's nearest-id'd-ancestor idea, which
+    // measured useless on app-shaped pages, so the promise needs a test.
+    document.body.innerHTML =
+      '<div id="wanted"><span data-before=\'"\u2658"\'>f6</span></div>' +
+      '<div id="furniture">' +
+      '<span data-before=\'"\u2659"\'>a</span><span data-before=\'"\u2659"\'>b</span>' +
+      '</div>'
+
+    const wanted = scan(document.querySelector('#wanted') as Element)
+    const furniture = scan(document.querySelector('#furniture') as Element)
+    const whole = scan(document.body)
+
+    expect(wanted.generated).toBe(1)
+    expect(furniture.generated).toBe(2)
+    expect(whole.generated, 'and the parts compose into the page total').toBe(3)
+  })
+
   it('counts a glyph the text read cannot see', () => {
     // The measured case: chess.com draws the piece letter as generated
     // content, so `innerText` keeps "f6" and loses the knight entirely.
