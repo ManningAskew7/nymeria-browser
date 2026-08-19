@@ -164,6 +164,18 @@ Args schema:
     "default": null,
     "title": "Ref"
   },
+  "selector": {
+    "anyOf": [
+      {
+        "type": "string"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Selector"
+  },
   "max_chars": {
     "default": 20000,
     "title": "Max Chars",
@@ -194,7 +206,8 @@ Read a Chrome tab's accessibility tree: the map you act on.
     detail level, so a page of pure prose renders every row and no refs,
     which is the read working, not failing (a note says so when it happens).
     "full" widens what is SHOWN, never what mints. To act where there is no
-    ref, target by css= selector or coordinate. Each document root carries a
+    ref, target by css= selector or coordinate (and to READ where there is no
+    ref, scope by selector=). Each document root carries a
     ref too (its "RootWebArea" line, one per frame): those SCROLL rather than
     click, and the header's count deliberately leaves them out, so a tree can
     hold more ref tags than the count names.
@@ -202,6 +215,18 @@ Read a Chrome tab's accessibility tree: the map you act on.
     detail: "interactive" (default: controls plus enough structure to place
         them), "full" (everything, large), or "minimal" (controls and headings).
     ref: re-root the read at one element, e.g. "@e12" to read just one form.
+    selector: re-root the read at a CSS selector instead, for the regions that
+        never carry a ref (a list, a table, an article body). Reading one list
+        this way instead of the whole page at detail="full" is the difference
+        between a few hundred characters and tens of thousands. ref="css=..."
+        means the same thing and works too; pass one or the other, not both.
+        A selector is a RULE, not an element: when it matches several, the read
+        is rooted at the FIRST and a note says how many matched, so a sparse
+        answer is a narrowing problem rather than an empty page. The scope
+        resolves in the TOP document and does not walk shadow roots, so an
+        element inside an iframe or a web component is not reachable this way
+        (scope to the frame with its "@e" ref, or read unscoped: the full tree
+        renders both).
     max_chars: model-facing cap. Oversized trees are truncated with a pointer
         to the full copy on disk.
 
@@ -313,7 +338,9 @@ Read the visible text of a Chrome tab. Cheaper than a screenshot for prose.
     error page cannot arrive as ordinary content. The status is the document's
     own, so it needs no extra permission and survives however long ago the page
     loaded; ABSENT means unknown (a page with no navigation entry, an older
-    extension), never that the load was fine.
+    extension), never that the load was fine. A read that finds NO text still
+    carries its notes, so a bare "no visible text" is real evidence the empty
+    page loaded cleanly rather than a silence hiding a 401.
 ````
 
 ---

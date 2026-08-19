@@ -228,6 +228,105 @@ describe('monotonic minting at the exec level (#160)', () => {
     expect((result.data as { tree: string }).tree).toMatch(/\[ref=@e3\]/)
   })
 
+  /**
+   * Stage a selector scope end to end: the COUNT evaluate, then the node
+   * evaluate, then describeNode, then the tree. `count` is what
+   * `querySelectorAll(...).length` answers; `resolves` is whether the
+   * follow-up `querySelector` still finds it.
+   */
+  function installScopeMock(count: number, opts: { resolves?: boolean } = {}): string[] {
+    const seen: string[] = []
+    chrome.debugger.sendCommand = (async (_t: unknown, method: string, params?: unknown) => {
+      if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-root' } } }
+      if (method === 'Page.createIsolatedWorld') return { executionContextId: 5 }
+      if (method === 'Runtime.evaluate') {
+        const expression = (params as { expression: string }).expression
+        seen.push(expression)
+        if (expression.includes('querySelectorAll')) return { result: { value: count } }
+        return opts.resolves === false
+          ? { result: { subtype: 'null' } }
+          : { result: { objectId: 'node-obj' } }
+      }
+      if (method === 'DOM.describeNode') return { node: { backendNodeId: 42 } }
+      return { nodes: interactiveNodes }
+    }) as unknown as typeof chrome.debugger.sendCommand
+    return seen
+  }
+
+  it('a scope selector reports how many elements it matched', async () => {
+    // A selector names a RULE, not an element. `.comment` on a 40-comment
+    // thread resolves to ONE comment, and a read's answer looks like the
+    // whole of what was asked for, so the model reasons over that subtree AS
+    // the region. The act path already reports its match count for this
+    // reason (review round).
+    installScopeMock(40)
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: '.comment' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { scope_match_count?: number }).scope_match_count).toBe(40)
+  })
+
+  it('a ref scope reports no match count, because it names one element', async () => {
+    installTreeMock()
+    await execSnapshot({ tab_id: 1, detail: 'interactive' })
+
+    const scoped = await execSnapshot({ tab_id: 1, scope_ref: '@e1' })
+
+    expect((scoped.data as { scope_match_count?: number }).scope_match_count).toBeUndefined()
+  })
+
+  it('a scoped read counts the CONTROLS in its own subtree', async () => {
+    // Withheld before: the backend's only copy made a page-level claim a
+    // subtree cannot support. But scoping to a static region is the flagship
+    // reason to scope, and withholding it there left that read answering
+    // "0 actionable elements" with no explanation, which is the #205 loop the
+    // count exists to close (review round).
+    installScopeMock(1)
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: '#region' })
+
+    expect((result.data as { control_ref_count?: number }).control_ref_count).toBeDefined()
+  })
+
+  it('a scoped read still withholds the page frame inventory', async () => {
+    // Unchanged by the control-count decision: frame counts describe sections
+    // this tree deliberately does not render.
+    installScopeMock(1)
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: '#region' })
+
+    expect((result.data as { frames_oopif?: number }).frames_oopif).toBeUndefined()
+  })
+
+  it('a scope that matches nothing names both limits of a scope, and stops early', async () => {
+    // The backend used to append this, keyed only on "we sent a selector", so
+    // it lectured about shadow roots at a typo and at a mid-navigation miss
+    // too. It belongs at the one error it explains, the way extract_text's
+    // own selector miss already carries its asymmetry (review round).
+    const seen = installScopeMock(0)
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: '#summary' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('matched no element: #summary')
+    expect(result.error).toContain('TOP document')
+    expect(result.error).toContain('shadow roots')
+    expect(result.error).toContain('unscoped')
+    expect(seen.some((e) => e.includes('querySelectorAll'))).toBe(true)
+    expect(seen.some((e) => !e.includes('querySelectorAll'))).toBe(false)
+  })
+
+  it('an element that vanishes between the count and the resolve says so', async () => {
+    installScopeMock(1, { resolves: false })
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: '#gone' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('went away mid-read')
+    expect(result.error, 'not the no-match copy: it DID match').not.toContain('matched no element')
+  })
+
   it('names a malformed scope selector instead of resolving the Error it threw', async () => {
     // A thrown expression still returns a `result`: the Error OBJECT, with a
     // perfectly usable objectId. It reached `DOM.describeNode`, produced no
@@ -269,20 +368,25 @@ describe('monotonic minting at the exec level (#160)', () => {
     expect(snapshotRefs.resolve(1, '@e3', 'https://example.com')).toMatchObject({ ok: true })
   })
 
-  it('a scoped read withholds the control count, which is a claim about the PAGE', async () => {
-    // #208 review round. The backend turns a zero control count into "this
-    // page has no controls", rendered outside the untrusted fence. A scoped
-    // read renders one subtree and cannot support that claim, so the count
-    // is withheld exactly as the frame counts already are, and the backend
-    // degrades to its pre-#208 wording rather than asserting a subtree fact
-    // about the whole page.
+  it('a scoped read counts the controls in its OWN subtree, not the page\'s', async () => {
+    // #208 withheld this on a scoped read, because the backend's only copy
+    // ("this page has no controls") is a page claim a subtree cannot support.
+    // #212 made scoping to a STATIC region the flagship route, where the
+    // count is always zero and its absence left the read saying "0 actionable
+    // elements" with nothing to explain it: the #205 loop, reachable again
+    // through the newly recommended parameter. So the count ships and the
+    // backend picks region-shaped copy when it was the one that scoped.
     installTreeMock()
 
     const full = await execSnapshot({ tab_id: 1, detail: 'interactive' })
     const scoped = await execSnapshot({ tab_id: 1, detail: 'interactive', scope_ref: '@e1' })
 
     expect((full.data as Record<string, unknown>).control_ref_count).toBe(2)
-    expect('control_ref_count' in (scoped.data as Record<string, unknown>)).toBe(false)
+    // Its own subtree's answer, which here is the one control it was rooted at.
+    expect((scoped.data as Record<string, unknown>).control_ref_count).toBe(1)
+    // The FRAME counts stay withheld: those describe sections a scoped tree
+    // deliberately does not render, so a subtree really cannot speak for them.
+    expect('frames_oopif' in (scoped.data as Record<string, unknown>)).toBe(false)
   })
 })
 
@@ -565,11 +669,11 @@ describe('same-process frame reads (reads-honesty pass)', () => {
     ).not.toContain('http_status')
   })
 
-  it('keeps the status on a SCOPED read, unlike the counts a subtree cannot support', async () => {
-    // The frame and control counts are withheld when scoped because a subtree
-    // cannot speak for the page. This claim is about the tab's MAIN DOCUMENT,
-    // and no scope can falsify it, so withholding it would lose a fact the
-    // read genuinely knows.
+  it('keeps the status on a SCOPED read, unlike the frame counts a subtree cannot support', async () => {
+    // The FRAME counts are withheld when scoped because a subtree cannot
+    // speak for sections it does not render. This claim is about the tab's
+    // MAIN DOCUMENT, and no scope can falsify it, so withholding it would
+    // lose a fact the read genuinely knows.
     installLocalFramesMock({ rootNodes, httpStatus: 404 })
     snapshotRefs.set(
       1,
@@ -581,7 +685,7 @@ describe('same-process frame reads (reads-honesty pass)', () => {
     const scoped = await execSnapshot({ tab_id: 1, detail: 'interactive', scope_ref: '@e1' })
 
     expect((scoped.data as { http_status?: number }).http_status).toBe(404)
-    expect((scoped.data as { control_ref_count?: number }).control_ref_count).toBeUndefined()
+    expect((scoped.data as { frames_oopif?: number }).frames_oopif).toBeUndefined()
   })
 
   it('surfaces hidden-dropped counts in the payload', async () => {

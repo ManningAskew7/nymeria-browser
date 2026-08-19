@@ -416,6 +416,7 @@ async function resolveScopeNode(
   backendNodeId: number | null
   frameTargetId?: string
   frameUrl?: string
+  matchCount?: number
   error?: string
 }> {
   if (scopeRef) {
@@ -436,6 +437,58 @@ async function resolveScopeNode(
   // Probe world (#160): the selector picks the read ROOT, so a main-world
   // `querySelector` override could steer what the model believes the page
   // says. Fail-closed: no world, no main-world fallback.
+  //
+  // COUNTED first, and by value. A selector names a RULE, not an element, so
+  // `.comment` on a 40-comment thread resolves to one comment that the model
+  // then reasons over AS the region: the act path already reports its match
+  // count for exactly this reason, and a read is worse, because its answer
+  // looks like the whole of what was asked for. The count also validates the
+  // selector, so a miss costs one round trip instead of two (review round).
+  const counted = await withProbeWorld(tabId, (contextId) =>
+    sendCommand<{ result?: { value?: unknown }; exceptionDetails?: unknown }>(
+      tabId,
+      'Runtime.evaluate',
+      {
+        expression: `document.querySelectorAll(${JSON.stringify(scopeSelector)}).length`,
+        returnByValue: true,
+        contextId,
+      },
+    ),
+  )
+  if (counted === null) {
+    return {
+      backendNodeId: null,
+      error:
+        'the scope selector could not run in this tab\'s isolated inspection context ' +
+        '(the tab is likely mid-navigation); retry, or read without a scope',
+    }
+  }
+  // A malformed selector THROWS, and a thrown expression still returns a
+  // `result`: the Error object, whose objectId passed every check the old
+  // node-first version made. Named as the syntax error it is rather than
+  // reported three lines later as "could not resolve the scope element".
+  if (counted.exceptionDetails) {
+    return { backendNodeId: null, error: `not a valid CSS selector: ${scopeSelector}` }
+  }
+  const matchCount = typeof counted.result?.value === 'number' ? counted.result.value : 0
+  if (matchCount < 1) {
+    // The two limits of a SCOPE ride the miss, the way extract_text's own
+    // selector miss carries its asymmetry: this resolves in the top
+    // document's world and does not walk shadow roots, while the unscoped
+    // tree includes both frames and shadow content. Told here rather than
+    // appended by the backend, which cannot tell this miss from a typo or a
+    // mid-navigation failure and so lectured about shadow roots on all three
+    // (review round).
+    return {
+      backendNodeId: null,
+      matchCount: 0,
+      error:
+        `scope selector matched no element: ${scopeSelector} (a scope resolves in ` +
+        'the TOP document and does not walk shadow roots, so an element inside an ' +
+        'iframe or a web component is not reachable here, though the unscoped tree ' +
+        'renders both; scope to the frame with its @e ref, or read unscoped)',
+    }
+  }
   const evald = await withProbeWorld(tabId, (contextId) =>
     sendCommand<{ result?: { objectId?: string; subtype?: string }; exceptionDetails?: unknown }>(
       tabId,
@@ -447,7 +500,7 @@ async function resolveScopeNode(
       },
     ),
   )
-  if (evald === null) {
+  if (evald === null || evald.exceptionDetails) {
     return {
       backendNodeId: null,
       error:
@@ -455,15 +508,13 @@ async function resolveScopeNode(
         '(the tab is likely mid-navigation); retry, or read without a scope',
     }
   }
-  // A malformed selector THROWS, and a thrown expression still returns a
-  // `result`: the Error object, with an objectId that passes every check
-  // below. Named as the syntax error it is rather than reported three lines
-  // later as "could not resolve the scope element" (review round).
-  if (evald.exceptionDetails) {
-    return { backendNodeId: null, error: `not a valid CSS selector: ${scopeSelector}` }
-  }
   if (!evald.result?.objectId || evald.result.subtype === 'null') {
-    return { backendNodeId: null, error: `scope selector matched no element: ${scopeSelector}` }
+    // Counted at least one and then resolved none: the page changed under the
+    // read. Says that rather than repeating the no-match copy.
+    return {
+      backendNodeId: null,
+      error: `the scope element went away mid-read: ${scopeSelector} (re-read the page)`,
+    }
   }
   const described = await sendCommand<{ node?: { backendNodeId?: number } }>(
     tabId,
@@ -474,7 +525,7 @@ async function resolveScopeNode(
   if (backendNodeId == null) {
     return { backendNodeId: null, error: 'could not resolve the scope element' }
   }
-  return { backendNodeId }
+  return { backendNodeId, matchCount }
 }
 
 export async function execSnapshot(args: unknown): Promise<CommandResult> {
@@ -496,12 +547,14 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   let scopeNodeId: number | null = null
   let scopeFrameTargetId: string | undefined
   let scopeFrameUrl: string | undefined
+  let scopeMatchCount: number | undefined
   if (a.scope_ref || a.scope_selector) {
     const scoped = await resolveScopeNode(a.tab_id, a.scope_ref, a.scope_selector)
     if (scoped.error) return { ok: false, status: 'error', error: scoped.error }
     scopeNodeId = scoped.backendNodeId
     scopeFrameTargetId = scoped.frameTargetId
     scopeFrameUrl = scoped.frameUrl
+    scopeMatchCount = scoped.matchCount
   }
 
   // A scope ref inside a frame re-roots INSIDE that frame: an OOPIF's tree
@@ -785,24 +838,34 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
         detail,
         url,
         ...(sameDocument ? httpStatusField(docStatus?.http_status) : {}),
-        // Frame counts are claims about THIS tree's sections, so a scoped
-        // read (which deliberately renders none) reports none: emitting the
-        // page's frame inventory there put a false "included" note outside
-        // the fence (review round).
+        // #208: how many refs are CONTROLS. Chrome marks every document
+        // `focusable`, so each document root mints a ref through the property
+        // path: a page of pure static text answers `ref_count: 2` (root plus a
+        // frame) while nothing on it can be clicked or typed into, which read
+        // live as a minting bug twice (#205, closed invalid). It must come off
+        // THIS map, never off the tree text, which is page content and could
+        // forge a ref-shaped line into the note the backend renders outside
+        // the fence.
+        //
+        // A SCOPED read reports it too, over its own subtree. It was withheld
+        // when the backend's only copy made a page-level claim ("this page has
+        // none"), which a subtree cannot support, but scoping to a static
+        // region is the flagship reason to scope at all: withholding it there
+        // left the newly recommended route answering "0 actionable elements"
+        // with no explanation, which is precisely the #205 loop the sentence
+        // exists to stop. The backend picks region-shaped copy when it scoped
+        // (#212 review round).
+        control_ref_count: countControlRefs(allRefs),
+        // How many the SCOPE SELECTOR matched, so the backend can say the read
+        // is rooted at the first of them. Absent on a ref scope, which names
+        // one element by construction.
+        ...(scopeMatchCount != null ? { scope_match_count: scopeMatchCount } : {}),
+        // Frame counts stay withheld when scoped: they are claims about THIS
+        // tree's sections, and a scoped read deliberately renders none, so
+        // emitting the page's frame inventory there put a false "included"
+        // note outside the fence (review round).
         ...(scopeNodeId == null
           ? {
-              // #208: how many refs are CONTROLS. Chrome marks every document
-              // `focusable`, so each document root mints a ref through the
-              // property path: a page of pure static text answers
-              // `ref_count: 2` (root plus a frame) while nothing on it can be
-              // clicked or typed into, which read live as a minting bug twice
-              // (#205, closed invalid). It must come off THIS map, never off
-              // the tree text, which is page content and could forge a
-              // ref-shaped line into the note the backend renders outside the
-              // fence. Withheld on a SCOPED read for the same reason the
-              // frame counts are: a subtree cannot support the page-level
-              // claim the backend's note makes from it (review round).
-              control_ref_count: countControlRefs(allRefs),
               frames_oopif: framesOopifRendered,
               frames_same_process: framesLocalRendered,
               // Sections rendered INSIDE another frame rather than in the
