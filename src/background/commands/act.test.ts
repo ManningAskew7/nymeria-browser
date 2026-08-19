@@ -83,6 +83,11 @@ interface MockOptions {
   scrollAfter?: {
     c?: { t: number; l: number } | null
     d?: { t: number; l: number } | null
+    /** #210: false models a page that produced no animation frame inside
+     *  the read's window, so its offsets predate the wheel. Omitted means
+     *  the ordinary rendering page. */
+    fresh?: boolean
+    vis?: string | null
   } | null
   bodyText?: string
   selectMatches?: boolean
@@ -448,7 +453,12 @@ function installCdpMock(opts: MockOptions = {}) {
         // pass through the document branch instead of the container one.
         return expression.includes('scrollingElement')
           ? { result: { value: scrollBase && { ...scrollBase, p: null } } }
-          : { result: { value: scrollAfter } }
+          : // A fixture that says nothing about rendering models the ordinary
+            // page: two frames arrived, the tab is visible. A test that means
+            // "the page never rendered" (#210) says so with `fresh: false`,
+            // which is the ONLY way to reach the withhold, since the parser
+            // treats anything but a literal true as not fresh.
+            { result: { value: scrollAfter && { fresh: true, vis: 'visible', ...scrollAfter } } }
       }
       // The coordinate-target probe, which has no objectId to ask: one call
       // answers both the file-input guard and what the point landed on.
@@ -4712,6 +4722,16 @@ describe('scroll at a ref (#203)', () => {
       return c[1] === 'Runtime.evaluate' && e.includes('__nymScroll') && !e.includes('scrollingElement')
     })
     expect((after?.[2] as { contextId?: number }).contextId).toBe(88)
+    // #210: the after-read observes the page over time (it waits for two
+    // animation frames), so it must be dispatched with awaitPromise or CDP
+    // hands back an unresolved Promise handle and every scroll reads as a
+    // failed measurement.
+    expect((after?.[2] as { awaitPromise?: boolean }).awaitPromise).toBe(true)
+    // The matching rule about the TRANSPORT deadline sitting above the
+    // expression's own window is not observable here: deadlineMs never
+    // reaches chrome.debugger.sendCommand, our wrapper races it locally. It
+    // lives as a constant relationship (15s vs SCROLL_FRESH_MS) at the call
+    // site, the way settle.ts states its own.
   })
 
   it('a wheel that chains off a pane at its end reports the document, not a fake container zero', async () => {
@@ -4772,7 +4792,10 @@ describe('scroll at a ref (#203)', () => {
     })
   })
 
-  it('scroll_moved stays absent when nothing was measurable at the baseline', async () => {
+  it('a wheel whose BASELINE never read still names its silence (#210)', async () => {
+    // The one dispatch that used to leave no key at all: the measurement
+    // never started, so neither the number nor a reason was emitted, while
+    // the docstring now promises a reason accompanies every absence.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
 
@@ -4780,6 +4803,28 @@ describe('scroll at a ref (#203)', () => {
 
     expect(result.ok).toBe(true)
     expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('read_failed')
+  })
+
+  it('a budget too short to wait for a frame says budget_spent, not read_failed (#210)', async () => {
+    // The clock can run out WITHOUT being fully spent: with less than the
+    // frame window left, attempting the read would have the transport
+    // deadline cut it off and the payload would blame the page.
+    vi.useFakeTimers()
+    try {
+      installCdpMock({
+        scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+        scrollAfter: { c: { t: 0, l: 0 }, d: { t: 0, l: 0 } },
+      })
+      const ctx = { deadline: Date.now() + 100, budgetMs: 30_000 }
+
+      const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' }, ctx)
+
+      expect(result.ok).toBe(true)
+      expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('budget_spent')
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('scroll_moved stays absent when the after-read fails', async () => {
@@ -4793,6 +4838,7 @@ describe('scroll at a ref (#203)', () => {
 
     expect(result.ok).toBe(true)
     expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('read_failed')
   })
 
   it('a ref scroll whose position cannot be read refuses without dispatching', async () => {
@@ -4821,6 +4867,7 @@ describe('scroll at a ref (#203)', () => {
 
     expect(result.ok).toBe(true)
     expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('over_frame')
   })
 
   it('a wheel over a frame withholds its zero even when a container was watched (#208)', async () => {
@@ -4840,6 +4887,7 @@ describe('scroll at a ref (#203)', () => {
 
     expect(result.ok).toBe(true)
     expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('over_frame')
   })
 
   it('a wheel over a frame still reports the PANE when the pane really moved (#208)', async () => {
@@ -4892,6 +4940,7 @@ describe('scroll at a ref (#203)', () => {
 
     expect(result.ok).toBe(true)
     expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('over_frame')
   })
 
   it('a TARGETED wheel into a frame still reports a page that really moved (#208)', async () => {
@@ -4941,6 +4990,224 @@ describe('scroll at a ref (#203)', () => {
       vi.useRealTimers()
       resetWheelAckLatchForTests()
     }
+  })
+
+  it('a mislaid wheel receipt does NOT cost the measured zero (#207 stands under #210)', async () => {
+    // The receipt and the measurement are separate questions, and one
+    // unreleased version conflated them. Gating the zero on the ack looks
+    // safe until you read input.ts's own latch note: after the first
+    // coalescing timeout the tolerance drops to 500ms, which "a heavy page
+    // is least likely to meet", so a page that scrolls perfectly well would
+    // lose its measured zeros for the rest of its life. Scroll has no second
+    // evidence key (no delivered, no dom_mutations), so that is the agent's
+    // whole termination signal for "this pane is at its end".
+    vi.useFakeTimers()
+    resetWheelAckLatchForTests()
+    try {
+      installCdpMock({
+        inputAckHangsFrom: 1,
+        scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+        scrollAfter: { c: { t: 0, l: 0 }, d: { t: 0, l: 0 } },
+      })
+
+      const pending = execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+      await vi.advanceTimersByTimeAsync(9_000)
+      const result = await pending
+
+      expect(result.ok).toBe(true)
+      expect((result.data as { wheel_ack?: string }).wheel_ack).toBe('not_received')
+      expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+        dx: 0,
+        dy: 0,
+        scroller: 'container',
+      })
+      expect('scroll_unmeasured' in (result.data as Record<string, unknown>)).toBe(false)
+    } finally {
+      vi.useRealTimers()
+      resetWheelAckLatchForTests()
+    }
+  })
+
+  it('a page that never rendered has its ZERO withheld and says why (#210)', async () => {
+    // Measured live: the operator's window was covered by another app, so
+    // Chrome marked the page hidden and stopped producing frames, and the
+    // offsets committed after the read. Three payloads in a row claimed a
+    // measured {0,0} while the document had really moved 500px. "Did not
+    // move" and "has not landed yet" are the same reading on an unrendered
+    // page, so neither is claimed.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+      scrollAfter: { c: { t: 0, l: 0 }, d: { t: 0, l: 0 }, fresh: false, vis: 'hidden' },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect(result.ok).toBe(true)
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('not_rendering')
+  })
+
+  it('a page that never rendered still REPORTS a difference, flagged stale (#210)', async () => {
+    // The other half of the same state, and the reason the withhold is not
+    // blanket: offsets can only differ if something scrolled, and a hidden
+    // tab handles its wheel on the main thread and moves without painting.
+    // Deleting this number would leave an agent driving a background tab
+    // with no scroll feedback at all, for the whole time it sits there;
+    // both review rounds pushed back on that. The flag warns about
+    // magnitude and attribution, never about whether it moved.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+      scrollAfter: { c: { t: 500, l: 0 }, d: { t: 0, l: 0 }, fresh: false, vis: 'hidden' },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+      dx: 0,
+      dy: 500,
+      scroller: 'container',
+    })
+    expect((result.data as { scroll_stale?: string }).scroll_stale).toBe('not_rendering')
+    expect('scroll_unmeasured' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('a fresh measurement carries no stale flag (#210)', async () => {
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+      scrollAfter: { c: { t: 500, l: 0 }, d: { t: 0, l: 0 } },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect((result.data as { scroll_moved?: unknown }).scroll_moved).toBeTruthy()
+    expect('scroll_stale' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('a VISIBLE page that missed the frame window is named apart from a hidden one (#210)', async () => {
+    // Same silence, different advice: a hidden tab needs bringing forward,
+    // a visible one that could not paint in time is merely busy and worth
+    // re-reading. Collapsing the two would leave the agent guessing which.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+      scrollAfter: { c: { t: 0, l: 0 }, d: { t: 0, l: 0 }, fresh: false, vis: 'visible' },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('no_frame')
+  })
+
+  it('a rendering page reports the CONTAINER it really moved (#210 keeps the capability)', async () => {
+    // The reason the freshness proof is a frame count and not the wheel
+    // receipt: this page loses its ack (wheel-heavy, latched) and still
+    // measures perfectly, which is the everyday case the ack gate would
+    // have silenced.
+    vi.useFakeTimers()
+    resetWheelAckLatchForTests()
+    try {
+      installCdpMock({
+        inputAckHangsFrom: 1,
+        scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+        scrollAfter: { c: { t: 300, l: 0 }, d: { t: 0, l: 0 } },
+      })
+
+      const pending = execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+      await vi.advanceTimersByTimeAsync(9_000)
+      const result = await pending
+
+      expect((result.data as { scroll_moved?: unknown }).scroll_moved).toEqual({
+        dx: 0,
+        dy: 300,
+        scroller: 'container',
+      })
+    } finally {
+      vi.useRealTimers()
+      resetWheelAckLatchForTests()
+    }
+  })
+
+  it('a read that says nothing about freshness is treated as STALE (#210)', async () => {
+    // The verdict has to be positively asserted by the expression that took
+    // the measurement. A shape without it is a read this code did not
+    // produce (an older worker mid-reload, a mangled value), and such a
+    // shape cannot vouch for its own timing, so it withholds rather than
+    // inheriting the benefit of the doubt.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+      scrollAfter: { c: { t: 0, l: 0 }, d: { t: 0, l: 0 }, fresh: undefined, vis: undefined },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('no_frame')
+  })
+
+  it('an after-read whose watched scrollers BOTH detached says read_failed (#210)', async () => {
+    // The other half of the read_failed guard: the read answered, but the
+    // pane and the document it was watching are gone, so there is nothing
+    // to subtract. Narrowing that guard to "no answer at all" left this
+    // case falling through to a fabricated measured zero (review round).
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+      scrollAfter: { c: null, d: null },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('read_failed')
+  })
+
+  it('a scroll whose budget ran out says budget_spent rather than nothing (#210)', async () => {
+    // The verification block is skipped past the deadline like every other
+    // renderer-bound enrichment, and the act still succeeds. What changed is
+    // that the silence is now attributable: "we did not look" is a different
+    // answer from "we looked and the page had not rendered", and both are
+    // different from "the page did not move".
+    vi.useFakeTimers()
+    try {
+      const cdp = installCdpMock({
+        scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+        scrollAfter: { c: { t: 0, l: 0 }, d: { t: 0, l: 0 } },
+      })
+      const inner = cdp.getMockImplementation()!
+      cdp.mockImplementation(async (target: unknown, method: string, params?: unknown) => {
+        if (
+          method === 'Input.dispatchMouseEvent' &&
+          (params as { type?: string })?.type === 'mouseWheel'
+        ) {
+          vi.setSystemTime(Date.now() + 60_000)
+        }
+        return inner(target, method as never, params as never)
+      })
+      const ctx = { deadline: Date.now() + 5_000, budgetMs: 30_000 }
+
+      const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' }, ctx)
+
+      expect(result.ok).toBe(true)
+      expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+      expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('budget_spent')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('an after-read that answers nothing at all says read_failed, not silence (#210)', async () => {
+    // The world died, the slot went with a navigation, or both watched
+    // scrollers detached. Before #210 this was a bare absence, which reads
+    // exactly like the over-frame withhold and like a payload that simply
+    // forgot the key.
+    installCdpMock({
+      scrollBase: { d: { t: 0, l: 0 }, c: { t: 0, l: 0 } },
+      scrollAfter: null,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'scroll', direction: 'down' })
+
+    expect('scroll_moved' in (result.data as Record<string, unknown>)).toBe(false)
+    expect((result.data as { scroll_unmeasured?: string }).scroll_unmeasured).toBe('read_failed')
   })
 
   it('an acked wheel carries no wheel_ack key', async () => {
@@ -4996,13 +5263,19 @@ describe('scroll probes (executed in-page)', () => {
         doc: boolean
       }
     ).call(el, id)
-  const runAfter = (id: string) =>
-    (
-      new Function(`return (${__test.scrollAfterExpression(id)})`) as () => {
+  /** The after-read is a PROMISE now (#210): it resolves once the page has
+   *  produced two animation frames, or once its own deadline gives up on
+   *  them, so every in-page assertion below awaits it. A missing slot still
+   *  answers null synchronously, which `await` flattens either way. */
+  const runAfter = async (id: string, baseline: { c: Pair | null; d: Pair | null } | null = null) =>
+    await ((
+      new Function(`return (${__test.scrollAfterExpression(id, baseline)})`) as () => Promise<{
         c: Pair | null
         d: Pair | null
-      } | null
-    )()
+        fresh: boolean
+        vis: string | null
+      } | null>
+    )())
 
   /** Stage scroll metrics the way a real browser exposes them: as ACCESSORS
    *  on the prototype chain, not as instance properties. happy-dom has no
@@ -5123,7 +5396,7 @@ describe('scroll probes (executed in-page)', () => {
     }
   })
 
-  it('the after-read measures the REGISTERED container, and drops it once detached', () => {
+  it('the after-read measures the REGISTERED container, and drops it once detached', async () => {
     document.body.innerHTML = '<div id="pane"><span id="target">x</span></div>'
     const pane = document.getElementById('pane') as HTMLElement
     pane.style.overflowY = 'auto'
@@ -5132,17 +5405,214 @@ describe('scroll probes (executed in-page)', () => {
 
     runBase(target, 'x7')
     ;(pane as unknown as { scrollTop: number }).scrollTop = 340
-    expect(runAfter('x7')?.c).toEqual({ t: 340, l: 0 })
+    expect((await runAfter('x7'))?.c).toEqual({ t: 340, l: 0 })
 
     runBase(target, 'x8')
     pane.remove()
-    const after = runAfter('x8')
+    const after = await runAfter('x8')
     expect(after?.c).toBeNull()
     expect(after?.d).not.toBeNull()
   })
 
-  it('a missing slot answers null, never a fabricated pair', () => {
-    expect(runAfter('never-registered')).toBeNull()
+  it('an offset that lands AFTER the wheel is still caught, not missed (#210)', async () => {
+    // The payoff the freshness wait exists for: the read happens once the
+    // page has rendered, so a scroll that commits a beat late is reported
+    // as the truth it is. Reading at call time instead would report the
+    // pre-wheel number and call it a measured nothing-moved, which is the
+    // live failure this pass was opened by.
+    document.body.innerHTML = '<div id="pane"><span id="target">x</span></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 0 })
+    const target = document.getElementById('target') as Element
+
+    runBase(target, 'late1')
+    // Queued on a frame callback registered BEFORE the read's own, so it
+    // lands while the read is waiting rather than before it starts: a read
+    // taken at call time would still see 0 here.
+    requestAnimationFrame(() => {
+      ;(pane as unknown as { scrollTop: number }).scrollTop = 300
+    })
+    const after = await runAfter('late1')
+
+    expect(after?.fresh).toBe(true)
+    expect(after?.c).toEqual({ t: 300, l: 0 })
+  })
+
+  it('a page that produces no frame decides STALE on its own deadline (#210)', async () => {
+    // The freshness verdict itself, exercised in the page rather than
+    // injected through the mock: a review round mutated the whole wait away
+    // (`resolve(readNow(true))`) and every one of the 861 tests still
+    // passed, because each not-fresh case was staged at the parser. This is
+    // the test that fails when the mechanism is deleted.
+    document.body.innerHTML = '<span id="target">x</span>'
+    const target = document.getElementById('target') as Element
+    const proto = Object.getOwnPropertyDescriptor(Window.prototype, 'requestAnimationFrame')
+    const own = Object.getOwnPropertyDescriptor(globalThis, 'requestAnimationFrame')
+    const neverFires = vi.fn(() => 1)
+    Object.defineProperty(Window.prototype, 'requestAnimationFrame', {
+      value: neverFires,
+      configurable: true,
+      writable: true,
+    })
+    Object.defineProperty(globalThis, 'requestAnimationFrame', {
+      value: neverFires,
+      configurable: true,
+      writable: true,
+    })
+    vi.useFakeTimers()
+    try {
+      runBase(target, 'noframe1')
+      const pending = runAfter('noframe1')
+      await vi.advanceTimersByTimeAsync(260)
+      const after = await pending
+
+      expect(neverFires).toHaveBeenCalled()
+      expect(after?.fresh).toBe(false)
+      // The offsets still come back: the caller decides what a stale read
+      // may claim, the probe never decides for it.
+      expect(after?.d).not.toBeNull()
+    } finally {
+      vi.useRealTimers()
+      if (proto) Object.defineProperty(Window.prototype, 'requestAnimationFrame', proto)
+      else delete (Window.prototype as unknown as Record<string, unknown>).requestAnimationFrame
+      if (own) Object.defineProperty(globalThis, 'requestAnimationFrame', own)
+      else delete (globalThis as unknown as Record<string, unknown>).requestAnimationFrame
+    }
+  })
+
+  it('a HIDDEN page answers at once, without arming a wait it cannot win (#210)', async () => {
+    // Hidden pages service no frame callbacks, so the wait could only end
+    // on the timer, and hidden pages are also where timers are throttled
+    // hardest: arming it would buy nothing and cost the act seconds. Also
+    // pins that visibilityState rides the chain read (a page can shadow a
+    // plain `document.visibilityState` lookup with a named property).
+    document.body.innerHTML = '<span id="target">x</span>'
+    const target = document.getElementById('target') as Element
+    const armed = vi.fn(() => 1)
+    const proto = Object.getOwnPropertyDescriptor(Window.prototype, 'requestAnimationFrame')
+    // Stage it on whichever prototype actually OWNS the accessor, which is
+    // what the probe's chain walk will find first (happy-dom's document is
+    // not a plain Document).
+    let visOwner: object = Document.prototype
+    for (let p = Object.getPrototypeOf(document); p; p = Object.getPrototypeOf(p)) {
+      if (Object.getOwnPropertyDescriptor(p, 'visibilityState')) {
+        visOwner = p
+        break
+      }
+    }
+    const vis = Object.getOwnPropertyDescriptor(visOwner, 'visibilityState')
+    Object.defineProperty(Window.prototype, 'requestAnimationFrame', {
+      value: armed,
+      configurable: true,
+      writable: true,
+    })
+    Object.defineProperty(visOwner, 'visibilityState', {
+      get: () => 'hidden',
+      configurable: true,
+    })
+    try {
+      runBase(target, 'hidden1')
+      const after = await runAfter('hidden1')
+
+      expect(after?.fresh).toBe(false)
+      expect(after?.vis).toBe('hidden')
+      expect(armed).not.toHaveBeenCalled()
+    } finally {
+      if (proto) Object.defineProperty(Window.prototype, 'requestAnimationFrame', proto)
+      else delete (Window.prototype as unknown as Record<string, unknown>).requestAnimationFrame
+      if (vis) Object.defineProperty(visOwner, 'visibilityState', vis)
+      else delete (visOwner as unknown as Record<string, unknown>).visibilityState
+    }
+  })
+
+  it('a page that ALREADY moved answers on the first look, paying nothing extra', async () => {
+    // The second look is the price of believing a zero, so movement must
+    // not pay it: this resolves inside the frame wait, well before the
+    // recheck delay would elapse. Dropping the early exit (or failing to
+    // pass the baseline the comparison needs) leaves this hanging.
+    document.body.innerHTML = '<div id="pane"><span id="target">x</span></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 0 })
+    const target = document.getElementById('target') as Element
+
+    vi.useFakeTimers()
+    try {
+      runBase(target, 'fast1')
+      ;(pane as unknown as { scrollTop: number }).scrollTop = 300
+      const pending = runAfter('fast1', { c: { t: 0, l: 0 }, d: null })
+      await vi.advanceTimersByTimeAsync(60)
+      const after = await pending
+
+      expect(after?.c).toEqual({ t: 300, l: 0 })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('a page at REST gets a second look, so queued input is not called a zero (#210 QA)', async () => {
+    // Measured live: a tab wheeled three times while backgrounded did not
+    // move at all, and flushed every one of those 1500px the moment it was
+    // shown, long after the acts that sent them had answered {0,0}. Input
+    // can simply be queued, so a first look showing nothing is not proof of
+    // nothing: only after a second look, taken a beat later, does a zero
+    // mean "at rest" rather than "not yet".
+    document.body.innerHTML = '<div id="pane"><span id="target">x</span></div>'
+    const pane = document.getElementById('pane') as HTMLElement
+    pane.style.overflowY = 'auto'
+    metrics(pane, { st: 0 })
+    const target = document.getElementById('target') as Element
+
+    runBase(target, 'queued1')
+    setTimeout(() => {
+      ;(pane as unknown as { scrollTop: number }).scrollTop = 300
+    }, 60)
+    const after = await runAfter('queued1', { c: { t: 0, l: 0 }, d: null })
+
+    expect(after?.fresh).toBe(true)
+    expect(after?.c).toEqual({ t: 300, l: 0 })
+  })
+
+  it('the freshness proof comes from Window.prototype, not a page-supplied rAF', async () => {
+    // Named properties follow you into an isolated world and they sit on the
+    // WindowProperties object, which PRECEDES Window.prototype in the chain:
+    // `<img name="requestAnimationFrame">` would win a plain lookup and could
+    // hand back a fresh verdict for a page that never rendered. An own
+    // property on the global is the same shadowing, only stronger, so a read
+    // that ignores it a fortiori ignores the named one. happy-dom carries no
+    // Window.prototype descriptor of its own, which is why the real one is
+    // installed here rather than assumed.
+    document.body.innerHTML = '<span id="target">x</span>'
+    const target = document.getElementById('target') as Element
+    const hostile = vi.fn()
+    const proto = Object.getOwnPropertyDescriptor(Window.prototype, 'requestAnimationFrame')
+    const own = Object.getOwnPropertyDescriptor(globalThis, 'requestAnimationFrame')
+    Object.defineProperty(Window.prototype, 'requestAnimationFrame', {
+      value: (cb: () => void) => setTimeout(cb, 0) as unknown as number,
+      configurable: true,
+      writable: true,
+    })
+    Object.defineProperty(globalThis, 'requestAnimationFrame', {
+      value: hostile,
+      configurable: true,
+      writable: true,
+    })
+    try {
+      runBase(target, 'raf1')
+      const after = await runAfter('raf1')
+      expect(after?.fresh).toBe(true)
+      expect(hostile).not.toHaveBeenCalled()
+    } finally {
+      if (proto) Object.defineProperty(Window.prototype, 'requestAnimationFrame', proto)
+      else delete (Window.prototype as unknown as Record<string, unknown>).requestAnimationFrame
+      if (own) Object.defineProperty(globalThis, 'requestAnimationFrame', own)
+      else delete (globalThis as unknown as Record<string, unknown>).requestAnimationFrame
+    }
+  })
+
+  it('a missing slot answers null, never a fabricated pair', async () => {
+    expect(await runAfter('never-registered')).toBeNull()
   })
 
   it('each registration prunes slots older than a minute (#207 hygiene)', () => {
@@ -5269,7 +5739,7 @@ describe('scroll probes (executed in-page)', () => {
     expect(reg?.d1?.c).toBe(pane)
   })
 
-  it('both scroll reads ignore a forged own-property metric, so no delta is fabricated', () => {
+  it('both scroll reads ignore a forged own-property metric, so no delta is fabricated', async () => {
     // An isolated world keeps its prototypes pristine but does NOT stop
     // named-property access on page objects (`<form><input name="scrollTop">`
     // is the live shape; an own data property is the same shadowing in
@@ -5288,7 +5758,7 @@ describe('scroll probes (executed in-page)', () => {
 
     // The after-read rides the SAME hardened read, so the pair agrees and
     // the delta is zero rather than 9959.
-    expect(runAfter('forge1')?.c).toEqual({ t: 40, l: 0 })
+    expect((await runAfter('forge1'))?.c).toEqual({ t: 40, l: 0 })
   })
 
   it('a DOCUMENT target whose centre sits over a frame flags the unmeasurable wheel', () => {

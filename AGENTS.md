@@ -315,7 +315,11 @@ POSTs results. Consequences:
   sighting yet, unit-proven), a per-widget latch drops later wheels to
   500ms and DIES WITH THE WIDGET (index.ts onCommitted/onRemoved clear
   it), and `stall_at` names which stall gate raised. Every other
-  Input.* dispatch keeps its load-bearing ack.
+  Input.* dispatch keeps its load-bearing ack. The ack is not a
+  MEASUREMENT signal either: gating scroll_moved's zero on it was tried
+  for one unreleased version and re-broke this very entry, since a
+  latched widget loses acks routinely while its offsets read perfectly
+  well (see the freshness bullet).
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
   STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
@@ -364,6 +368,38 @@ POSTs results. Consequences:
   stages values as per-element PROTOTYPE accessors for that reason;
   own-property stubs would leave the hardened read untested and
   happy-dom's own Element getters shadow them anyway.
+- Scroll measurement is WATCHED, not sampled (v0.16.1, #210). Two live
+  findings drove it. (1) A window that is minimised, covered or
+  backgrounded stops painting and its offsets lag: QA measured three
+  confident {0,0}s against a page that had moved 500px. (2) A
+  BACKGROUNDED TAB HOLDS ITS WHEELS: QA wheeled a hidden tab three times
+  (no movement at all, ground truth flat), and all 1500px landed the
+  moment the tab was shown, long after those acts answered. So the
+  after-read waits for two animation frames (`awaitPromise` forwarded
+  through `evaluateInProbeWorld`, which settle.ts already proved on the
+  same sendCommand), and a page that rendered but shows NOTHING gets a
+  second look 150ms later; only a zero pays that cost. A hidden page
+  short-circuits both waits, because it services no frame callbacks and
+  is where timers are throttled hardest. What the frame proof does NOT
+  cover: a wheel still queued behind the page's own handler, and a
+  smooth scroll mid-flight (the second look narrows both).
+  `requestAnimationFrame` comes from `Window.prototype`'s own descriptor,
+  NOT a chain walk: named properties sit on WindowProperties, which
+  PRECEDES Window.prototype, so a chain walk would find
+  `<img name="requestAnimationFrame">` first (the opposite of the element
+  metric rule, where the accessor is the deepest thing on the chain).
+  Payload: a zero means at-rest; an unrendered page's zero is withheld
+  with `scroll_unmeasured` (closed enum: over_frame, not_rendering,
+  no_frame, read_failed, budget_spent), and its DELTA still reports
+  tagged `scroll_stale` (deleting a real delta would leave an agent
+  driving a background tab with no scroll feedback at all, which both
+  review rounds pushed back on). Test traps: act.test's after-read
+  fixtures default to `fresh: true`, so a test meaning "never rendered"
+  must say `fresh: false`; frames.test stages its own inline fixtures and
+  needs the same fields; and a not-fresh case staged at the MOCK pins the
+  ladder, not the measurement, which is how a review round deleted the
+  whole frame wait with all 861 tests still green (the in-page probe
+  tests are the ones with teeth there).
 - Known residual (#208, not a regression): the point-based walks start
   from `Document.prototype.elementFromPoint`, which retargets a shadow
   hit to the HOST, so a scroller INSIDE an open shadow root is not

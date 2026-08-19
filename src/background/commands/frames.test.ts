@@ -245,7 +245,7 @@ describe('frame input dispatch', () => {
         String(params.expression ?? '').includes('__nymScroll') &&
         !String(params.expression ?? '').includes('scrollingElement')
       ) {
-        return { result: { value: { c: { t: 200, l: 0 }, d: { t: 0, l: 0 } } } }
+        return { result: { value: { c: { t: 200, l: 0 }, d: { t: 0, l: 0 }, fresh: true, vis: 'visible' } } }
       }
       return base(...args)
     })
@@ -307,7 +307,7 @@ describe('frame input dispatch', () => {
         String(params.expression ?? '').includes('__nymScroll') &&
         !String(params.expression ?? '').includes('scrollingElement')
       ) {
-        return { result: { value: { c: { t: 420, l: 0 }, d: { t: 0, l: 0 } } } }
+        return { result: { value: { c: { t: 420, l: 0 }, d: { t: 0, l: 0 }, fresh: true, vis: 'visible' } } }
       }
       return base(...args)
     })

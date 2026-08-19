@@ -2030,16 +2030,29 @@ async function keyboardSessionForFocus(
  * in-world prototypes themselves are pristine), while finding the real
  * accessor wherever the implementation hung it. `doc` is the document's
  * scrolling element. */
-const SCROLL_DOC_SNIPPET = `
+/** The prototype-CHAIN read for `document.*`, the one walk every scroll
+ *  probe shares (three copies had already drifted apart by #210). Named
+ *  properties follow you into an isolated world, so `<img name="body">`
+ *  clobbers a plain `document.body` lookup; walking to the accessor is what
+ *  stops that. Elements get the same idiom with a number guard in
+ *  SCROLL_METRIC_SNIPPET. NB the ONE place this walk is wrong is a window
+ *  property: WindowProperties precedes Window.prototype in that chain, so a
+ *  named property would be found FIRST (see scrollAfterExpression's rAF). */
+const CHAIN_READ_SNIPPET = `
   var read = function (name, obj) {
-    var p = Object.getPrototypeOf(obj);
-    while (p) {
-      var d = Object.getOwnPropertyDescriptor(p, name);
-      if (d && d.get) return d.get.call(obj);
-      p = Object.getPrototypeOf(p);
-    }
+    try {
+      var p = obj ? Object.getPrototypeOf(obj) : null;
+      while (p) {
+        var d = Object.getOwnPropertyDescriptor(p, name);
+        if (d && d.get) return d.get.call(obj);
+        p = Object.getPrototypeOf(p);
+      }
+    } catch (e) {}
     return undefined;
-  };
+  };`
+
+const SCROLL_DOC_SNIPPET = `
+  ${CHAIN_READ_SNIPPET}
   var docEl = read('documentElement', document);
   var bodyEl = read('body', document);
   var doc = read('scrollingElement', document) || docEl;`
@@ -2240,24 +2253,120 @@ function scrollBaseExpression(id: string, point: Point | null): string {
 })()`
 }
 
+/** How long the after-read waits for the page to produce two animation
+ *  frames before it calls its own numbers stale (#210). A 60fps page needs
+ *  ~33ms for two; a page throttled to 1fps needs 2s and misses this window
+ *  BY DESIGN, which is the whole signal. */
+const SCROLL_FRESH_MS = 250
+/** How long a page that has rendered but shows NO movement is watched
+ *  before its zero is believed (#210 QA). Measured live: a tab wheeled
+ *  three times while backgrounded did not move at all, then flushed all
+ *  1500px the moment it was shown, hundreds of ms after the acts that sent
+ *  them. Input can be queued, so "nothing yet" and "nothing at all" need
+ *  separating in TIME, and only a zero pays for it. */
+const SCROLL_RECHECK_MS = 150
+/** Worst-case page-side observation: two frame waits with the recheck
+ *  between them. Both the transport deadline and the budget gate derive
+ *  from this, so raising a constant carries its own headroom. */
+const SCROLL_OBSERVE_MS = SCROLL_FRESH_MS * 2 + SCROLL_RECHECK_MS
+
 /** Post-settle re-read of the REGISTERED scrollers, never a re-walk. A
  * container detached by settle-time churn answers null (its offsets would
  * be stale garbage); a missing slot (world died, navigation) answers null
- * wholesale, which keeps scroll_moved absent. */
-function scrollAfterExpression(id: string): string {
+ * wholesale, which keeps scroll_moved absent.
+ *
+ * The read watches the page rather than sampling it (#210). Two things
+ * measured live make a single immediate sample a lie:
+ *
+ *  - A window that is minimised, covered or backgrounded stops producing
+ *    frames, and its offsets lag behind whatever the compositor has taken.
+ *    QA saw three confident {0,0} payloads on a page that had moved 500px.
+ *    So the read waits for TWO animation frames and says whether they came:
+ *    what that proves is that the page is rendering, not that this wheel
+ *    was consumed, and the caller withholds a ZERO when they did not.
+ *  - Input can simply be QUEUED. A backgrounded tab wheeled three times did
+ *    not move at all, and flushed every delta at once when it was shown
+ *    again, well after the acts that sent them had answered. So a page that
+ *    has rendered and shows NOTHING gets a second look SCROLL_RECHECK_MS
+ *    later: only a zero pays that cost, and only after it does a zero mean
+ *    "at rest" rather than "not yet".
+ *
+ * `requestAnimationFrame` is taken from `Window.prototype`'s own descriptor
+ * because a bare lookup would find `<img name="requestAnimationFrame">`
+ * first: named properties sit on the WindowProperties object, which
+ * precedes Window.prototype in the chain, so walking the chain (what the
+ * document read does) would find the FORGERY here. Interface objects are
+ * own properties of the global, so `Window` itself cannot be shadowed.
+ * `setTimeout` needs no such care: neither a no-op nor an instant-fire
+ * forgery can produce a fresh verdict, only a withheld one. */
+function scrollAfterExpression(
+  id: string,
+  baseline: { c: ScrollPair | null; d: ScrollPair | null } | null,
+): string {
   return `(function(){
   ${SCROLL_METRIC_SNIPPET}
+  ${CHAIN_READ_SNIPPET}
   var reg = globalThis.__nymScroll;
   var s = reg && reg[${JSON.stringify(id)}];
   if (reg) { delete reg[${JSON.stringify(id)}]; }
   if (!s) return null;
-  // The SAME hardened read as the baseline, deliberately: a mismatched pair
-  // (prototype getter one side, named-property lookup the other) would not
-  // just read a forged number, it would SUBTRACT two different quantities
-  // and report the difference as a measured scroll (review round).
-  var c = s.c && s.c.isConnected ? { t: metric(s.c, 'scrollTop'), l: metric(s.c, 'scrollLeft') } : null;
-  var d = s.d && s.d.isConnected ? { t: metric(s.d, 'scrollTop'), l: metric(s.d, 'scrollLeft') } : null;
-  return { c: c, d: d };
+  var base = ${JSON.stringify(baseline ?? { c: null, d: null })};
+  var rafOf = function () {
+    try {
+      var d = Object.getOwnPropertyDescriptor(Window.prototype, 'requestAnimationFrame');
+      if (d && typeof d.value === 'function') return d.value;
+    } catch (e) {}
+    // Pristine prototypes always carry it in a real isolated world, so this
+    // is the test environment's path, the same shape as the metric read's
+    // own-property fallback, not a forgery window.
+    var own = globalThis.requestAnimationFrame;
+    return typeof own === 'function' ? own : null;
+  };
+  var readNow = function (fresh) {
+    // The SAME hardened read as the baseline, deliberately: a mismatched pair
+    // (prototype getter one side, named-property lookup the other) would not
+    // just read a forged number, it would SUBTRACT two different quantities
+    // and report the difference as a measured scroll (review round).
+    var c = s.c && s.c.isConnected ? { t: metric(s.c, 'scrollTop'), l: metric(s.c, 'scrollLeft') } : null;
+    var d = s.d && s.d.isConnected ? { t: metric(s.d, 'scrollTop'), l: metric(s.d, 'scrollLeft') } : null;
+    var vis = read('visibilityState', document);
+    return { c: c, d: d, fresh: fresh, vis: typeof vis === 'string' ? vis : null };
+  };
+  var moved = function (v) {
+    if (!v) return false;
+    if (base.c && v.c && (v.c.t !== base.c.t || v.c.l !== base.c.l)) return true;
+    if (base.d && v.d && (v.d.t !== base.d.t || v.d.l !== base.d.l)) return true;
+    return false;
+  };
+  var raf = rafOf();
+  var frames = function () {
+    return new Promise(function (resolve) {
+      var done = false;
+      var finish = function (ok) { if (done) return; done = true; resolve(ok); };
+      setTimeout(function () { finish(false); }, ${SCROLL_FRESH_MS});
+      if (!raf) { finish(false); return; }
+      try {
+        raf.call(globalThis, function () { raf.call(globalThis, function () { finish(true); }); });
+      } catch (e) { finish(false); }
+    });
+  };
+  // A hidden page is settled BEFORE arming anything: it services no frame
+  // callbacks at all, so the wait could only ever end on the timer, and
+  // hidden pages are exactly where Chrome throttles timers hardest (a 1s
+  // floor, a per-minute wake-up once hidden a while). Arming it would buy
+  // nothing and could cost the act seconds, or overrun the transport
+  // deadline and report the wrong reason for the silence (review round).
+  if (read('visibilityState', document) === 'hidden') {
+    return Promise.resolve(readNow(false));
+  }
+  return frames().then(function (ok) {
+    if (!ok) return readNow(false);
+    var first = readNow(true);
+    if (moved(first)) return first;
+    return new Promise(function (r) { setTimeout(r, ${SCROLL_RECHECK_MS}); })
+      .then(frames)
+      .then(function (ok2) { return readNow(ok2); });
+  });
 })()`
 }
 
@@ -2345,16 +2454,48 @@ async function scrollBaseTargetless(
   return v === undefined ? null : parseScrollSnap(v)
 }
 
+interface ScrollAfter {
+  c: ScrollPair | null
+  d: ScrollPair | null
+  /** Two animation frames arrived inside the page-side window, so these
+   *  numbers were read from a page that has rendered since the wheel. */
+  fresh: boolean
+  /** `document.visibilityState` at the read, which separates the two ways a
+   *  frame can fail to arrive: a hidden page is not rendering at all, a
+   *  visible one is merely busy. */
+  vis: string | null
+}
+
 async function scrollAfter(
   session: Cdp,
   id: string,
-): Promise<{ c: ScrollPair | null; d: ScrollPair | null } | null> {
-  const v = await evaluateInProbeWorld<{ c?: unknown; d?: unknown }>(
+  baseline: { c: ScrollPair | null; d: ScrollPair | null },
+  deadline: number | null,
+): Promise<ScrollAfter | null> {
+  const v = await evaluateInProbeWorld<{ c?: unknown; d?: unknown; fresh?: unknown; vis?: unknown }>(
     session,
-    scrollAfterExpression(id),
+    scrollAfterExpression(id, baseline),
+    // The expression bounds itself at SCROLL_OBSERVE_MS, so the transport
+    // deadline is DERIVED from it rather than sharing the file's 15s probe
+    // constant: a raised window must carry its own headroom with it, or a
+    // healthy wait starts reading as a hang (settle.ts derives its own the
+    // same way, maxMs + 2s). The caller refuses to start the read at all
+    // without that much budget left, so the clamp below cannot land under
+    // the page-side bound.
+    deadline === null
+      ? { deadlineMs: SCROLL_OBSERVE_MS + 5_000 }
+      : { deadlineMs: clampToDeadline(SCROLL_OBSERVE_MS + 5_000, deadline) },
+    { awaitPromise: true },
   )
   if (!v || typeof v !== 'object') return null
-  return { c: scrollPair(v.c), d: scrollPair(v.d) }
+  return {
+    c: scrollPair(v.c),
+    d: scrollPair(v.d),
+    // Absent is NOT fresh: a shape this code did not produce cannot vouch
+    // for its own timing.
+    fresh: v.fresh === true,
+    vis: typeof v.vis === 'string' ? v.vis : null,
+  }
 }
 
 async function stillConnected(session: Cdp, objectId: string | null): Promise<boolean | null> {
@@ -3059,6 +3200,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   let scrollBaseline: { c: ScrollPair | null; d: ScrollPair | null } | null = null
   let scrollSlotId: string | null = null
   let scrollOverFrame = false
+  // A wheel WENT OUT. Everything that reports on the scroll hangs off this
+  // rather than off the baseline, so a dispatch whose measurement never even
+  // started still says so (#210 review round).
+  let scrollWheeled = false
   // Only ever set for a coordinate act: a ref act already names its target,
   // and `target_exists` answers the same question for it more directly. On a
   // drag the point is the SOURCE, so it is named as such rather than left to
@@ -3735,12 +3880,18 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         }
         {
           const ack = await trustedWheel(wheelTarget, at, { x: deltaX, y: deltaY }, modifiers)
+          scrollWheeled = true
           if (ack === 'timeout') {
             // #207: the browser mislaid the RECEIPT, not the wheel (a
             // coalesced-away wheel never acks while its delta still lands;
             // measured live, the page scrolled through every "failed" ack).
             // Not a failure: scroll_moved and settle carry the verdict, and
             // the widget latch in input.ts caps what later wheels pay.
+            // Deliberately NOT a measurement signal (#210): gating the zero
+            // on this receipt was tried for one unreleased version and it
+            // re-broke #207, since the latch means a wheel-heavy page loses
+            // acks routinely while its offsets read perfectly well. The
+            // freshness proof in the after-read is the honest gate.
             extra.wheel_ack = 'not_received'
           }
         }
@@ -4214,30 +4365,73 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     if (tally !== null) extra.dom_mutations = tally
   }
   // scroll_moved (#203): the SAME registered scrollers are re-read after
-  // settle. Post-settle is the best available moment, not a guarantee:
-  // settle is DOM quiescence and offsets mutate nothing, so a slow smooth
-  // scroll can still be mid-flight at the read (docstring-taught as a rare
-  // {0,0}/partial cause). The container's delta when it moved; else the
-  // document's, which is where a wheel CHAINS when the pane is at its end
-  // (review round: reporting the untouched container's zero there called a
-  // page that visibly scrolled a measured nothing); else a measured zero
-  // naming the container when one was watched. Absence means a read
-  // failed, never a guess.
-  if (scrollBaseline && scrollSlotId && !budgetSpent(budgetDeadline)) {
-    const after = await scrollAfter(objectId ? elementSession : tabId, scrollSlotId)
-    if (after) {
+  // settle, and the re-read waits for the page to RENDER first (#210), so
+  // the numbers describe a page that has caught up with the wheel. Settle
+  // alone was never enough: it is DOM quiescence and offsets mutate
+  // nothing, so a slow smooth scroll can still be mid-flight at the read
+  // (docstring-taught as a rare {0,0}/partial cause) and an unrendered page
+  // answers with its PRE-wheel numbers. The container's delta when it
+  // moved; else the document's, which is where a wheel CHAINS when the pane
+  // is at its end (review round: reporting the untouched container's zero
+  // there called a page that visibly scrolled a measured nothing); else a
+  // measured zero naming the container when one was watched.
+  //
+  // scroll_moved therefore appears only where the measurement is
+  // trustworthy, and every path that withholds it now names itself in
+  // `scroll_unmeasured` instead of leaving a bare absence for the agent to
+  // interpret (#210). The values are a closed set: over_frame,
+  // not_rendering, no_frame, read_failed, budget_spent.
+  if (scrollWheeled) {
+    if (!scrollBaseline || !scrollSlotId) {
+      // The wheel went out but the BASELINE never read (a targetless wheel
+      // whose probe failed; the targeted paths refuse before dispatching).
+      // Before #210 this was the one dispatch that left no key at all,
+      // which is the bare absence the docstring now promises cannot happen.
+      extra.scroll_unmeasured = 'read_failed'
+    } else if (budgetSpent(budgetDeadline) || budgetLeft(budgetDeadline) < SCROLL_OBSERVE_MS + 1_000) {
+      // Not enough clock left to wait for a frame AND get the answer back,
+      // so the read is not even attempted. Without this the clamp below
+      // would hand the transport a deadline UNDER the expression's own
+      // window, cutting a healthy wait off as a hang and reporting
+      // `read_failed` for what is really a spent budget (review round;
+      // settle.ts avoids the same inversion from the other side, by
+      // clamping its PAGE-side bound and deriving the transport one above
+      // it, which a fixed window cannot do).
+      extra.scroll_unmeasured = 'budget_spent'
+    } else {
+      const after = await scrollAfter(objectId ? elementSession : tabId, scrollSlotId, scrollBaseline, budgetDeadline)
       const cd =
-        scrollBaseline.c && after.c
+        after && scrollBaseline.c && after.c
           ? { dx: after.c.l - scrollBaseline.c.l, dy: after.c.t - scrollBaseline.c.t }
           : null
       const dd =
-        scrollBaseline.d && after.d
+        after && scrollBaseline.d && after.d
           ? { dx: after.d.l - scrollBaseline.d.l, dy: after.d.t - scrollBaseline.d.t }
           : null
+      const fresh = after?.fresh === true
+      // A DIFFERENCE is positive evidence: the offsets can only differ if
+      // something scrolled after the baseline, and on a page that never
+      // rendered (a hidden tab handles its wheel on the main thread and
+      // updates scrollTop without painting) this is the only evidence
+      // there will ever be. It is reported with `scroll_stale` naming the
+      // state rather than withheld, because deleting it would cost the
+      // agent its only scroll feedback for the whole time a tab sits in
+      // the background, and this pass exists to remove a false ZERO, which
+      // is the half that stays withheld. What the flag warns about is
+      // MAGNITUDE and attribution, not the fact of movement: an unrendered
+      // read can under-report, or catch a wheel that landed late.
+      const staleReason = after?.vis && after.vis !== 'visible' ? 'not_rendering' : 'no_frame'
       if (cd && (cd.dx !== 0 || cd.dy !== 0)) {
         extra.scroll_moved = { ...cd, scroller: 'container' }
+        if (!fresh) extra.scroll_stale = staleReason
       } else if (dd && (dd.dx !== 0 || dd.dy !== 0)) {
         extra.scroll_moved = { ...dd, scroller: 'document' }
+        if (!fresh) extra.scroll_stale = staleReason
+      } else if (!after || (!cd && !dd)) {
+        // The world died, the slot went with a navigation, or both watched
+        // scrollers detached: nothing to subtract, and never a guess.
+        extra.scroll_unmeasured = 'read_failed'
+      } else if (scrollOverFrame) {
         // A wheel that landed where this read cannot watch scrolls a
         // document neither registered scroller covers (#203 QA round: the
         // frame visibly scrolled while the root's honest zero read as
@@ -4245,12 +4439,24 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         // the document one: until #208 the point paths never watched a
         // container, so `cd` could not be reached with the flag set, and
         // watching the pane under the point re-opened that door for an
-        // iframe sitting inside a scrollable pane (review round). Absence
-        // means unmeasured; a real movement still reports above.
-      } else if (cd && !scrollOverFrame) {
+        // iframe sitting inside a scrollable pane (review round). Ranked
+        // ABOVE the freshness reasons deliberately: it is the only reason
+        // that names a route the agent can take instead.
+        extra.scroll_unmeasured = 'over_frame'
+      } else if (!fresh) {
+        // A zero from a page that has not rendered since the wheel is the
+        // measured lie this pass was opened by: "did not move" and "has not
+        // landed yet" are the same reading, so neither is claimed.
+        extra.scroll_unmeasured = staleReason
+      } else if (cd) {
         extra.scroll_moved = { dx: 0, dy: 0, scroller: 'container' }
-      } else if (dd && !scrollOverFrame) {
+      } else if (dd) {
         extra.scroll_moved = { dx: 0, dy: 0, scroller: 'document' }
+      } else {
+        // Unreachable while the guard above catches an empty pair, and
+        // stated anyway: the alternative is a bare `else` that mints a
+        // measured zero out of no data if that guard is ever narrowed.
+        extra.scroll_unmeasured = 'read_failed'
       }
     }
   }

@@ -266,18 +266,32 @@ export async function resolveNodeInProbeWorld(
  * for probes whose callers keep their own degraded answer (describePoint's
  * null, viewportCentre's fallback centre, performWait's keep-polling).
  * Never falls back to the main world.
+ *
+ * `evaluate.awaitPromise` lets a probe that must OBSERVE the page over time
+ * (the scroll freshness race, #210) resolve its own promise before the value
+ * comes back, the way `settle.ts` already does on the main world. It carries
+ * the same rule as settle's: the expression must bound itself page-side, and
+ * the caller's transport deadline (`opts.deadlineMs`) must sit ABOVE that
+ * bound, or a healthy wait is cut off as a hang. A rejected promise lands in
+ * `exceptionDetails` and reports undefined, like any other failure here.
  */
 export async function evaluateInProbeWorld<T>(
   target: Cdp,
   expression: string,
   opts: SendCommandOpts = {},
+  evaluate: { awaitPromise?: boolean } = {},
 ): Promise<T | undefined> {
   try {
     const result = await withProbeWorld(target, async (contextId) => {
       const resp = await sendCommand<{ result?: { value?: T }; exceptionDetails?: unknown }>(
         target,
         'Runtime.evaluate',
-        { expression, contextId, returnByValue: true },
+        {
+          expression,
+          contextId,
+          returnByValue: true,
+          ...(evaluate.awaitPromise ? { awaitPromise: true } : {}),
+        },
         opts,
       )
       if (resp.exceptionDetails) return undefined

@@ -572,22 +572,40 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         watched and the one that moved is reported (a wheel at the end
         of a pane CHAINS to the page, and that is named "document";
         with a frame's document ref, "document" means THAT frame's
-        document, since that is the one being scrolled).
-        When the wheel lands where this cannot be measured, the zero is
-        withheld rather than reported: over an embedded frame, or with
-        the frame element itself as the ref (the frame's own scrolling
-        is not measured from outside; a page that really moved still
-        reports, and the frame's document ref measures it properly).
-        {0,0} is a
-        MEASURED nothing-moved (end of scroll, a pane that ignored the
-        wheel, or rarely a smooth animation still in flight at the
-        read); the key ABSENT means it could not be measured. A wheel
-        that moved some OTHER pane than the two watched reads {0,0}. A
-        rare "wheel_ack": "not_received" beside a successful scroll says
-        the browser mislaid the wheel's RECEIPT, not the wheel (a Chrome
-        quirk on wheel-heavy tabs): the scroll went in, the extension
-        self-heals the cost, and scroll_moved is the field to believe;
-        no "wheel_ack" key means the receipt arrived normally.
+        document, since that is the one being scrolled). {0,0} is a
+        MEASURED nothing-moved (end of scroll, or a pane that ignored
+        the wheel; more rarely a smooth scroll still animating, or a
+        wheel still queued behind the page's own handler); a wheel that
+        moved some OTHER pane than the two watched reads {0,0} too.
+        A ZERO is only ever reported off a page that has RENDERED since
+        the wheel and then held still through a second look a moment
+        later, which is what separates "did not move" from "has not
+        landed yet" (a backgrounded tab can hold a wheel and apply it
+        when it is shown again, so an instant read there answers about
+        a scroll that has not happened yet). When the page cannot be
+        watched at all, "scroll_unmeasured" says which way:
+        "over_frame" (the wheel went into an embedded frame, which
+        scrolls in its own space: target that frame's document ref to
+        measure it), "not_rendering" (the tab is minimised, covered or
+        backgrounded, so it is not painting and its offsets lag: switch
+        to it with chrome_tabs if it matters, though a window the user
+        has covered is theirs to raise, or just re-read the page to see
+        where it sits), "no_frame" (a visible page too busy to paint in
+        time: re-read), "read_failed" (the read could not complete: the
+        page navigated under the probe, the watched pane detached, or
+        the act's clock cut it short) and "budget_spent" (no time left
+        to measure). A DIFFERENCE is still reported from an unrendered
+        page, tagged "scroll_stale" with the same reason, since offsets
+        can only differ if something scrolled: trust that it moved,
+        treat the amount as a floor rather than a total. In every one
+        of these states the wheel WAS dispatched, so scrolling again to
+        compensate scrolls twice: re-read the page instead.
+        "wheel_ack": "not_received" beside a successful scroll says
+        the browser mislaid the wheel's RECEIPT, not the wheel (a
+        Chrome quirk on wheel-heavy tabs): the scroll went in, the
+        extension self-heals the cost, and it says nothing either way
+        about the measurement, which stands on its own. No "wheel_ack"
+        key means the receipt arrived normally.
         To bring a specific element into view, action="scroll_to" with
         its ref is still the direct verb.
     to_ref: drag destination.
