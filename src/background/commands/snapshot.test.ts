@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { __test, execSnapshot } from './snapshot'
 import * as snapshotRefs from '../snapshotRefs'
 import { resetForTests as resetDebugger } from '../debuggerSession'
+import { installNavWatch, resetForTests as resetNavWatch } from '../navWatch'
 import { resetForTests as resetWorlds } from '../worlds'
 
 const { formatTree } = __test
@@ -13,6 +14,7 @@ beforeEach(() => {
   snapshotRefs.resetForTests()
   resetDebugger()
   resetWorlds()
+  resetNavWatch()
 })
 
 function av(value: unknown): { value: unknown } {
@@ -337,6 +339,10 @@ function installLocalFramesMock(cfg: {
   frameTree?: FrameTreeFixture
   viewState?: unknown
   viewStateThrows?: boolean
+  /** What the document's own navigation timing entry answers (#187). */
+  httpStatus?: number | null
+  /** Fires when the status probe runs, for staging a mid-read navigation. */
+  onDocStatusProbe?: () => void
 }) {
   const mock = vi.fn(async (_target: unknown, method: string, params: Record<string, unknown> = {}) => {
     if (method === 'Accessibility.getFullAXTree') {
@@ -356,6 +362,10 @@ function installLocalFramesMock(cfg: {
             value: cfg.viewState ?? { modal_dialog: false, aria_modal: false, fullscreen: false },
           },
         }
+      }
+      if (expression.includes('nymDocStatus')) {
+        cfg.onDocStatusProbe?.()
+        return { result: { value: { http_status: cfg.httpStatus ?? null } } }
       }
       return { result: { value: undefined } }
     }
@@ -513,6 +523,65 @@ describe('same-process frame reads (reads-honesty pass)', () => {
     const result = await execSnapshot({ tab_id: 1, detail: 'interactive' })
     expect(result.ok).toBe(true)
     expect((result.data as { view_state?: unknown }).view_state).toBeUndefined()
+  })
+
+  it('carries the status the document itself reports, and omits it when unknown', async () => {
+    // An error PAGE commits like any other, so without this a read of a 404
+    // returns ordinary prose with nothing to say the load failed (#187).
+    installLocalFramesMock({ rootNodes, httpStatus: 500 })
+    const failed = await execSnapshot({ tab_id: 1, detail: 'interactive' })
+    expect((failed.data as { http_status?: number }).http_status).toBe(500)
+
+    installLocalFramesMock({ rootNodes, httpStatus: null })
+    const unknown = await execSnapshot({ tab_id: 1, detail: 'interactive' })
+    expect(
+      Object.keys(unknown.data as object),
+      'absent is unknown, never a claim the load was fine',
+    ).not.toContain('http_status')
+  })
+
+  it('withholds the status when a commit landed between the tree and the probe', async () => {
+    // The tree and the status come from DIFFERENT round trips, and
+    // `withProbeWorld` rebuilds its world in the new document on a
+    // context-gone error, so a navigation mid-read would silently answer with
+    // the NEW document's status: a soft 404 that redirects would lose its
+    // note, and a 404 committing under a good page would render one over it.
+    installNavWatch()
+    const commit = (
+      chrome.webNavigation!.onCommitted.addListener as unknown as ReturnType<typeof vi.fn>
+    ).mock.calls.at(-1)?.[0] as (d: { tabId: number; url: string; frameId: number }) => void
+    installLocalFramesMock({
+      rootNodes,
+      httpStatus: 404,
+      onDocStatusProbe: () => commit({ tabId: 1, url: 'https://elsewhere.test/', frameId: 0 }),
+    })
+
+    const result = await execSnapshot({ tab_id: 1, detail: 'interactive' })
+
+    expect(result.ok, 'the read itself still succeeds').toBe(true)
+    expect(
+      Object.keys(result.data as object),
+      'two documents, so the status describes neither with confidence',
+    ).not.toContain('http_status')
+  })
+
+  it('keeps the status on a SCOPED read, unlike the counts a subtree cannot support', async () => {
+    // The frame and control counts are withheld when scoped because a subtree
+    // cannot speak for the page. This claim is about the tab's MAIN DOCUMENT,
+    // and no scope can falsify it, so withholding it would lose a fact the
+    // read genuinely knows.
+    installLocalFramesMock({ rootNodes, httpStatus: 404 })
+    snapshotRefs.set(
+      1,
+      new Map([['e1', { backendNodeId: 42, role: 'button', name: 'OK' }]]),
+      'https://example.com',
+      1,
+    )
+
+    const scoped = await execSnapshot({ tab_id: 1, detail: 'interactive', scope_ref: '@e1' })
+
+    expect((scoped.data as { http_status?: number }).http_status).toBe(404)
+    expect((scoped.data as { control_ref_count?: number }).control_ref_count).toBeUndefined()
   })
 
   it('surfaces hidden-dropped counts in the payload', async () => {

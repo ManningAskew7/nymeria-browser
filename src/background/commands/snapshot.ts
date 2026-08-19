@@ -9,6 +9,8 @@ import {
   type LocalFrame,
   type LocalFrameTree,
 } from '../debuggerSession'
+import { DOC_STATUS_EXPRESSION, httpStatusField } from '../docStatus'
+import { commitSeq } from '../navWatch'
 import { sameDocumentUrl } from '../urlMatch'
 import { evaluateInProbeWorld, withProbeWorld } from '../worlds'
 import {
@@ -481,6 +483,11 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     return { ok: false, status: 'error', error: 'tab_id required' }
   }
   const detail = a.detail ?? 'interactive'
+  // Sampled BEFORE anything is read, so the status probe at the end of this
+  // command can prove it describes the document the tree came from. Unlike
+  // extract_text, which answers everything in ONE evaluation, this read is
+  // necessarily several round trips (#187 review round).
+  const commitSeqBefore = commitSeq(a.tab_id)
 
   // Scope, when asked for, is resolved to a real backend node and used as the
   // tree root. The previous implementation only probed that a selector
@@ -552,11 +559,31 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     scopeIsFrameOwner = strVal(scopeNode.role) === 'Iframe'
   }
 
-  // The collapse-honesty probe (see VIEW_STATE_EXPRESSION). Soft: no world,
-  // no note; the read itself is never blocked on it.
-  const viewState = await evaluateInProbeWorld<ViewState>(a.tab_id, VIEW_STATE_EXPRESSION)
+  // Two soft probes, together: independent questions, neither blocks the read,
+  // and one round trip beats two on every page read.
+  //
+  // The collapse-honesty probe (see VIEW_STATE_EXPRESSION), and the document's
+  // own HTTP status (#187, docStatus.ts). The status gets its own expression
+  // rather than riding the view-state one: that expression's contract is
+  // BOOLEANS ONLY, and one probe answering two unrelated questions is how a
+  // shared snippet drifts. Unlike the frame and control counts, the status
+  // rides a SCOPED read too, because the claim it supports is about the tab's
+  // main document and no scope can falsify that.
+  const [viewState, docStatus] = await Promise.all([
+    evaluateInProbeWorld<ViewState>(a.tab_id, VIEW_STATE_EXPRESSION),
+    evaluateInProbeWorld<{ http_status: number | null }>(a.tab_id, DOC_STATUS_EXPRESSION),
+  ])
   const viewConstrained =
     viewState != null && (viewState.modal_dialog || viewState.aria_modal || viewState.fullscreen)
+
+  // The status describes the document that answered the PROBE, and the tree
+  // came from an earlier round trip. A commit in between means they are two
+  // different documents, and `withProbeWorld` makes that silent rather than
+  // loud: it rebuilds the world in the NEW document and re-evaluates there.
+  // Both directions are real: a soft 404 that redirects would answer 200 and
+  // lose the note, and a 404 committing under a good page would render one
+  // over it. So a read that straddles a commit says nothing (review round).
+  const sameDocument = commitSeq(a.tab_id) === commitSeqBefore
 
   // Minting is serialized per tab and numbers continue from the tab's
   // monotonic counter: two reads never mint the same number, so a ref held
@@ -757,6 +784,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
         ref_count: allRefs.size,
         detail,
         url,
+        ...(sameDocument ? httpStatusField(docStatus?.http_status) : {}),
         // Frame counts are claims about THIS tree's sections, so a scoped
         // read (which deliberately renders none) reports none: emitting the
         // page's frame inventory there put a false "included" note outside

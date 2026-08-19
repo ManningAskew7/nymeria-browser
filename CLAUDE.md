@@ -560,6 +560,41 @@ POSTs results. Consequences:
   `extract_text.ts` module docstring, and the `chrome_read_text` row in
   `tools.md` all say that `css=` acts walk open shadow roots while this read
   does not. Remove them together.
+- A READ takes its HTTP status from the DOCUMENT, not from statusWatch
+  (`docStatus.ts`, #187, whose docstring carries the derivation). statusWatch
+  stays the NAVIGATION answer; for a read it needs the host grant, dies with
+  the worker, and has to be JOINED back to the document, where a same-URL
+  reload whose response has landed but not committed attributes the NEW status
+  to the OLD text. Traps: it is the tab's MAIN document even on a scoped read
+  (no scope can falsify that, unlike the frame and control counts); it survives
+  a pushState with its ORIGINAL value, so an SPA that 404s its shell and then
+  routes to real content still reports 404; and because `chrome_read_page`
+  needs several round trips, a commit between the tree and the probe withholds
+  it (`withProbeWorld` rebuilds its world in the new document, so the wrong
+  answer would be silent).
+- `GLOBAL_READ_SNIPPET` (`worlds.ts`) is the ONE way a probe body reads a
+  global: own descriptor first, `Window.prototype` second, never bare and never
+  by chain walk, because `<img name="x">` writes into the WindowProperties
+  object which precedes Window.prototype. Measured 2026-08-19: `performance`,
+  `getComputedStyle` AND `requestAnimationFrame` are all OWN properties of the
+  probe world's global and none is on `Window.prototype`, which is why
+  `act.ts`'s rAF read moved onto this helper (its old prototype-first lookup
+  never matched in Chrome, so the fallback it called "the test environment's
+  path" was production).
+- The text read COUNTS what it could not carry (`text_dropped_generated`,
+  #190; `TEXT_DROPPED_SNIPPET`'s docstring carries the measurements). Traps a
+  fresh session cannot re-derive: hidden elements STILL report generated
+  content, so the element gate is required, and it gates on
+  `checkVisibilityCSS` ALONE because `innerText` KEEPS an `opacity: 0`
+  element's text; the pseudo has its own box, so a `display: none` ::after is
+  no loss; computed `content` QUOTES literals and RESOLVES `attr()` but leaves
+  `counter()` alone, and `image-set(url("a.png") 1x)` carries a quoted
+  FILENAME, so only quoted runs at paren depth ZERO count as text; the scan
+  includes the ROOT (querySelectorAll is descendants-only) and caps at 5,000
+  elements, which makes the count a floor. The text itself is UNCHANGED:
+  inline markers would mean rebuilding innerText's layout rules, trading a
+  fidelity regression on every page for a fix on some. Fixture
+  `nymeria-qa-glyph-fixture-13.html` carries all six loss mechanisms.
 
 ## Check commands
 

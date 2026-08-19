@@ -51,6 +51,31 @@ import { frameIdOf, sendCommand, sessionOf, tabOf, type Cdp, type SendCommandOpt
  * only reachable from its own session.
  */
 
+/**
+ * Read a GLOBAL function or accessor without a chain lookup, for probe bodies.
+ *
+ * The general form of the one inversion the scroll-freshness pass measured
+ * (#210): `<img name="x">` writes into the WindowProperties object, which sits
+ * BEFORE `Window.prototype` in the global's prototype chain, so a bare `x` or a
+ * chain walk can find the forgery first. Own properties are found before the
+ * chain, so an own descriptor cannot be shadowed at all; the `Window.prototype`
+ * fallback covers the globals that live there instead.
+ *
+ * Measured 2026-08-19 against a page carrying `<img name="getComputedStyle">`
+ * plus assignments to `window.getComputedStyle`, `Window.prototype
+ * .getComputedStyle`, `window.performance` and `Element.prototype
+ * .checkVisibility`: in the probe world both globals resolved as OWN properties
+ * and every read returned the truth, while the same reads in the main world
+ * returned the page's forgeries.
+ */
+export const GLOBAL_READ_SNIPPET = `var nymGlobal = function (name) {
+    var d = null;
+    try { d = Object.getOwnPropertyDescriptor(globalThis, name); } catch (e) {}
+    if (!d) { try { d = Object.getOwnPropertyDescriptor(Window.prototype, name); } catch (e) {} }
+    if (!d) return undefined;
+    try { return d.get ? d.get.call(globalThis) : d.value; } catch (e) { return undefined; }
+  };`
+
 /** World for trust probes: geometry, hit tests, selectors, state reads. */
 export const PROBE_WORLD = 'nymeria_probe'
 /** World owned by delivery.ts; named here so the cache can host both. */

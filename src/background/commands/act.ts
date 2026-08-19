@@ -62,6 +62,7 @@ import { commitSeq, commitSince, navigationPending, waitForNavSignal } from '../
 import { cssResolveExpression, SELECTOR_INVALID, SELECTOR_MISS } from '../shadowWalk'
 import {
   evaluateInProbeWorld,
+  GLOBAL_READ_SNIPPET,
   probeWorldUnavailableError,
   resolveNodeInProbeWorld,
   withProbeWorld,
@@ -2291,14 +2292,17 @@ const SCROLL_OBSERVE_MS = SCROLL_FRESH_MS * 2 + SCROLL_RECHECK_MS
  *    later: only a zero pays that cost, and only after it does a zero mean
  *    "at rest" rather than "not yet".
  *
- * `requestAnimationFrame` is taken from `Window.prototype`'s own descriptor
- * because a bare lookup would find `<img name="requestAnimationFrame">`
- * first: named properties sit on the WindowProperties object, which
+ * `requestAnimationFrame` is read through `nymGlobal` (worlds.ts) rather than
+ * bare, because named properties sit on the WindowProperties object, which
  * precedes Window.prototype in the chain, so walking the chain (what the
- * document read does) would find the FORGERY here. Interface objects are
- * own properties of the global, so `Window` itself cannot be shadowed.
- * `setTimeout` needs no such care: neither a no-op nor an instant-fire
- * forgery can produce a fresh verdict, only a withheld one. */
+ * document read does) would find `<img name="requestAnimationFrame">` first.
+ * This site used to try `Window.prototype` and then fall back to a bare read,
+ * described as the test environment's path; measured 2026-08-19, rAF is an OWN
+ * property of the probe world's global and is NOT on `Window.prototype`, so
+ * the fallback was the production path and the comment had it backwards. The
+ * shared helper takes own-descriptor first and covers both. `setTimeout` needs
+ * no such care: neither a no-op nor an instant-fire forgery can produce a
+ * fresh verdict, only a withheld one. */
 function scrollAfterExpression(
   id: string,
   baseline: { c: ScrollPair | null; d: ScrollPair | null } | null,
@@ -2306,21 +2310,15 @@ function scrollAfterExpression(
   return `(function(){
   ${SCROLL_METRIC_SNIPPET}
   ${CHAIN_READ_SNIPPET}
+  ${GLOBAL_READ_SNIPPET}
   var reg = globalThis.__nymScroll;
   var s = reg && reg[${JSON.stringify(id)}];
   if (reg) { delete reg[${JSON.stringify(id)}]; }
   if (!s) return null;
   var base = ${JSON.stringify(baseline ?? { c: null, d: null })};
   var rafOf = function () {
-    try {
-      var d = Object.getOwnPropertyDescriptor(Window.prototype, 'requestAnimationFrame');
-      if (d && typeof d.value === 'function') return d.value;
-    } catch (e) {}
-    // Pristine prototypes always carry it in a real isolated world, so this
-    // is the test environment's path, the same shape as the metric read's
-    // own-property fallback, not a forgery window.
-    var own = globalThis.requestAnimationFrame;
-    return typeof own === 'function' ? own : null;
+    var fn = nymGlobal('requestAnimationFrame');
+    return typeof fn === 'function' ? fn : null;
   };
   var readNow = function (fresh) {
     // The SAME hardened read as the baseline, deliberately: a mismatched pair

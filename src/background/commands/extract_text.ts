@@ -1,6 +1,7 @@
 import type { CommandResult } from '../../shared/types'
 import { sendCommand } from '../debuggerSession'
-import { probeWorldUnavailableError, withProbeWorld } from '../worlds'
+import { DOC_STATUS_SNIPPET, httpStatusField } from '../docStatus'
+import { GLOBAL_READ_SNIPPET, probeWorldUnavailableError, withProbeWorld } from '../worlds'
 
 /**
  * Visible text of a page or of one region.
@@ -27,6 +28,11 @@ import { probeWorldUnavailableError, withProbeWorld } from '../worlds'
  * Root document only: no frame parameter, so an iframe's text is not part of
  * this answer (chrome_read_page is the frame-aware reader).
  *
+ * The read answers THREE things in one evaluation, so all three describe the
+ * same document at the same instant: the text, the document's own HTTP status
+ * (`docStatus.ts`, #187), and how much meaning the text could not carry
+ * (`TEXT_DROPPED_SNIPPET`, #190).
+ *
  * STOPGAP (v0.9.0), to be removed by the selector-alignment pass: the act
  * path's `css=` resolution walks open shadow roots and this read does not, so
  * one selector can act and then fail to read. Extending the walk to here is
@@ -41,12 +47,129 @@ interface ExtractTextArgs {
   max_chars?: number
 }
 
+interface TextDropped {
+  generated: number
+  capped: boolean
+}
+
 interface PageText {
   found: boolean
   text: string
   url: string
   title: string
+  status: number | null
+  /** Null when the read found no root, and when the scan itself threw. */
+  dropped: TextDropped | null
 }
+
+/**
+ * Elements the loss scan will walk before it stops and says so.
+ *
+ * Measured 2026-08-19 on a 12,478-element Wikipedia article: the full walk
+ * cost ~200ms of the USER's browser main thread, and stopping here cost
+ * ~101ms. Deliberately an element count rather than a time budget: a budget
+ * would adapt better but makes the answer nondeterministic, and this series
+ * spent a whole pass (#180) buying determinism back.
+ */
+const TEXT_SCAN_CAP = 5000
+
+/**
+ * Count the meaning this read could not carry (#190).
+ *
+ * `innerText` returns rendered TEXT NODES, so a glyph drawn by CSS generated
+ * content contributes nothing and leaves no trace. Measured live: a chess move
+ * list read as `1. f6 / 2. e4 / 3. c5`, where the real moves were 1...Nf6,
+ * 2...Ne4, 3...Nc5, and a block of rating stars, status pills and icon buttons
+ * read as two order numbers and nothing else. The answer is not degraded, it is
+ * WRONG, and nothing about its shape says so.
+ *
+ * Generated content ONLY, and that is a measurement, not a scope cut. The same
+ * probe counted images on real pages: 267 on one Wikipedia article, 36 on BBC
+ * News, which would fire a large meaningless number on most of the web. The
+ * strict generated-content count instead measured 0 on example.com, Hacker News
+ * and BBC News, 1 on that Wikipedia article, and 11 on the glyph fixture, so it
+ * is silent on ordinary prose and loud exactly where the loss lives. Images and
+ * `alt` text stay in the read's GUIDANCE, which already points at
+ * chrome_read_page for attribute-borne content.
+ *
+ * Four filters, each measured rather than assumed:
+ *
+ * - `display:none` and `visibility:hidden` elements STILL report their
+ *   generated content, so an element gate is required or hidden decoration
+ *   inflates the count. It gates on `checkVisibilityCSS` ALONE, deliberately:
+ *   `innerText` includes the text of an `opacity: 0` element (measured
+ *   `"FADE  SHOWN"`), so a glyph there is lost exactly like any other, and
+ *   `checkOpacity` would have skipped it. The gate mirrors what innerText
+ *   itself drops, not what a human can see.
+ * - The PSEUDO-element has its own box, and its computed style is already in
+ *   hand: `.tip::after { content: attr(data-tip); display: none }` is the
+ *   ordinary tooltip idiom and renders nothing, so it lost nothing.
+ * - Text is counted by a character scan rather than pattern-matching, because
+ *   `content` takes any `<image>`: `image-set(url("a.png") 1x)` carries a
+ *   quoted string that is a FILENAME, and gradients, `element()` and the
+ *   quote keywords carry no text at all. Only quoted runs at paren depth ZERO
+ *   are text, which also keeps a literal `"(1)"` countable.
+ * - `counter()` is the one text source computed style leaves unresolved, so it
+ *   is detected by name.
+ *
+ * The loose version of this filter counted 1,102 on that same Wikipedia page.
+ */
+const TEXT_DROPPED_SNIPPET = `${GLOBAL_READ_SNIPPET}
+  var nymTextAdds = function (content) {
+    // Quoted runs OUTSIDE any function call are the text a pseudo adds.
+    if (/\\bcounters?\\(/.test(content)) return true;
+    var depth = 0;
+    var quoted = false;
+    var text = '';
+    for (var c = 0; c < content.length; c++) {
+      var ch = content.charAt(c);
+      if (quoted) {
+        if (ch === '"') { quoted = false; continue; }
+        if (ch === '\\\\') { c++; continue; }
+        if (depth === 0) text += ch;
+        continue;
+      }
+      if (ch === '"') { quoted = true; continue; }
+      if (ch === '(') depth++;
+      else if (ch === ')' && depth > 0) depth--;
+    }
+    return text.replace(/\\s/g, '') !== '';
+  };
+  var nymTextDropped = function (root) {
+    var out = { generated: 0, capped: false };
+    try {
+      var gcs = nymGlobal('getComputedStyle');
+      if (typeof gcs !== 'function') return out;
+      var all = Element.prototype.querySelectorAll.call(root, '*');
+      // The ROOT itself counts: querySelectorAll returns DESCENDANTS only, and
+      // a scoped read of \`#price\` whose own ::before draws the currency symbol
+      // is the narrowest and most-trusted read shape there is (review round).
+      var total = all.length + 1;
+      out.capped = total > ${TEXT_SCAN_CAP};
+      var limit = out.capped ? ${TEXT_SCAN_CAP} : total;
+      var visD = Object.getOwnPropertyDescriptor(Element.prototype, 'checkVisibility');
+      var canSee = visD && typeof visD.value === 'function' ? visD.value : null;
+      for (var i = 0; i < limit; i++) {
+        var el = i === 0 ? root : all[i - 1];
+        if (canSee) {
+          var visible = true;
+          try { visible = canSee.call(el, { checkVisibilityCSS: true }); } catch (e) {}
+          if (!visible) continue;
+        }
+        for (var p = 0; p < 2; p++) {
+          var style = null;
+          try { style = gcs.call(globalThis, el, p ? '::after' : '::before'); } catch (e) { continue; }
+          if (!style) continue;
+          var content = style.content;
+          if (typeof content !== 'string' || content === 'none' || content === 'normal') continue;
+          if (style.display === 'none' || style.visibility === 'hidden') continue;
+          if (!nymTextAdds(content)) continue;
+          out.generated++;
+        }
+      }
+    } catch (e) {}
+    return out;
+  };`
 
 export async function execExtractText(args: unknown): Promise<CommandResult> {
   const a = args as ExtractTextArgs
@@ -60,6 +183,8 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
       'Runtime.evaluate',
       {
         expression: `(function(){
+      ${DOC_STATUS_SNIPPET}
+      ${TEXT_DROPPED_SNIPPET}
       const sel = ${selectorLiteral};
       const read = function (proto, name, obj) {
         const d = Object.getOwnPropertyDescriptor(proto, name);
@@ -68,10 +193,11 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
       const url = location.href;
       const rawTitle = read(Document.prototype, 'title', document);
       const title = typeof rawTitle === 'string' ? rawTitle : '';
+      const status = nymDocStatus();
       const root = sel
         ? Document.prototype.querySelector.call(document, sel)
         : read(Document.prototype, 'body', document);
-      if (!root) return { found: false, text: '', url: url, title: title };
+      if (!root) return { found: false, text: '', url: url, title: title, status: null, dropped: null };
       const raw =
         root instanceof HTMLElement
           ? read(HTMLElement.prototype, 'innerText', root)
@@ -81,6 +207,8 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
         text: typeof raw === 'string' ? raw : '',
         url: url,
         title: title,
+        status: status,
+        dropped: nymTextDropped(root),
       };
     })()`,
         contextId,
@@ -122,6 +250,35 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
   return {
     ok: true,
     status: 'success',
-    data: { text, truncated, url: value.url, title: value.title },
+    data: {
+      text,
+      truncated,
+      url: value.url,
+      title: value.title,
+      ...httpStatusField(value.status),
+      ...droppedFields(value.dropped),
+    },
   }
 }
+
+/**
+ * The loss fields, or nothing at all.
+ *
+ * A zero renders no note, so it ships no key: an ordinary prose page pays
+ * neither the payload nor the sentence. The cap flag rides only ALONGSIDE a
+ * count, where it turns the number into a floor. A capped walk that found
+ * nothing stays silent on purpose: the alternative renders "some of this page
+ * was not scanned" on every large page, which is the wallpaper this count was
+ * shaped to avoid.
+ */
+function droppedFields(dropped: TextDropped | null | undefined): Record<string, unknown> {
+  const generated = dropped?.generated
+  if (typeof generated !== 'number' || !Number.isInteger(generated) || generated <= 0) return {}
+  return {
+    text_dropped_generated: generated,
+    ...(dropped?.capped === true ? { text_dropped_capped: true } : {}),
+  }
+}
+
+/** Internal seams for unit tests; not part of the command's contract. */
+export const __test = { TEXT_DROPPED_SNIPPET, TEXT_SCAN_CAP }

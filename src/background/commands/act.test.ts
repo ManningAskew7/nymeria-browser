@@ -5447,20 +5447,20 @@ describe('scroll probes (executed in-page)', () => {
     // the test that fails when the mechanism is deleted.
     document.body.innerHTML = '<span id="target">x</span>'
     const target = document.getElementById('target') as Element
-    const proto = Object.getOwnPropertyDescriptor(Window.prototype, 'requestAnimationFrame')
-    const own = Object.getOwnPropertyDescriptor(globalThis, 'requestAnimationFrame')
     const neverFires = vi.fn(() => 1)
-    Object.defineProperty(Window.prototype, 'requestAnimationFrame', {
-      value: neverFires,
-      configurable: true,
-      writable: true,
-    })
+    // Staged AFTER useFakeTimers and handed back BEFORE useRealTimers,
+    // deliberately: vitest's fake timers swap the global rAF for their own,
+    // and the probe reads the global's OWN descriptor (measured: that is
+    // where Chrome keeps it), so a stub installed first would be overwritten
+    // and one restored last would outlive the test and strand every later
+    // test with no rAF at all.
+    vi.useFakeTimers()
+    const faked = Object.getOwnPropertyDescriptor(globalThis, 'requestAnimationFrame')
     Object.defineProperty(globalThis, 'requestAnimationFrame', {
       value: neverFires,
       configurable: true,
       writable: true,
     })
-    vi.useFakeTimers()
     try {
       runBase(target, 'noframe1')
       const pending = runAfter('noframe1')
@@ -5473,11 +5473,9 @@ describe('scroll probes (executed in-page)', () => {
       // may claim, the probe never decides for it.
       expect(after?.d).not.toBeNull()
     } finally {
-      vi.useRealTimers()
-      if (proto) Object.defineProperty(Window.prototype, 'requestAnimationFrame', proto)
-      else delete (Window.prototype as unknown as Record<string, unknown>).requestAnimationFrame
-      if (own) Object.defineProperty(globalThis, 'requestAnimationFrame', own)
+      if (faked) Object.defineProperty(globalThis, 'requestAnimationFrame', faked)
       else delete (globalThis as unknown as Record<string, unknown>).requestAnimationFrame
+      vi.useRealTimers()
     }
   })
 
@@ -5574,26 +5572,26 @@ describe('scroll probes (executed in-page)', () => {
     expect(after?.c).toEqual({ t: 300, l: 0 })
   })
 
-  it('the freshness proof comes from Window.prototype, not a page-supplied rAF', async () => {
-    // Named properties follow you into an isolated world and they sit on the
-    // WindowProperties object, which PRECEDES Window.prototype in the chain:
-    // `<img name="requestAnimationFrame">` would win a plain lookup and could
-    // hand back a fresh verdict for a page that never rendered. An own
-    // property on the global is the same shadowing, only stronger, so a read
-    // that ignores it a fortiori ignores the named one. happy-dom carries no
-    // Window.prototype descriptor of its own, which is why the real one is
-    // installed here rather than assumed.
+  it('the freshness proof ignores an rAF shadowed onto the prototype chain', async () => {
+    // Named properties follow you into an isolated world and land on the
+    // WindowProperties object, which PRECEDES Window.prototype in the chain,
+    // so a chain walk finds `<img name="requestAnimationFrame">` first and
+    // could hand back a fresh verdict for a page that never rendered.
+    // Measured 2026-08-19: in the probe world rAF is an OWN property of the
+    // global and is NOT on Window.prototype, so an own-descriptor read is
+    // both the real lookup and the unshadowable one.
     document.body.innerHTML = '<span id="target">x</span>'
     const target = document.getElementById('target') as Element
     const hostile = vi.fn()
-    const proto = Object.getOwnPropertyDescriptor(Window.prototype, 'requestAnimationFrame')
+    const chain = Object.getPrototypeOf(globalThis)
+    const shadowed = Object.getOwnPropertyDescriptor(chain, 'requestAnimationFrame')
     const own = Object.getOwnPropertyDescriptor(globalThis, 'requestAnimationFrame')
-    Object.defineProperty(Window.prototype, 'requestAnimationFrame', {
+    Object.defineProperty(globalThis, 'requestAnimationFrame', {
       value: (cb: () => void) => setTimeout(cb, 0) as unknown as number,
       configurable: true,
       writable: true,
     })
-    Object.defineProperty(globalThis, 'requestAnimationFrame', {
+    Object.defineProperty(chain, 'requestAnimationFrame', {
       value: hostile,
       configurable: true,
       writable: true,
@@ -5604,8 +5602,8 @@ describe('scroll probes (executed in-page)', () => {
       expect(after?.fresh).toBe(true)
       expect(hostile).not.toHaveBeenCalled()
     } finally {
-      if (proto) Object.defineProperty(Window.prototype, 'requestAnimationFrame', proto)
-      else delete (Window.prototype as unknown as Record<string, unknown>).requestAnimationFrame
+      if (shadowed) Object.defineProperty(chain, 'requestAnimationFrame', shadowed)
+      else delete (chain as Record<string, unknown>).requestAnimationFrame
       if (own) Object.defineProperty(globalThis, 'requestAnimationFrame', own)
       else delete (globalThis as unknown as Record<string, unknown>).requestAnimationFrame
     }
