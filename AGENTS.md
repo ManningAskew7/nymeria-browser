@@ -374,8 +374,12 @@ POSTs results. Consequences:
   confident {0,0}s against a page that had moved 500px. (2) A
   BACKGROUNDED TAB HOLDS ITS WHEELS: QA wheeled a hidden tab three times
   (no movement at all, ground truth flat), and all 1500px landed the
-  moment the tab was shown, long after those acts answered. So the
-  after-read waits for two animation frames (`awaitPromise` forwarded
+  moment the tab was shown, long after those acts answered. QA verified
+  the shipped fix the same way (three backgrounded scrolls, each
+  `not_rendering` with no number, then 500 + 3x500 = 2000 exactly on
+  activation): a held wheel is SPENT, so an agent that resends one it
+  thinks failed lands both, which is what the copy now warns about. So
+  the after-read waits for two animation frames (`awaitPromise` forwarded
   through `evaluateInProbeWorld`, which settle.ts already proved on the
   same sendCommand), and a page that rendered but shows NOTHING gets a
   second look 150ms later; only a zero pays that cost. A hidden page
