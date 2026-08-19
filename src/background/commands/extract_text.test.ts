@@ -25,6 +25,10 @@ interface PageFixture {
   status?: number | null
   /** What the loss scan counted (#190). */
   dropped?: { generated: number; capped: boolean } | null
+  /** Which candidates of a selector LIST the read root satisfies (#193). */
+  matched?: string | null
+  /** How many elements the whole selector matched (#193). */
+  matchCount?: number | null
 }
 
 function installCdpMock(page: PageFixture = {}) {
@@ -47,6 +51,8 @@ function installCdpMock(page: PageFixture = {}) {
             // nothing lost, so a test that cares about either says so.
             status: page.status === undefined ? 200 : page.status,
             dropped: page.dropped === undefined ? { generated: 0, capped: false } : page.dropped,
+            matched: page.matched === undefined ? null : page.matched,
+            matchCount: page.matchCount === undefined ? null : page.matchCount,
           },
         },
       }
@@ -279,6 +285,40 @@ describe('execExtractText', () => {
     const expression = String((evaluates(mock)[0][2] as { expression: string }).expression)
     expect(expression).toContain("nymGlobal('getComputedStyle')")
     expect(expression, 'a bare call is the shadowable one').not.toMatch(/[^'"]getComputedStyle\(/)
+  })
+})
+
+describe('the selector count and identity on the payload', () => {
+  it('carries how many the selector matched, under the tree read\'s own key', async () => {
+    installCdpMock({ matchCount: 30 })
+
+    const result = await execExtractText({ tab_id: TAB, selector: '.athing' })
+
+    expect((result.data as { scope_match_count?: number }).scope_match_count).toBe(30)
+  })
+
+  it('ships no count for a whole-page read', async () => {
+    installCdpMock({ matchCount: null })
+
+    const result = await execExtractText({ tab_id: TAB })
+
+    expect('scope_match_count' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('ships no identity when the read root satisfied no candidate', async () => {
+    installCdpMock({ matched: null })
+
+    const result = await execExtractText({ tab_id: TAB, selector: '.a' })
+
+    expect('selector_matched' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('carries the identity when there was one', async () => {
+    installCdpMock({ matched: '.move-list' })
+
+    const result = await execExtractText({ tab_id: TAB, selector: '.a, .move-list' })
+
+    expect((result.data as { selector_matched?: string }).selector_matched).toBe('.move-list')
   })
 })
 

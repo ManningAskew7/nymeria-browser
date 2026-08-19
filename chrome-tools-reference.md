@@ -1279,7 +1279,12 @@ One read that says whether a Chrome tab is healthy and what state it is in.
     chrome_network and a throwaway action. It has NO side effects: it does not
     attach the tab, start capture, or touch the page.
 
-    The payload carries: the tab itself (url, title, load status); whether the
+    The payload carries: extension_version, the build that EXECUTED this
+    command, so a round verifying a just-shipped capability can tell "broken"
+    from "not deployed yet" (a build too old to report it gets a note naming
+    the version it announced when it last connected, which is a weaker claim
+    and says so); the tab itself (url,
+    title, load status); whether the
     debugger is attached and whether capture ever ran this worker life;
     console/network buffer sizes (unfiltered, up to 200 per tab; a filtered
     read like chrome_console's errors-only default may return fewer) and,

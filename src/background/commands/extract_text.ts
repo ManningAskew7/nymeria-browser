@@ -1,6 +1,7 @@
 import type { CommandResult } from '../../shared/types'
 import { sendCommand } from '../debuggerSession'
 import { DOC_STATUS_SNIPPET, httpStatusField } from '../docStatus'
+import { SELECTOR_IDENTITY_SNIPPET } from '../selectorIdentity'
 import { GLOBAL_READ_SNIPPET, probeWorldUnavailableError, withProbeWorld } from '../worlds'
 
 /**
@@ -60,6 +61,10 @@ interface PageText {
   status: number | null
   /** Null when the read found no root, and when the scan itself threw. */
   dropped: TextDropped | null
+  /** The parts of a comma-separated selector the read root satisfies. */
+  matched: string | null
+  /** How many elements the whole selector matched; null for a whole-page read. */
+  matchCount: number | null
 }
 
 /**
@@ -185,6 +190,7 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
         expression: `(function(){
       ${DOC_STATUS_SNIPPET}
       ${TEXT_DROPPED_SNIPPET}
+      ${SELECTOR_IDENTITY_SNIPPET}
       const sel = ${selectorLiteral};
       const read = function (proto, name, obj) {
         const d = Object.getOwnPropertyDescriptor(proto, name);
@@ -197,7 +203,11 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
       const root = sel
         ? Document.prototype.querySelector.call(document, sel)
         : read(Document.prototype, 'body', document);
-      if (!root) return { found: false, text: '', url: url, title: title, status: null, dropped: null };
+      if (!root) return { found: false, text: '', url: url, title: title, status: null, dropped: null, matched: null, matchCount: 0 };
+      // No try needed: an invalid selector already threw at the querySelector
+      // above, taking the whole evaluation into exceptionDetails, so this can
+      // only run on a selector the engine accepted (review round).
+      var matchCount = sel ? Document.prototype.querySelectorAll.call(document, sel).length : null;
       const raw =
         root instanceof HTMLElement
           ? read(HTMLElement.prototype, 'innerText', root)
@@ -209,6 +219,11 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
         title: title,
         status: status,
         dropped: nymTextDropped(root),
+        // Which of the candidates answered, and how many elements the whole
+        // selector matched. The count uses the tree read's key downstream, so
+        // one backend sentence serves both readers.
+        matched: sel ? nymSelectorIdentity(root, sel) : null,
+        matchCount: matchCount,
       };
     })()`,
         contextId,
@@ -257,6 +272,13 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
       title: value.title,
       ...httpStatusField(value.status),
       ...droppedFields(value.dropped),
+      // The tree read's key, deliberately: one backend sentence then serves
+      // both readers, and a third vocabulary for "how many did the selector
+      // match" would be worse than the two that already exist (#193).
+      ...(typeof value.matchCount === 'number' && value.matchCount > 0
+        ? { scope_match_count: value.matchCount }
+        : {}),
+      ...(value.matched ? { selector_matched: value.matched } : {}),
     },
   }
 }

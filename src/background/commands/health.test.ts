@@ -88,6 +88,30 @@ describe('execHealth', () => {
     expect(result.error).toMatch(/chrome_tabs/)
   })
 
+  it('names which extension build answered', async () => {
+    // Nothing else in any payload carries it, and the fact is otherwise
+    // knowable only at a `chrome_reload_extension` boundary, which resets
+    // driving state. A round on 2026-08-19 drove a stale build for want of
+    // this and reported two false failures (#216).
+    const result = await execHealth({ tab_id: TAB })
+
+    expect((result.data as { extension_version?: string }).extension_version).toBe('9.9.9')
+  })
+
+  it('reports NO version rather than a placeholder when the manifest cannot answer', async () => {
+    // An agent gates on this, so "unknown" would be a value to compare
+    // against. Absence is honest everywhere else in this payload.
+    const saved = chrome.runtime.getManifest
+    ;(chrome.runtime as { getManifest?: unknown }).getManifest = undefined
+    try {
+      const result = await execHealth({ tab_id: TAB })
+
+      expect('extension_version' in (result.data as Record<string, unknown>)).toBe(false)
+    } finally {
+      chrome.runtime.getManifest = saved
+    }
+  })
+
   it('reports a never-driven tab honestly, and does NOT attach it', async () => {
     // The whole point of the read: no side effects. An attach here would
     // start capture the caller did not ask for and flip the very state

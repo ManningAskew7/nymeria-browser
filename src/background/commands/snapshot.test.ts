@@ -234,7 +234,10 @@ describe('monotonic minting at the exec level (#160)', () => {
    * `querySelectorAll(...).length` answers; `resolves` is whether the
    * follow-up `querySelector` still finds it.
    */
-  function installScopeMock(count: number, opts: { resolves?: boolean } = {}): string[] {
+  function installScopeMock(
+    count: number,
+    opts: { resolves?: boolean; matched?: string | null } = {},
+  ): string[] {
     const seen: string[] = []
     chrome.debugger.sendCommand = (async (_t: unknown, method: string, params?: unknown) => {
       if (method === 'Page.getFrameTree') return { frameTree: { frame: { id: 'frame-root' } } }
@@ -242,7 +245,9 @@ describe('monotonic minting at the exec level (#160)', () => {
       if (method === 'Runtime.evaluate') {
         const expression = (params as { expression: string }).expression
         seen.push(expression)
-        if (expression.includes('querySelectorAll')) return { result: { value: count } }
+        if (expression.includes('querySelectorAll')) {
+          return { result: { value: { count, matched: opts.matched ?? null } } }
+        }
         return opts.resolves === false
           ? { result: { subtype: 'null' } }
           : { result: { objectId: 'node-obj' } }
@@ -297,6 +302,51 @@ describe('monotonic minting at the exec level (#160)', () => {
     const result = await execSnapshot({ tab_id: 1, scope_selector: '#region' })
 
     expect((result.data as { frames_oopif?: number }).frames_oopif).toBeUndefined()
+  })
+
+  it('names which candidate of a selector LIST the scope answered with', async () => {
+    // #193 shipped this on the text read alone, which left the reader an
+    // agent ACTS from unable to say which of several candidates it used: the
+    // same complaint, on the surface where it matters more (review round).
+    installScopeMock(1, { matched: '.move-list' })
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: '.a, .move-list' })
+
+    expect((result.data as { selector_matched?: string }).selector_matched).toBe('.move-list')
+  })
+
+  it('ships no identity when the page answered something that is not a string', async () => {
+    // It renders OUTSIDE the untrusted fence downstream, so a payload that is
+    // not the shape promised must drop out here rather than be rendered.
+    installScopeMock(1, { matched: 42 as unknown as string })
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: '.a, .b' })
+
+    expect('selector_matched' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('ships no identity when the scope was not a list', async () => {
+    installScopeMock(1, { matched: null })
+
+    const result = await execSnapshot({ tab_id: 1, scope_selector: '#region' })
+
+    expect('selector_matched' in (result.data as Record<string, unknown>)).toBe(false)
+  })
+
+  it('takes the identity from the element it actually rooted at', async () => {
+    // querySelector answers with the first match and the identity must
+    // describe THAT element, so both come from the same evaluation over
+    // `all[0]` rather than two reads that could straddle a mutation.
+    const seen = installScopeMock(3, { matched: '.b' })
+
+    await execSnapshot({ tab_id: 1, scope_selector: '.a, .b' })
+
+    // ONE evaluate carries both, so a mutation between them cannot make the
+    // identity describe a different element than the count.
+    const scoping = seen.filter((e) => e.includes('nymSelectorIdentity'))
+    expect(scoping).toHaveLength(1)
+    expect(scoping[0]).toContain('querySelectorAll')
+    expect(scoping[0]).toContain('all[0]')
   })
 
   it('a scope that matches nothing names both limits of a scope, and stops early', async () => {

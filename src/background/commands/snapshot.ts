@@ -11,6 +11,7 @@ import {
 } from '../debuggerSession'
 import { DOC_STATUS_EXPRESSION, httpStatusField } from '../docStatus'
 import { commitSeq } from '../navWatch'
+import { SELECTOR_IDENTITY_SNIPPET } from '../selectorIdentity'
 import { sameDocumentUrl } from '../urlMatch'
 import { evaluateInProbeWorld, withProbeWorld } from '../worlds'
 import {
@@ -417,6 +418,7 @@ async function resolveScopeNode(
   frameTargetId?: string
   frameUrl?: string
   matchCount?: number
+  matched?: string
   error?: string
 }> {
   if (scopeRef) {
@@ -445,11 +447,24 @@ async function resolveScopeNode(
   // looks like the whole of what was asked for. The count also validates the
   // selector, so a miss costs one round trip instead of two (review round).
   const counted = await withProbeWorld(tabId, (contextId) =>
-    sendCommand<{ result?: { value?: unknown }; exceptionDetails?: unknown }>(
+    sendCommand<{
+      result?: { value?: { count?: unknown; matched?: unknown } }
+      exceptionDetails?: unknown
+    }>(
       tabId,
       'Runtime.evaluate',
       {
-        expression: `document.querySelectorAll(${JSON.stringify(scopeSelector)}).length`,
+        // Count AND identity in one evaluation, so both describe the same
+        // document at the same instant, and the text read's rule cannot drift
+        // from this one (#193 review round: the identity landed on the text
+        // read alone, leaving the reader an agent ACTS from unable to say
+        // which of several candidates it answered with).
+        expression: `(function(){
+          ${SELECTOR_IDENTITY_SNIPPET}
+          var sel = ${JSON.stringify(scopeSelector)};
+          var all = document.querySelectorAll(sel);
+          return { count: all.length, matched: all.length ? nymSelectorIdentity(all[0], sel) : null };
+        })()`,
         returnByValue: true,
         contextId,
       },
@@ -470,7 +485,9 @@ async function resolveScopeNode(
   if (counted.exceptionDetails) {
     return { backendNodeId: null, error: `not a valid CSS selector: ${scopeSelector}` }
   }
-  const matchCount = typeof counted.result?.value === 'number' ? counted.result.value : 0
+  const value = counted.result?.value
+  const matchCount = typeof value?.count === 'number' ? value.count : 0
+  const matched = typeof value?.matched === 'string' ? value.matched : undefined
   if (matchCount < 1) {
     // The two limits of a SCOPE ride the miss, the way extract_text's own
     // selector miss carries its asymmetry: this resolves in the top
@@ -525,7 +542,7 @@ async function resolveScopeNode(
   if (backendNodeId == null) {
     return { backendNodeId: null, error: 'could not resolve the scope element' }
   }
-  return { backendNodeId, matchCount }
+  return { backendNodeId, matchCount, matched }
 }
 
 export async function execSnapshot(args: unknown): Promise<CommandResult> {
@@ -548,6 +565,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
   let scopeFrameTargetId: string | undefined
   let scopeFrameUrl: string | undefined
   let scopeMatchCount: number | undefined
+  let scopeMatched: string | undefined
   if (a.scope_ref || a.scope_selector) {
     const scoped = await resolveScopeNode(a.tab_id, a.scope_ref, a.scope_selector)
     if (scoped.error) return { ok: false, status: 'error', error: scoped.error }
@@ -555,6 +573,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
     scopeFrameTargetId = scoped.frameTargetId
     scopeFrameUrl = scoped.frameUrl
     scopeMatchCount = scoped.matchCount
+    scopeMatched = scoped.matched
   }
 
   // A scope ref inside a frame re-roots INSIDE that frame: an OOPIF's tree
@@ -860,6 +879,7 @@ export async function execSnapshot(args: unknown): Promise<CommandResult> {
         // is rooted at the first of them. Absent on a ref scope, which names
         // one element by construction.
         ...(scopeMatchCount != null ? { scope_match_count: scopeMatchCount } : {}),
+        ...(scopeMatched ? { selector_matched: scopeMatched } : {}),
         // Frame counts stay withheld when scoped: they are claims about THIS
         // tree's sections, and a scoped read deliberately renders none, so
         // emitting the page's frame inventory there put a false "included"

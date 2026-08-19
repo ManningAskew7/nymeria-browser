@@ -65,6 +65,22 @@ function age(now: number, at: number): number {
   return Math.max(0, now - at)
 }
 
+/**
+ * Which build EXECUTED this command, or nothing.
+ *
+ * Absence is honest everywhere in this payload, and a version is no
+ * exception: the optional-call shape matches `reload_extension.ts`, the only
+ * other reader of the manifest, because a worker that cannot answer must say
+ * nothing rather than report a placeholder an agent would gate on. The
+ * backend has its own weaker answer (the version announced at SSE subscribe)
+ * and renders it only when this key is missing, which is what an extension
+ * predating this field looks like.
+ */
+function extensionVersionField(): Record<string, string> {
+  const version = chrome.runtime.getManifest?.()?.version
+  return typeof version === 'string' && version ? { extension_version: version } : {}
+}
+
 export async function execHealth(args: unknown): Promise<CommandResult> {
   const a = args as HealthArgs
   if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'tab_id required' }
@@ -98,6 +114,10 @@ export async function execHealth(args: unknown): Promise<CommandResult> {
         ...describeTab(tab),
         ...(tab.discarded === true ? { discarded: true } : {}),
       },
+      // Which build EXECUTED this command. The backend separately knows the
+      // version announced at SSE subscribe, which is the fallback when this
+      // key is absent, but only the payload proves what actually ran (#216).
+      ...extensionVersionField(),
       attached: isAttached(tabId),
       ever_attached_this_worker: everAttached(tabId),
       console_entries: consoleCount(tabId),
