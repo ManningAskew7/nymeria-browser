@@ -4,10 +4,15 @@ import { statusPayload } from '../statusWatch'
 import { TAB_LOAD_WAIT_MS, waitForTabComplete, watchForTabComplete } from '../settle'
 
 interface TabsArgs {
-  action: 'list' | 'create' | 'switch' | 'close' | 'reload'
+  action: 'list' | 'create' | 'switch' | 'close' | 'reload' | 'zoom'
   tab_id?: number
   url?: string
+  zoom?: number
 }
+
+/** Chrome's own accepted zoom range, 25% to 500%. */
+const ZOOM_MIN = 0.25
+const ZOOM_MAX = 5.0
 
 /**
  * `chrome.tabs.create` and `.reload` both resolve the instant Chrome accepts
@@ -172,6 +177,64 @@ export async function execTabs(args: unknown): Promise<CommandResult> {
           ...statusPayload(a.tab_id, t0, [reloaded?.url]),
         },
       }
+    }
+    case 'zoom': {
+      if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'zoom requires tab_id' }
+      const report = async (extra: Record<string, unknown>) => {
+        const factor = await chrome.tabs.getZoom(a.tab_id as number)
+        const settings = await chrome.tabs.getZoomSettings(a.tab_id as number).catch(() => null)
+        return {
+          ok: true as const,
+          status: 'success' as const,
+          // Read BACK rather than echoing what was asked: Chrome clamps, and
+          // changing the scope can itself move the factor.
+          data: {
+            tab_id: a.tab_id,
+            zoom: factor,
+            percent: Math.round(factor * 100),
+            scope: settings?.scope ?? null,
+            ...extra,
+          },
+        }
+      }
+
+      // No factor given is a READ. Cheap, and the only way for a driving agent
+      // to discover it is on a zoomed page at all: page zoom silently breaks
+      // every coordinate the capture path produces (#231).
+      if (a.zoom === undefined || a.zoom === null) return report({})
+
+      // 0 is the UNDO, and it is a scope restore rather than a factor. Setting
+      // the scope back to per-origin makes the tab follow the USER's own saved
+      // preference again, which is the true inverse of what a set did. Zeroing
+      // the factor instead would leave the tab pinned per-tab, still ignoring
+      // that preference and silently diverging from every other tab on the
+      // origin.
+      if (a.zoom === 0) {
+        await chrome.tabs.setZoomSettings(a.tab_id, { scope: 'per-origin' })
+        return report({ restored_to_user_setting: true })
+      }
+
+      if (!(a.zoom >= ZOOM_MIN && a.zoom <= ZOOM_MAX)) {
+        return {
+          ok: false,
+          status: 'error',
+          error:
+            `zoom must be between ${ZOOM_MIN} and ${ZOOM_MAX} (Chrome's own range), ` +
+            `or 0 to restore the user's own setting; got ${String(a.zoom)}`,
+        }
+      }
+
+      // PER-TAB on purpose. Chrome's default zoom scope is per-ORIGIN and
+      // PERSISTENT: setting it the ordinary way would rewrite a preference of
+      // the user's, for every tab on that site, permanently, as a side effect
+      // of an agent wanting accurate coordinates for one capture. Per-tab
+      // scope confines it to this tab and lets navigation return the tab to
+      // the user's setting on its own. The cost is that it does not survive a
+      // navigation, which the payload says out loud rather than leaving the
+      // agent to discover mid-drive.
+      await chrome.tabs.setZoomSettings(a.tab_id, { scope: 'per-tab' })
+      await chrome.tabs.setZoom(a.tab_id, a.zoom)
+      return report({ resets_on_navigation: true })
     }
     default:
       return { ok: false, status: 'error', error: `unknown action: ${String(a.action)}` }

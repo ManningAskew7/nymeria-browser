@@ -573,8 +573,13 @@ POSTs results. Consequences:
     at any zoom other than 100% the clip asks for the wrong box (worked
     example at 150%: 423x257 CSS px out). Silent, because the PNG still
     returns at `clip.width * scale` and the backend's corroboration passes.
-    Backlog #231, unconfirmed live; the backend withholds `[Frame]` at any
-    zoom until it is fixed.
+    Backlog #231, and the backend withholds `[Frame]` at any zoom until it is
+    fixed. It was filed UNCONFIRMED only because nothing could set zoom;
+    `chrome_tabs(action="zoom")` shipped in v0.22.0 (#233), so **confirming it
+    is now one round**: set 150%, region-capture a known element, look at
+    whether the crop shows that element. Setting is per-TAB and temporary on
+    purpose, since Chrome's ordinary zoom scope is per-origin and would
+    permanently rewrite the user's preference for the whole site.
   - NEVER express a capture-derived conversion as a factor of the returned
     PNG's pixels. The backend downscales any image past the model's ceiling
     (2000px on every model checked) before the model sees it, and `autoScale`'s

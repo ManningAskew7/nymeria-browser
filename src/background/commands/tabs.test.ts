@@ -20,9 +20,24 @@ const TAB = 42
  * buttons were plainly present.
  */
 function installTabsMock(
-  opts: { loadAfterMs?: number | null; initialStatus?: string; silentComplete?: boolean } = {},
+  opts: {
+    loadAfterMs?: number | null
+    initialStatus?: string
+    silentComplete?: boolean
+    /** The user's own sticky per-site zoom for this tab, 1.25 = 125%. */
+    originZoom?: number
+  } = {},
 ) {
-  const { loadAfterMs = 500, initialStatus = 'loading', silentComplete = false } = opts
+  const {
+    loadAfterMs = 500,
+    initialStatus = 'loading',
+    silentComplete = false,
+    originZoom = 1.25,
+  } = opts
+  // Models the part of Chrome's zoom behaviour the tool turns on: the factor
+  // follows the SCOPE, so dropping back to per-origin restores whatever the
+  // user themselves had set for the site.
+  const zoomState = { factor: originZoom, scope: 'per-origin' as string }
   const listeners: Array<(id: number, info: { status?: string }) => void> = []
   const state = { status: initialStatus, url: 'https://example.com/', title: 'Example' }
 
@@ -57,6 +72,17 @@ function installTabsMock(
     query: vi.fn(async () => []),
     update: vi.fn(async () => ({ id: TAB, windowId: 1 })),
     remove: vi.fn(async () => undefined),
+    getZoom: vi.fn(async () => zoomState.factor),
+    setZoom: vi.fn(async (_id: number, factor: number) => {
+      zoomState.factor = factor
+    }),
+    getZoomSettings: vi.fn(async () => ({ scope: zoomState.scope, mode: 'automatic' })),
+    setZoomSettings: vi.fn(async (_id: number, s: { scope?: string }) => {
+      if (s.scope) zoomState.scope = s.scope
+      // Returning to per-origin hands the tab back to the user's own setting,
+      // which is the whole point of the undo.
+      if (s.scope === 'per-origin') zoomState.factor = originZoom
+    }),
     onUpdated: {
       addListener: (fn: (id: number, info: { status?: string }) => void) => listeners.push(fn),
       removeListener: (fn: (id: number, info: { status?: string }) => void) => {
@@ -415,5 +441,86 @@ describe('tabs close and beforeunload (#169)', () => {
     const removeOrder = (chrome.tabs.remove as unknown as ReturnType<typeof vi.fn>).mock
       .invocationCallOrder[0]
     expect(intentOrder).toBeLessThan(removeOrder)
+  })
+})
+
+describe('tabs zoom (#233)', () => {
+  const zoomFn = (name: string) =>
+    (chrome.tabs as unknown as Record<string, ReturnType<typeof vi.fn>>)[name]
+
+  it('reads the zoom without changing it, which is the only way to spot a zoomed tab', async () => {
+    // The motivating case: page zoom is per-site and sticky, so a tab can sit
+    // at 125% from something the user did weeks ago. At any zoom but 100% a
+    // region capture is aimed at the wrong box (#231) and publishes no
+    // [Frame], and before this there was no way to find that out at all.
+    installTabsMock({ loadAfterMs: null, originZoom: 1.25 })
+
+    const result = await execTabs({ action: 'zoom', tab_id: TAB })
+
+    expect(result.ok).toBe(true)
+    expect(result.data).toMatchObject({ zoom: 1.25, percent: 125, scope: 'per-origin' })
+    expect(zoomFn('setZoom'), 'a read must not write').not.toHaveBeenCalled()
+    expect(zoomFn('setZoomSettings'), 'nor touch the scope').not.toHaveBeenCalled()
+  })
+
+  it('confines a set to this tab BEFORE setting it, so it cannot rewrite the user preference', async () => {
+    // The order is the whole safety property. Chrome's default scope is
+    // per-ORIGIN and permanent: a setZoom that landed before the scope change
+    // would rewrite the user's saved preference for that entire site, in
+    // every tab, for good, as a side effect of wanting one accurate capture.
+    installTabsMock({ loadAfterMs: null, originZoom: 1.25 })
+
+    const result = await execTabs({ action: 'zoom', tab_id: TAB, zoom: 1.0 })
+
+    expect(result.ok).toBe(true)
+    expect(zoomFn('setZoomSettings')).toHaveBeenCalledWith(TAB, { scope: 'per-tab' })
+    const scopeOrder = zoomFn('setZoomSettings').mock.invocationCallOrder[0]
+    const setOrder = zoomFn('setZoom').mock.invocationCallOrder[0]
+    expect(scopeOrder, 'scope must be confined first').toBeLessThan(setOrder)
+    // And the agent is told the cost of that choice up front, rather than
+    // discovering it when a navigation quietly drops the zoom mid-drive.
+    expect(result.data).toMatchObject({ zoom: 1, percent: 100, resets_on_navigation: true })
+  })
+
+  it('undoes with 0 by restoring the scope, so the user gets their own zoom back', async () => {
+    // 0 is a scope restore, not a factor. Zeroing the factor instead would
+    // leave the tab pinned per-tab, still ignoring the user's preference and
+    // silently diverging from every other tab on the site.
+    installTabsMock({ loadAfterMs: null, originZoom: 1.25 })
+    await execTabs({ action: 'zoom', tab_id: TAB, zoom: 1.0 })
+
+    const result = await execTabs({ action: 'zoom', tab_id: TAB, zoom: 0 })
+
+    expect(result.ok).toBe(true)
+    expect(zoomFn('setZoomSettings')).toHaveBeenLastCalledWith(TAB, { scope: 'per-origin' })
+    expect(result.data).toMatchObject({
+      zoom: 1.25,
+      percent: 125,
+      scope: 'per-origin',
+      restored_to_user_setting: true,
+    })
+  })
+
+  it('refuses a factor outside Chrome range without touching the browser', async () => {
+    installTabsMock({ loadAfterMs: null })
+
+    const result = await execTabs({ action: 'zoom', tab_id: TAB, zoom: 12 })
+
+    expect(result.ok).toBe(false)
+    expect(result.error, 'names the range AND the undo, rather than just refusing').toMatch(
+      /between 0\.25 and 5.*0 to restore the user's own setting/,
+    )
+    expect(zoomFn('setZoom')).not.toHaveBeenCalled()
+    expect(zoomFn('setZoomSettings'), 'a refused set leaves the scope alone').not.toHaveBeenCalled()
+  })
+
+  it('requires a tab_id', async () => {
+    installTabsMock({ loadAfterMs: null })
+
+    const result = await execTabs({ action: 'zoom' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/zoom requires tab_id/)
+    expect(zoomFn('getZoom')).not.toHaveBeenCalled()
   })
 })
