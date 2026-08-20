@@ -68,8 +68,27 @@ POSTs results. Consequences:
 
 ## Live QA
 
+- **ALWAYS dispatch with `nymeria_chat_background`, never plain
+  `nymeria_chat`.** A QA round routinely runs ten to twenty minutes and plain
+  chat dies at 300s. Then know the second half, because the workaround does
+  NOT escape the ceiling it exists for: `nymeria_chat_collect` blocks silently
+  and Claude Code aborts any MCP tool that is silent for 300s (#199).
+  Measured 2026-08-20: a collect died at exactly 300s while `/status/turns`
+  showed the turn healthy at 328s and climbing, and Claude Code
+  auto-backgrounding the call did NOT save it, because the abort is on
+  transport silence rather than on foreground-ness. The fix is a per-server
+  `"timeout"` in the repo `.mcp.json` (set to 30 min; it is read at startup,
+  so a session that predates it still has the old ceiling). Without that,
+  poll `GET /status/turns` under the ceiling and read the result from history.
+- **Collect per ROUND, not once at the end.** A long round can trip
+  auto-compaction, which removes the messages from retrievable history: the
+  final report then cannot be read back at all and has to be re-requested.
+  (The thread agent survived this correctly by writing state to its notepad
+  first, but the transcript was still gone.)
 - QA thread: `38e2c63c` (title "[QA session: browser extension update...]"),
-  via the `nymeria` MCP (`nymeria_chat`, verbosity "concise"). Reuse it: it
+  via the `nymeria` MCP, verbosity "concise". IDs rotate, `45ae4224` carried
+  the 2026-08-20 pass; treat these as examples, not as live pointers. Reuse
+  one: it
   holds the running QA history (#168 fused waits, nav honesty, #175
   http_status, budget, batched upload, #160 worlds/refs, OOPIF input). The
   driving agent there is capable; give it one focused round per message and
