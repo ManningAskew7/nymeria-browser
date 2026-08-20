@@ -148,7 +148,9 @@ POSTs results. Consequences:
   everything", same node so the fingerprint must refuse `changed`;
   `#swap-btn` is node-REPLACED by a lookalike via `#swap-now`, refusing
   `unknown-ref`; `#stable-btn` is the control; `#abort-fetch` mints a
-  cross-origin `canceled` failure for the `likely_benign` class; status
+  cross-origin `canceled` failure for the routine-noise class (the fixture
+  for `failed_requests_benign_omitted`; the `likely_benign` payload key it
+  was built against is gone since #220); status
   lines start `*-untouched` per the fixture-6 convention).
   TRAP, measured 2026-08-16 and corrected same day by #177's live capture:
   an in-frame link to iana.org NEVER navigates. The operative blocker is
@@ -288,15 +290,27 @@ POSTs results. Consequences:
   refuse fresh refs as `navigated`). Same pass: cross-origin
   `canceled`/`ERR_BLOCKED_BY_CLIENT` failures with status < 400 are the
   routine-noise class; same-origin/unparseable/error-status never join it.
-  Since #220 (v0.18.0) that class is OMITTED from act payloads rather than
-  ranked last inside them, and rides only as
-  `failed_requests_benign_omitted`. Ranking it last just let it pad whatever
-  the cap of 5 had spare, so a retail click spent all five slots on ad pixels
-  (~6,000 chars, measured). Lossless by construction, since a real failure
-  always outranked it, which is the argument to re-make if anyone proposes
-  un-omitting; `chrome_network` reads the same buffer unfiltered and is the
-  way back to the entries. A count with NO `failed_requests` beside it is the
-  ordinary commercial-page shape, never "nothing failed". Since #203
+  Since #220 (v0.19.0) that class is OMITTED from act payloads rather than
+  ranked last inside them, and rides as `failed_requests_benign_omitted`
+  = `{count, hosts, hosts_omitted?}`. Ranking it last just let it pad
+  whatever the cap of 5 had spare, so a retail click spent all five slots on
+  ad pixels (~6,000 chars, measured). Dropping it cannot evict a real
+  failure, since a real one always outranked it: that is the argument to
+  re-make if anyone proposes un-omitting. The HOSTS are the load-bearing
+  half and v0.18.0 shipped without them for half a day: the class keys on an
+  EXACT origin compare, so a site's own `api.*` subdomain is cross-origin to
+  its `www`, and the agent's own POST canceled by the navigation it
+  triggered (no status, so no >=400 rescue) classifies as noise. A bare
+  count made that indistinguishable from an ad pixel, which is the Place
+  Order case the item came from. Do not "simplify" the hosts away.
+  `chrome_network` reads the same buffer unfiltered and is the way back to
+  the entries, though it exposes no `since`, so the reread cannot be scoped
+  to the act's window. A summary with NO `failed_requests` beside it is the
+  ordinary commercial-page shape, never "nothing failed". Same pass removed
+  the `FAILURE_RANK_POOL` pre-truncation (newest 50, applied BEFORE
+  classification, so a burst of noise starved older real failures out of the
+  ranking that exists to protect them); the buffer's own `MAX_PER_TAB` is
+  the bound. Since #203
   (v0.15.x) resolved_frame is THREE-state: absent=root, null=frame
   located with an empty URL, string=live URL; both emission sites
   (target-backed + confirmed keyboard) guard `!== undefined`, never

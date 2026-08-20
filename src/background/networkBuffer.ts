@@ -108,9 +108,18 @@ export function read(tabId: number, opts: ReadOptions = {}): NetworkEntry[] {
   return out
 }
 
-/** Failures only: what the post-action verification payload reports. */
-export function failuresSince(tabId: number, since: number, limit = 5): NetworkEntry[] {
-  return read(tabId, { since, only_failures: true, limit })
+/**
+ * Failures only: what the post-action verification payload reports.
+ *
+ * `limit` follows `read`'s convention, so OMITTING it means everything
+ * buffered in the window. The act payload does omit it: its own ranking and
+ * cap decide what is shown, and a pre-truncation to the newest N happens
+ * BEFORE any of that, which silently starves an older real failure out of the
+ * ranking whenever a burst of noise follows it. The buffer is already bounded
+ * at MAX_PER_TAB, so unbounded here is O(200) at worst.
+ */
+export function failuresSince(tabId: number, since: number, limit?: number): NetworkEntry[] {
+  return read(tabId, { since, only_failures: true, ...(limit === undefined ? {} : { limit }) })
 }
 
 export function clear(tabId: number): void {

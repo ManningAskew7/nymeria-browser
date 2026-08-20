@@ -418,12 +418,17 @@ function undeliveredError(action: ActionName): string {
 const TELEMETRY_TYPES = new Set(['Ping', 'Beacon', 'Image', 'Media', 'Font', 'Prefetch', 'CSPViolationReport'])
 
 /**
- * How many recent failures the ranking considers before the cap is applied.
- * Wider than the cap so a data-class failure buried under a burst of
- * telemetry noise is still in the pool to be ranked above it; bounded so a
- * pathological page cannot make every act result O(all failures ever).
+ * How many distinct hosts the omitted-noise summary names before it starts
+ * counting the rest. Hosts are short and deduplicated, so this is generous
+ * for any real page; the cap exists only so a pathological one cannot turn
+ * the summary back into the payload weight it was built to remove.
+ *
+ * There is deliberately no companion cap on how many failures the RANKING
+ * considers. That used to be `FAILURE_RANK_POOL = 50`, applied as "newest 50"
+ * BEFORE ranking, which meant a burst of noise could starve an older real
+ * failure out of the ranking entirely. The buffer already bounds itself.
  */
-const FAILURE_RANK_POOL = 50
+const MAX_BENIGN_HOSTS = 20
 
 /**
  * Mint-time AX roles that name a DOCUMENT, not a control (#202): a ref to
@@ -494,16 +499,29 @@ function likelyBenign(entry: { error?: string; status?: number }, sameOrigin: bo
  * final list reads chronologically.
  *
  * The known-benign class (#202) is removed BEFORE the rank sort (#220) and
- * comes back only as `benignOmitted`, which is why no rank term mentions it
- * any more. That count is bounded by the ranking pool, so on a page emitting
- * more than `FAILURE_RANK_POOL` failures in the window it reads as a floor.
+ * comes back as a count plus the HOSTS it was spread across, which is why no
+ * rank term mentions it any more. The read is unbounded (see `failuresSince`),
+ * so the count is exact rather than a floor.
+ *
+ * Hosts are why this is not a capability narrowing, and the review round that
+ * added them is worth remembering. `likelyBenign` keys on
+ * `sameOrigin === false`, and origin comparison is exact, so `api.retailer.com`
+ * is "cross-origin" to a page on `www.retailer.com`. The rank docstring above
+ * says as much in its own words, which is exactly why RANKING gives origin only
+ * +1 and combines it with resource type. A bare count would have promoted that
+ * same origin-only judgement from "costs a rank slot" to "costs the entry", and
+ * the case it loses is the one this item came from: a Place Order click whose
+ * own POST to the site's api subdomain is canceled by the ensuing navigation
+ * (no status, so the >=400 rescue never fires). With hosts, an agent tells five
+ * ad pixels from one canceled call to its own API at a glance, for ~100
+ * characters against the ~6,000 that motivated the omission.
  */
 function classifiedFailures(
   tabId: number,
   since: number,
   pageUrl: string | null,
-): { entries: Record<string, unknown>[]; benignOmitted: number } {
-  const raw = networkFailuresSince(tabId, since, FAILURE_RANK_POOL)
+): { entries: Record<string, unknown>[]; omitted: Record<string, unknown> | null } {
+  const raw = networkFailuresSince(tabId, since)
   const annotated = raw.map((e) => {
     const so = sameOriginAs(e.url, pageUrl)
     return {
@@ -519,37 +537,31 @@ function classifiedFailures(
   kept.sort((a, b) => a.rank - b.rank || b.entry.ts - a.entry.ts)
   const chosen = kept.slice(0, MAX_CONSOLE_IN_RESULT)
   chosen.sort((a, b) => a.entry.ts - b.entry.ts)
+
+  const dropped = annotated.filter((a) => a.benign)
+  // Benign entries parse by construction (the class needs `same_origin: false`,
+  // which an unparseable URL can never ground), so the host read cannot throw.
+  const hosts = [...new Set(dropped.map((d) => new URL(String(d.entry.url)).hostname))]
   return {
     entries: chosen.map((c) => c.entry as unknown as Record<string, unknown>),
-    benignOmitted: annotated.length - kept.length,
+    omitted: dropped.length
+      ? {
+          count: dropped.length,
+          hosts: hosts.slice(0, MAX_BENIGN_HOSTS),
+          // Truncation must never read as absence, the same rule `matched_total`
+          // enforces on the capture reads. `count` is entries, not hosts, so it
+          // cannot be used to infer that the list was cut.
+          ...(hosts.length > MAX_BENIGN_HOSTS
+            ? { hosts_omitted: hosts.length - MAX_BENIGN_HOSTS }
+            : {}),
+        }
+      : null,
   }
 }
 
 /**
- * The failed-requests block, composed ONCE (#220) so the verification payload
- * and the stall/error diagnostics cannot drift apart on it.
- *
- * Two keys, both absent when they have nothing to say. An absent count means
- * nothing was omitted; a count with NO `failed_requests` beside it is the
- * commercial-page shape, where every failure in the window was benign, and it
- * has to stay visible: a filtered-away list that simply vanished would read as
- * "no requests failed", which is the same mistake `matched_total` exists to
- * prevent on the capture reads.
- */
-function failuresBlock(
-  tabId: number,
-  since: number,
-  pageUrl: string | null,
-): Record<string, unknown> {
-  const { entries, benignOmitted } = classifiedFailures(tabId, since, pageUrl)
-  return {
-    ...(entries.length ? { failed_requests: entries } : {}),
-    ...(benignOmitted ? { failed_requests_benign_omitted: benignOmitted } : {}),
-  }
-}
-
-/**
- * The evidence a stalled page cannot stop us collecting.
+ * The evidence a stalled page cannot stop us collecting, and the ONE composer
+ * of the diagnostics block for every payload that carries it.
  *
  * Console lines and failed requests come from local buffers fed by CDP events,
  * so they need nothing from the suspended renderer. They are also the only
@@ -558,6 +570,19 @@ function failuresBlock(
  * points at a dialog. A failure that drops them is a worse trade than the
  * silent success this whole mechanism replaced. `pageUrl` feeds the
  * same-origin classification; null (not yet known) just omits it.
+ *
+ * The success path composes through here too (#220 review). It used to
+ * hand-roll a byte-identical console read beside its own spread, so the two
+ * sites were free to drift on `console_errors` while a separate helper kept
+ * them honest about `failed_requests`. Half a guarantee is worse than none:
+ * one composer, both keys, every site.
+ *
+ * Each key is absent when it has nothing to say. A benign-omission summary
+ * with NO `failed_requests` beside it is the ordinary commercial-page shape,
+ * where every failure in the window was routine noise, and it has to stay
+ * visible: a filtered-away list that simply vanished would read as "no
+ * requests failed", the same mistake `matched_total` exists to prevent on the
+ * capture reads.
  */
 function localDiagnostics(
   tabId: number,
@@ -565,9 +590,11 @@ function localDiagnostics(
   pageUrl: string | null,
 ): Record<string, unknown> {
   const errors = consoleSince(tabId, startedAt, { only_errors: true, limit: MAX_CONSOLE_IN_RESULT })
+  const { entries, omitted } = classifiedFailures(tabId, startedAt, pageUrl)
   return {
     ...(errors.length ? { console_errors: errors } : {}),
-    ...failuresBlock(tabId, startedAt, pageUrl),
+    ...(entries.length ? { failed_requests: entries } : {}),
+    ...(omitted ? { failed_requests_benign_omitted: omitted } : {}),
   }
 }
 
@@ -2640,17 +2667,13 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
         stillConnected(v.elementSession, v.objectId),
         describeFocused(v.tabId),
       ])
-  const errors = consoleSince(v.tabId, v.startedAt, {
-    only_errors: true,
-    limit: MAX_CONSOLE_IN_RESULT,
-  })
   // A request that came back 500 without throwing is the commonest silent
   // failure on a real site, and it never reaches the console. Classified and
   // ranked against the page the action ran ON (#166): the failures in this
   // window were issued by the urlBefore document, so when the action
   // navigated, judging them against urlAfter would misclassify the very POST
   // whose failure explains the move (review round).
-  const failures = failuresBlock(v.tabId, v.startedAt, v.urlBefore ?? urlAfter)
+  const diagnostics = localDiagnostics(v.tabId, v.startedAt, v.urlBefore ?? urlAfter)
   return {
     action: v.action,
     ...(v.target ? { target: v.target } : {}),
@@ -2670,8 +2693,7 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
     ...(focused ? { focused } : {}),
     input: v.inputMode,
     ...(v.settleResult ? { settled: v.settleResult } : {}),
-    ...(errors.length ? { console_errors: errors } : {}),
-    ...failures,
+    ...diagnostics,
     ...(enrichmentSkipped ? { budget_clamped: true } : {}),
     ...(v.extra ?? {}),
   }
@@ -3628,9 +3650,12 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         inputMode = 'synthetic'
         // Teach the next step (#220): the honest reason left an agent with
         // nowhere to go on a site that ignores synthetic events, and there is
-        // a trusted-input route for exactly that case.
+        // a trusted-input route for exactly that case. The copy has to say
+        // the value is ALREADY set, or the advice reads as "arrow from where
+        // you were" and moves the agent OFF the option it just asked for
+        // (this.value is assigned above, before the reason is composed).
         extra.synthetic_reason =
-          'native select popups cannot receive browser-level input; if this page ignores synthetic events, send real keys to the same ref instead: action="key" with value "ArrowDown" or "ArrowUp" to move the selection, then "Enter"'
+          'native select popups cannot receive browser-level input, so the value was set directly. It IS now selected; if this page ignores synthetic events and did not react, re-drive it with trusted keys on the same ref: action="key" with "ArrowDown" or "ArrowUp" moves from the option already selected, so step back to it and confirm with a read before "Enter"'
         break
       }
       case 'check':

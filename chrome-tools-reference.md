@@ -809,13 +809,18 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     crowded out by third-party telemetry beacons; weigh same-origin data
     failures heaviest. Routine page noise is OMITTED rather than listed: a
     CROSS-ORIGIN request that was canceled or eaten by the user's own content
-    blocker (analytics streams, ad pixels) is dropped from the list and only
-    counted, as "failed_requests_benign_omitted". A count with NO
+    blocker (analytics streams, ad pixels) is dropped from the list and
+    summarised as "failed_requests_benign_omitted", an object carrying
+    "count" and the "hosts" those requests went to (plus "hosts_omitted" when
+    there were more hosts than it names). READ THE HOSTS rather than just the
+    count. Cross-origin here is an EXACT origin match, so a site's own api.*
+    subdomain is cross-origin to its www: a request of YOURS that the
+    navigation you just triggered canceled can land in this summary, and the
+    host is how you tell it from an ad pixel. A summary with NO
     failed_requests beside it is the ordinary shape on a commercial page and
     means every failure in the window was that class, never that nothing
-    failed. Omitting it can never cost you a real failure, because a real one
-    always outranks that class; when you do want the entries themselves,
-    chrome_network reads the same buffer unfiltered.
+    failed. For the entries themselves, chrome_network reads the same buffer
+    unfiltered.
     Navigation is reported honestly. "url_changed" means the tab's URL
     changed, computed after a pending page load commits, so a click that
     navigates reports true with the new URL (an SPA route change reports it

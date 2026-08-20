@@ -1794,6 +1794,15 @@ describe('argument handling', () => {
     expect(reason, 'names the tool and args, not just "use the keyboard"').toMatch(/action="key"/)
     expect(reason).toMatch(/ArrowDown/)
     expect(reason).toMatch(/Enter/)
+    // The correction a review round caught: the synthetic path assigns
+    // this.value BEFORE composing the reason, so the option asked for is
+    // already selected. Advice that reads as "arrow, then Enter" walks the
+    // agent OFF it. The copy has to say the value is already applied and that
+    // arrowing moves FROM it.
+    expect(reason, 'says the option is already selected').toMatch(/IS now selected/)
+    expect(reason, 'says arrowing moves from the current option').toMatch(
+      /moves from the option already selected/,
+    )
   })
 
   it('fails a select whose value matches no option', async () => {
@@ -6180,8 +6189,10 @@ describe('failed_requests classification', () => {
   // them is LOSSLESS for everything else: a non-benign entry always outranked
   // a benign one, so the class removed is the class already last in line.
 
-  const benignCount = (r: { data?: unknown }): unknown =>
-    (r.data as { failed_requests_benign_omitted?: unknown }).failed_requests_benign_omitted
+  type Omitted = { count?: number; hosts?: string[]; hosts_omitted?: number }
+  const omitted = (r: { data?: unknown }): Omitted | undefined =>
+    (r.data as { failed_requests_benign_omitted?: Omitted }).failed_requests_benign_omitted
+  const benignCount = (r: { data?: unknown }): unknown => omitted(r)?.count
 
   it('omits cross-origin canceled entries and reports the count instead', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
@@ -6340,6 +6351,115 @@ describe('failed_requests classification', () => {
     expect(failed).toHaveLength(1)
     expect(String(failed?.[0].url)).toContain('api.example.net')
     expect(benignCount(result)).toBe(1)
+  })
+
+  it('names the HOSTS it omitted, so a first-party API is not lost in the ad noise', async () => {
+    // The case the review round caught, and the reason a bare count was not
+    // enough. `same_origin` is an EXACT origin compare, so the page's own API
+    // on a subdomain reads as cross-origin; canceled by a navigation it has no
+    // status, so the >=400 rescue never fires, and it classifies as routine
+    // noise. That is the Place Order click this whole item came from. The
+    // count alone cannot tell it from an ad pixel. The host can.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://ads.doubleclick.net/pixel?a=1',
+      method: 'GET',
+      error: 'net::ERR_BLOCKED_BY_CLIENT',
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+    pushNetwork(TAB, {
+      url: 'https://api.example.com/checkout',
+      method: 'POST',
+      error: 'canceled',
+      resource_type: 'Fetch',
+      ts: future() + 1,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const o = omitted(result)
+    expect(o?.count).toBe(2)
+    expect(o?.hosts, 'the agent can see its own API was among the dropped').toEqual([
+      'ads.doubleclick.net',
+      'api.example.com',
+    ])
+  })
+
+  it('deduplicates hosts, so twenty pixels from one ad network read as one host', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    for (let i = 0; i < 20; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://ads.example.net/pixel-${i}?cachebust=${i}`,
+        method: 'GET',
+        error: 'net::ERR_BLOCKED_BY_CLIENT',
+        resource_type: 'Fetch',
+        ts: future() + i,
+      })
+    }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const o = omitted(result)
+    expect(o?.count, 'the count stays entries, not hosts').toBe(20)
+    expect(o?.hosts).toEqual(['ads.example.net'])
+    expect('hosts_omitted' in (o ?? {})).toBe(false)
+  })
+
+  it('counts the hosts it could not name, so a cut list never reads as the whole list', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    // 25 DISTINCT hosts against a cap of 20.
+    for (let i = 0; i < 25; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://ads-${i}.example.net/pixel`,
+        method: 'GET',
+        error: 'canceled',
+        resource_type: 'Fetch',
+        ts: future() + i,
+      })
+    }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const o = omitted(result)
+    expect(o?.count).toBe(25)
+    expect(o?.hosts).toHaveLength(20)
+    expect(o?.hosts_omitted, 'the five it could not name are still declared').toBe(5)
+  })
+
+  it('a burst of noise cannot starve an older real failure out of the ranking', async () => {
+    // The ranking used to consider only the newest 50 failures, applied BEFORE
+    // classification, so 60 later ad pixels pushed the one real failure out of
+    // the pool entirely and it was never ranked at all. Ranking exists to stop
+    // exactly this, and the pre-truncation defeated it.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://example.com/api/save',
+      method: 'POST',
+      error: 'net::ERR_FAILED',
+      resource_type: 'XHR',
+      ts: future(),
+    })
+    for (let i = 0; i < 60; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://ads-${i}.example.net/pixel`,
+        method: 'GET',
+        error: 'net::ERR_BLOCKED_BY_CLIENT',
+        resource_type: 'Fetch',
+        ts: future() + 10 + i,
+      })
+    }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed, 'the real failure survives 60 newer benign ones').toHaveLength(1)
+    expect(String(failed?.[0].url)).toContain('example.com/api/save')
+    expect(omitted(result)?.count, 'and the count is exact, not a floor').toBe(60)
   })
 
   it('reports the count on the STALL path too, where the diagnostics are all there is', async () => {
