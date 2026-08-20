@@ -3702,7 +3702,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         // you were" and moves the agent OFF the option it just asked for
         // (this.value is assigned above, before the reason is composed).
         extra.synthetic_reason =
-          'native select popups cannot receive browser-level input, so the value was set directly and IS now selected. If this page ignores synthetic events and did not react, re-drive it with trusted keys on the same ref: action="key" with "ArrowDown" or "ArrowUp" steps FROM the option already selected and commits each step as it goes, so move to the one you want and re-read to confirm. Do not send Enter to finish: the arrow already committed it, and on a select inside a form Enter can submit the form'
+          'native select popups cannot receive browser-level input, so the value was set directly and IS now selected. If this page ignores synthetic events and did not react, the option you asked for is already the one selected, so what is missing is a TRUSTED event on it, not navigation: with action="key" on the same ref, arrow ONE step away and one step back ("ArrowDown" then "ArrowUp", or the reverse if you are on the last option). Each arrow commits as it goes, so the pair lands back on your option having fired a real change event, and a re-read confirms it. Do not send Enter to finish: the arrow already committed, and on a select inside a form Enter can submit the form'
         break
       }
       case 'check':

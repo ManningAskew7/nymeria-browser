@@ -1797,8 +1797,16 @@ describe('argument handling', () => {
     // reason, so the option asked for is already selected. "Arrow, then Enter"
     // walks the agent OFF it.
     expect(reason, 'says the option is already selected').toMatch(/IS now selected/)
-    expect(reason, 'says arrowing steps from the current option').toMatch(
-      /steps FROM the option already selected/,
+    // Correction 3, from the QA operator reading the corrected copy: "move to
+    // the one you want" still described NAVIGATION, and there is nowhere to
+    // navigate to. In this failure mode the value is already right and only a
+    // TRUSTED event is missing, so the move is away-and-back, not A to B.
+    expect(reason, 'names the real problem as a missing trusted event').toMatch(
+      /missing is a TRUSTED event on it, not navigation/,
+    )
+    expect(reason, 'prescribes the away-and-back pair').toMatch(/arrow ONE step away and one step back/)
+    expect(reason, 'covers the last-option case where one direction is a no-op').toMatch(
+      /the reverse if you are on the last option/,
     )
     // Correction 2, and the one with teeth: arrowing a focused select commits
     // as it goes, so Enter adds nothing, and on a select inside a form Enter
