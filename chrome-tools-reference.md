@@ -1007,10 +1007,11 @@ Capture what the user's Chrome tab looks like, and see it.
     it as a proportion between the stated edges and round, rather than
     working back to the full picture by eye. Proportional on purpose, so it
     survives the image being downscaled on its way to you. It holds until the
-    page scrolls. No [Frame] means the geometry could not be trusted, most
-    often because the capture reached off screen and reflowed the page it
-    would be measured against; the other lines say what could not be
-    corroborated.
+    page scrolls. No [Frame] means the geometry could not be trusted: most
+    often the capture reached off screen and reflowed the page it would be
+    measured against, and it is also withheld on any zoomed page, where the
+    capture itself is aimed at the wrong box. The other lines say what could
+    not be corroborated.
 
     Trust that viewport over one you measured yourself a moment earlier.
     Driving a tab puts Chrome's "being debugged" infobar on it, which shortens

@@ -548,6 +548,14 @@ POSTs results. Consequences:
     and reflows the page the frame is measured against, mid-capture: the same
     reason `full_page` never gets one. Do not "simplify" that guard away, and
     do not publish a frame beside a `[Reflow]` line.
+  - `clip` is documented in DEVICE INDEPENDENT px, while `getBoundingClientRect`,
+    `getContentQuads` and `scrollX` are CSS px. `cssVisualViewport.zoom` is the
+    documented conversion, and `screenshot.ts` reads it but only REPORTS it, so
+    at any zoom other than 100% the clip asks for the wrong box (worked
+    example at 150%: 423x257 CSS px out). Silent, because the PNG still
+    returns at `clip.width * scale` and the backend's corroboration passes.
+    Backlog #231, unconfirmed live; the backend withholds `[Frame]` at any
+    zoom until it is fixed.
   - NEVER express a capture-derived conversion as a factor of the returned
     PNG's pixels. The backend downscales any image past the model's ceiling
     (2000px on every model checked) before the model sees it, and `autoScale`'s
