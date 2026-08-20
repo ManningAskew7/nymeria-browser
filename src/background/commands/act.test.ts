@@ -1779,6 +1779,23 @@ describe('argument handling', () => {
     expect((result.data as { input: string }).input).toBe('synthetic')
   })
 
+  it('the select degrade names the keyboard route out of it (#220)', async () => {
+    // The reason was honest and terminal: a site that ignores synthetic
+    // events left the agent with no next move, while `action="key"` on the
+    // same ref is a real trusted-input route. A refusal that teaches the
+    // next step is the house rule.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ selectMatches: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'select', ref: '@e1', value: 'Express shipping' })
+
+    const reason = String((result.data as { synthetic_reason?: string }).synthetic_reason)
+    expect(reason).toMatch(/cannot receive browser-level input/)
+    expect(reason, 'names the tool and args, not just "use the keyboard"').toMatch(/action="key"/)
+    expect(reason).toMatch(/ArrowDown/)
+    expect(reason).toMatch(/Enter/)
+  })
+
   it('fails a select whose value matches no option', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ selectMatches: false })
@@ -6153,16 +6170,24 @@ describe('failed_requests classification', () => {
 
   // The known-benign class (#202, from the #188 QA round): a LaunchDarkly
   // EventSource "canceled" rode two act payloads as an apparent error. A
-  // cross-origin cancel or content-blocker kill is routine page noise: it is
-  // tagged `likely_benign` and ranked below EVERYTHING untagged, telemetry
-  // included, so it can never crowd a real failure out of the cap. Nothing
-  // is hidden: the entries still appear.
+  // cross-origin cancel or content-blocker kill is routine page noise.
+  //
+  // Since #220 the class is OMITTED from the payload rather than ranked last
+  // inside it, and only `failed_requests_benign_omitted` reports it. Ranking
+  // last meant benign entries padded whatever the cap had spare, so a
+  // commercial page with no real failures spent all five slots on ad pixels
+  // (~6,000 characters measured live). What these tests pin is that removing
+  // them is LOSSLESS for everything else: a non-benign entry always outranked
+  // a benign one, so the class removed is the class already last in line.
 
-  it('tags cross-origin canceled entries likely_benign and ranks them below telemetry noise', async () => {
+  const benignCount = (r: { data?: unknown }): unknown =>
+    (r.data as { failed_requests_benign_omitted?: unknown }).failed_requests_benign_omitted
+
+  it('omits cross-origin canceled entries and reports the count instead', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
-    // A real (untagged) cross-origin telemetry failure FIRST, then five
-    // NEWER benign cancels: recency or the old rank would evict the ping.
+    // A real (never-benign) cross-origin telemetry failure FIRST, then five
+    // NEWER benign cancels: recency alone would evict the ping.
     pushNetwork(TAB, {
       url: 'https://telemetry.example.net/collect',
       method: 'POST',
@@ -6183,16 +6208,92 @@ describe('failed_requests classification', () => {
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
-    expect(failed).toHaveLength(5)
-    const ping = failed?.find((e) => String(e.url).includes('telemetry'))
-    expect(ping, 'the untagged telemetry failure survives five benign cancels').toBeDefined()
-    expect('likely_benign' in (ping ?? {})).toBe(false)
-    const streams = failed?.filter((e) => String(e.url).includes('stream')) ?? []
-    expect(streams).toHaveLength(4)
-    for (const s of streams) expect(s.likely_benign).toBe(true)
+    expect(failed, 'only the real failure survives').toHaveLength(1)
+    expect(String(failed?.[0].url)).toContain('telemetry')
+    expect(failed?.every((e) => !('likely_benign' in e))).toBe(true)
+    expect(benignCount(result)).toBe(5)
   })
 
-  it('never tags a same-origin cancel: it can be the very failure the payload exists to surface', async () => {
+  it('reports the count with NO failed_requests when every failure was benign', async () => {
+    // The measured commercial-page shape. The count has to be there, or a
+    // filtered-away list reads as "no requests failed" (the `matched_total`
+    // lesson from the capture reads).
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    for (let i = 0; i < 3; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://ads.example.net/pixel-${i}`,
+        method: 'GET',
+        error: 'net::ERR_BLOCKED_BY_CLIENT',
+        resource_type: 'Fetch',
+        ts: future() + i,
+      })
+    }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect('failed_requests' in (result.data as object)).toBe(false)
+    expect(benignCount(result)).toBe(3)
+  })
+
+  it('omits the count entirely when nothing was benign', async () => {
+    // Absent means none omitted. A zero would be one more field on every
+    // ordinary act payload saying nothing.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://example.com/api/save',
+      method: 'POST',
+      error: 'net::ERR_FAILED',
+      resource_type: 'XHR',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed).toHaveLength(1)
+    expect('failed_requests_benign_omitted' in (result.data as object)).toBe(false)
+  })
+
+  it('is lossless for the non-benign class: the same entries survive, in the same order', async () => {
+    // The property the whole change rests on. Five real failures fill the
+    // cap; three benign ones alongside them change NOTHING about the list.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    for (let i = 0; i < 5; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://example.com/api/real-${i}`,
+        method: 'POST',
+        error: 'net::ERR_FAILED',
+        resource_type: 'XHR',
+        ts: future() + i,
+      })
+    }
+    for (let i = 0; i < 3; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://ads.example.net/pixel-${i}`,
+        method: 'GET',
+        error: 'canceled',
+        resource_type: 'Fetch',
+        ts: future() + 100 + i,
+      })
+    }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+    expect(failed?.map((e) => String(e.url))).toEqual([
+      'https://example.com/api/real-0',
+      'https://example.com/api/real-1',
+      'https://example.com/api/real-2',
+      'https://example.com/api/real-3',
+      'https://example.com/api/real-4',
+    ])
+    expect(benignCount(result)).toBe(3)
+  })
+
+  it('never omits a same-origin cancel: it can be the very failure the payload exists to surface', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     pushNetwork(TAB, {
@@ -6208,28 +6309,10 @@ describe('failed_requests classification', () => {
     const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
     expect(failed).toHaveLength(1)
     expect(failed?.[0].same_origin).toBe(true)
-    expect('likely_benign' in (failed?.[0] ?? {})).toBe(false)
+    expect('failed_requests_benign_omitted' in (result.data as object)).toBe(false)
   })
 
-  it('tags a cross-origin request eaten by the content blocker', async () => {
-    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
-    installCdpMock()
-    pushNetwork(TAB, {
-      url: 'https://ads.example.net/pixel',
-      method: 'GET',
-      error: 'net::ERR_BLOCKED_BY_CLIENT',
-      resource_type: 'Fetch',
-      ts: future(),
-    })
-
-    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
-
-    const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
-    expect(failed).toHaveLength(1)
-    expect(failed?.[0].likely_benign).toBe(true)
-  })
-
-  it('an error-status response wearing a cancel is a REAL failure, never tagged', async () => {
+  it('an error-status response wearing a cancel is a REAL failure, never omitted', async () => {
     // A cross-origin 500 whose stream was then canceled is the failure the
     // payload exists to surface; only a healthy-status cancel is noise.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
@@ -6254,16 +6337,52 @@ describe('failed_requests classification', () => {
     const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
 
     const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
-    expect(failed).toHaveLength(2)
-    const errored = failed?.find((e) => String(e.url).includes('api.example.net'))
-    expect('likely_benign' in (errored ?? {})).toBe(false)
-    const healthy = failed?.find((e) => String(e.url).includes('stream.example.net'))
-    expect(healthy?.likely_benign).toBe(true)
+    expect(failed).toHaveLength(1)
+    expect(String(failed?.[0].url)).toContain('api.example.net')
+    expect(benignCount(result)).toBe(1)
+  })
+
+  it('reports the count on the STALL path too, where the diagnostics are all there is', async () => {
+    // The stall payload composes through localDiagnostics, not the
+    // verification payload, and it is the path where an agent has least to
+    // go on. Two emission sites drifting apart on this is exactly what the
+    // shared composer exists to stop.
+    vi.useFakeTimers()
+    try {
+      setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+      installCdpMock({ rendererHangsAfterDispatch: true })
+      pushNetwork(TAB, {
+        url: 'https://ads.example.net/pixel',
+        method: 'GET',
+        error: 'net::ERR_BLOCKED_BY_CLIENT',
+        resource_type: 'Fetch',
+        ts: future(),
+      })
+      pushNetwork(TAB, {
+        url: 'https://example.com/api/save',
+        method: 'POST',
+        error: 'net::ERR_FAILED',
+        resource_type: 'XHR',
+        ts: future() + 1,
+      })
+
+      const pending = execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+      await vi.advanceTimersByTimeAsync(60_000)
+      const result = await pending
+
+      expect(result.ok).toBe(false)
+      const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
+      expect(failed).toHaveLength(1)
+      expect(String(failed?.[0].url)).toContain('example.com/api/save')
+      expect(benignCount(result)).toBe(1)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('an unparseable URL cannot ground a benign claim', async () => {
-    // The tag rests on same_origin === false; unknown origin says nothing,
-    // so it must never tag, even on a "canceled" error.
+    // The class rests on same_origin === false; unknown origin says nothing,
+    // so it must never be omitted, even on a "canceled" error.
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock()
     pushNetwork(TAB, {
@@ -6278,6 +6397,6 @@ describe('failed_requests classification', () => {
 
     const failed = (result.data as { failed_requests?: Record<string, unknown>[] }).failed_requests
     expect(failed).toHaveLength(1)
-    expect('likely_benign' in (failed?.[0] ?? {})).toBe(false)
+    expect('failed_requests_benign_omitted' in (result.data as object)).toBe(false)
   })
 })

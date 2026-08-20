@@ -458,9 +458,19 @@ function sameOriginAs(url: string, pageUrl: string | null): boolean | undefined 
  * claim needs the fact it rests on. An error-status response (a 500 whose
  * stream was then canceled) is a REAL failure wearing a cancel, so it is
  * never tagged either; a 2xx-then-canceled stream (the measured
- * LaunchDarkly shape) is. Hedged key (`likely_benign`) because it is a
- * classification, not a verdict; tagged entries still appear when the cap
- * has room, ranked last.
+ * LaunchDarkly shape) is.
+ *
+ * Since #220 (v0.18.0) this class is OMITTED from act payloads rather than
+ * ranked last within them, and only its COUNT rides the result. Ranking last
+ * meant benign entries padded whatever the cap had left over, so a commercial
+ * page with no real failures spent all five slots on blocked ad pixels: one
+ * measured click carried ~6,000 characters of them. Dropping them cannot
+ * cost a real signal, because a non-benign entry always outranks a benign one
+ * and the cap is filled by rank: the class being removed is exactly the class
+ * that was already last in line. Still a hedged name, because it is a
+ * classification and not a verdict, which is why the count is reported at all
+ * and why `chrome_network` (same buffer, unfiltered) remains the way back to
+ * the entries themselves.
  */
 function likelyBenign(entry: { error?: string; status?: number }, sameOrigin: boolean | undefined): boolean {
   if (sameOrigin !== false || !entry.error) return false
@@ -480,37 +490,62 @@ function likelyBenign(entry: { error?: string; status?: number }, sameOrigin: bo
  * telemetry-shaped types, same-origin before cross-origin within the class.
  * Origin alone would demote a first-party API on its own api.* domain; type
  * alone would keep third-party fetch beacons; the combination plus the
- * visible annotations covers both. The known-benign class (#202) demotes
- * below everything else, telemetry included. Most-recent wins within a
- * rank, and the final list reads chronologically.
+ * visible annotations covers both. Most-recent wins within a rank, and the
+ * final list reads chronologically.
+ *
+ * The known-benign class (#202) is removed BEFORE the rank sort (#220) and
+ * comes back only as `benignOmitted`, which is why no rank term mentions it
+ * any more. That count is bounded by the ranking pool, so on a page emitting
+ * more than `FAILURE_RANK_POOL` failures in the window it reads as a floor.
  */
 function classifiedFailures(
   tabId: number,
   since: number,
   pageUrl: string | null,
-): Record<string, unknown>[] {
+): { entries: Record<string, unknown>[]; benignOmitted: number } {
   const raw = networkFailuresSince(tabId, since, FAILURE_RANK_POOL)
   const annotated = raw.map((e) => {
     const so = sameOriginAs(e.url, pageUrl)
-    const benign = likelyBenign(e, so)
     return {
       entry: {
         ...e,
         ...(so === undefined ? {} : { same_origin: so }),
-        ...(benign ? { likely_benign: true } : {}),
       },
-      // Benign outranks (sorts below) everything, telemetry included: a
-      // tagged entry must never crowd an untagged one out of the cap.
-      rank:
-        (TELEMETRY_TYPES.has(e.resource_type ?? '') ? 2 : 0) +
-        (so === false ? 1 : 0) +
-        (benign ? 4 : 0),
+      rank: (TELEMETRY_TYPES.has(e.resource_type ?? '') ? 2 : 0) + (so === false ? 1 : 0),
+      benign: likelyBenign(e, so),
     }
   })
-  annotated.sort((a, b) => a.rank - b.rank || b.entry.ts - a.entry.ts)
-  const chosen = annotated.slice(0, MAX_CONSOLE_IN_RESULT)
+  const kept = annotated.filter((a) => !a.benign)
+  kept.sort((a, b) => a.rank - b.rank || b.entry.ts - a.entry.ts)
+  const chosen = kept.slice(0, MAX_CONSOLE_IN_RESULT)
   chosen.sort((a, b) => a.entry.ts - b.entry.ts)
-  return chosen.map((c) => c.entry as unknown as Record<string, unknown>)
+  return {
+    entries: chosen.map((c) => c.entry as unknown as Record<string, unknown>),
+    benignOmitted: annotated.length - kept.length,
+  }
+}
+
+/**
+ * The failed-requests block, composed ONCE (#220) so the verification payload
+ * and the stall/error diagnostics cannot drift apart on it.
+ *
+ * Two keys, both absent when they have nothing to say. An absent count means
+ * nothing was omitted; a count with NO `failed_requests` beside it is the
+ * commercial-page shape, where every failure in the window was benign, and it
+ * has to stay visible: a filtered-away list that simply vanished would read as
+ * "no requests failed", which is the same mistake `matched_total` exists to
+ * prevent on the capture reads.
+ */
+function failuresBlock(
+  tabId: number,
+  since: number,
+  pageUrl: string | null,
+): Record<string, unknown> {
+  const { entries, benignOmitted } = classifiedFailures(tabId, since, pageUrl)
+  return {
+    ...(entries.length ? { failed_requests: entries } : {}),
+    ...(benignOmitted ? { failed_requests_benign_omitted: benignOmitted } : {}),
+  }
 }
 
 /**
@@ -530,10 +565,9 @@ function localDiagnostics(
   pageUrl: string | null,
 ): Record<string, unknown> {
   const errors = consoleSince(tabId, startedAt, { only_errors: true, limit: MAX_CONSOLE_IN_RESULT })
-  const failedRequests = classifiedFailures(tabId, startedAt, pageUrl)
   return {
     ...(errors.length ? { console_errors: errors } : {}),
-    ...(failedRequests.length ? { failed_requests: failedRequests } : {}),
+    ...failuresBlock(tabId, startedAt, pageUrl),
   }
 }
 
@@ -2616,7 +2650,7 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
   // window were issued by the urlBefore document, so when the action
   // navigated, judging them against urlAfter would misclassify the very POST
   // whose failure explains the move (review round).
-  const failedRequests = classifiedFailures(v.tabId, v.startedAt, v.urlBefore ?? urlAfter)
+  const failures = failuresBlock(v.tabId, v.startedAt, v.urlBefore ?? urlAfter)
   return {
     action: v.action,
     ...(v.target ? { target: v.target } : {}),
@@ -2637,7 +2671,7 @@ async function buildVerification(v: VerificationInput): Promise<Record<string, u
     input: v.inputMode,
     ...(v.settleResult ? { settled: v.settleResult } : {}),
     ...(errors.length ? { console_errors: errors } : {}),
-    ...(failedRequests.length ? { failed_requests: failedRequests } : {}),
+    ...failures,
     ...(enrichmentSkipped ? { budget_clamped: true } : {}),
     ...(v.extra ?? {}),
   }
@@ -3592,7 +3626,11 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
           }
         }
         inputMode = 'synthetic'
-        extra.synthetic_reason = 'native select popups cannot receive browser-level input'
+        // Teach the next step (#220): the honest reason left an agent with
+        // nowhere to go on a site that ignores synthetic events, and there is
+        // a trusted-input route for exactly that case.
+        extra.synthetic_reason =
+          'native select popups cannot receive browser-level input; if this page ignores synthetic events, send real keys to the same ref instead: action="key" with value "ArrowDown" or "ArrowUp" to move the selection, then "Enter"'
         break
       }
       case 'check':

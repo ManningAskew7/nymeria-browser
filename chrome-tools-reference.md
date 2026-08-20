@@ -334,6 +334,13 @@ Read the visible text of a Chrome tab. Cheaper than a screenshot for prose.
     State that lives in attributes rather than prose is the same story: read it
     with chrome_read_page or chrome_find.
 
+    The count describes THIS read, so a selector localises it: re-read the one
+    region and the number is that region's, which is how you tell a loss in
+    the part you care about from one in the page furniture. A zero there is the
+    strongest evidence available that the region really carries nothing beyond
+    its text (measured: the nearest-id'd-ancestor alternative names a useful
+    place on document-shaped pages and nothing usable on app-shaped ones, #215).
+
     A note also names the document's HTTP status when it was 4xx or 5xx, so an
     error page cannot arrive as ordinary content. The status is the document's
     own, so it needs no extra permission and survives however long ago the page
@@ -800,10 +807,15 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     Each failed_requests entry carries "same_origin" where it can be judged,
     and the capped list is ranked so a broken first-party POST is never
     crowded out by third-party telemetry beacons; weigh same-origin data
-    failures heaviest. An entry tagged "likely_benign": true is a
-    CROSS-ORIGIN request that was canceled or eaten by the user's own
-    content blocker (analytics streams, ad pixels): routine page noise,
-    ranked last, almost never your action's story.
+    failures heaviest. Routine page noise is OMITTED rather than listed: a
+    CROSS-ORIGIN request that was canceled or eaten by the user's own content
+    blocker (analytics streams, ad pixels) is dropped from the list and only
+    counted, as "failed_requests_benign_omitted". A count with NO
+    failed_requests beside it is the ordinary shape on a commercial page and
+    means every failure in the window was that class, never that nothing
+    failed. Omitting it can never cost you a real failure, because a real one
+    always outranks that class; when you do want the entries themselves,
+    chrome_network reads the same buffer unfiltered.
     Navigation is reported honestly. "url_changed" means the tab's URL
     changed, computed after a pending page load commits, so a click that
     navigates reports true with the new URL (an SPA route change reports it

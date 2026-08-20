@@ -174,8 +174,10 @@ POSTs results. Consequences:
   (`github.com/ManningAskew7/nymeria-browser`), gitignored inside the main
   tree, push separately. Module invariants live in module docstrings: read
   them before editing; this file is the standing map, not their
-  replacement. Commits need the trailer
-  `Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`.
+  replacement. Commits need a `Co-Authored-By:` trailer naming the model that
+  actually did the work (`<noreply@anthropic.com>`). This line used to pin
+  "Claude Fable 5" and went stale the moment the driving model changed; the
+  live history is the reference, not this file.
 - Backend tool file: `Nymeria/nymeria/tools/chrome_browser.py`; tests
   `Nymeria/tests/test_chrome_browser_tools.py`; kit
   `Nymeria/nymeria/skills_bundled/browser-control/SKILL.md`; docs rows in
@@ -284,9 +286,17 @@ POSTs results. Consequences:
   claims nothing. `Target.targetInfoChanged` keeps the frame map's URLs
   current (without it, attach-time URLs misattribute in-place navs AND
   refuse fresh refs as `navigated`). Same pass: cross-origin
-  `canceled`/`ERR_BLOCKED_BY_CLIENT` failures with status < 400 tag
-  `likely_benign` and rank LAST (a tag can never evict an untagged
-  entry); same-origin/unparseable/error-status never tag. Since #203
+  `canceled`/`ERR_BLOCKED_BY_CLIENT` failures with status < 400 are the
+  routine-noise class; same-origin/unparseable/error-status never join it.
+  Since #220 (v0.18.0) that class is OMITTED from act payloads rather than
+  ranked last inside them, and rides only as
+  `failed_requests_benign_omitted`. Ranking it last just let it pad whatever
+  the cap of 5 had spare, so a retail click spent all five slots on ad pixels
+  (~6,000 chars, measured). Lossless by construction, since a real failure
+  always outranked it, which is the argument to re-make if anyone proposes
+  un-omitting; `chrome_network` reads the same buffer unfiltered and is the
+  way back to the entries. A count with NO `failed_requests` beside it is the
+  ordinary commercial-page shape, never "nothing failed". Since #203
   (v0.15.x) resolved_frame is THREE-state: absent=root, null=frame
   located with an empty URL, string=live URL; both emission sites
   (target-backed + confirmed keyboard) guard `!== undefined`, never
