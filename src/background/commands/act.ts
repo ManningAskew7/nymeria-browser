@@ -520,7 +520,12 @@ function classifiedFailures(
   tabId: number,
   since: number,
   pageUrl: string | null,
-): { entries: Record<string, unknown>[]; omitted: Record<string, unknown> | null } {
+): {
+  entries: Record<string, unknown>[]
+  /** Non-benign matches BEFORE the cap, so a cut list can say it was cut. */
+  keptTotal: number
+  omitted: Record<string, unknown> | null
+} {
   const raw = networkFailuresSince(tabId, since)
   const annotated = raw.map((e) => {
     const so = sameOriginAs(e.url, pageUrl)
@@ -539,24 +544,53 @@ function classifiedFailures(
   chosen.sort((a, b) => a.entry.ts - b.entry.ts)
 
   const dropped = annotated.filter((a) => a.benign)
-  // Benign entries parse by construction (the class needs `same_origin: false`,
-  // which an unparseable URL can never ground), so the host read cannot throw.
-  const hosts = [...new Set(dropped.map((d) => new URL(String(d.entry.url)).hostname))]
+  const hosts = [...new Set(dropped.map((d) => hostLabel(String(d.entry.url))))]
+  // Error kinds, deduplicated. The QA operator's words on the first shipped
+  // cut: the key "says benign but never says WHY, so I have to take the
+  // extension's word for it", and it could not tell a page's own deliberate
+  // abort from something it should care about without a second call. The
+  // class is two errors wide, so this costs a few characters and turns the
+  // label back into evidence.
+  const errors = [...new Set(dropped.map((d) => String(d.entry.error)))]
   return {
-    entries: chosen.map((c) => c.entry as unknown as Record<string, unknown>),
+    entries: chosen.map((c) => c.entry),
+    // The list the agent ACTS on is capped, and until this was added nothing
+    // said so (review catch): five entries out of seven read as the complete
+    // set, especially beside a summary that carefully counts what IT dropped.
+    // Same `matched_total` rule, applied to the list that matters most.
+    keptTotal: kept.length,
     omitted: dropped.length
       ? {
           count: dropped.length,
           hosts: hosts.slice(0, MAX_BENIGN_HOSTS),
+          errors,
           // Truncation must never read as absence, the same rule `matched_total`
           // enforces on the capture reads. `count` is entries, not hosts, so it
-          // cannot be used to infer that the list was cut.
+          // cannot be used to infer that the host list was cut.
           ...(hosts.length > MAX_BENIGN_HOSTS
             ? { hosts_omitted: hosts.length - MAX_BENIGN_HOSTS }
             : {}),
         }
       : null,
   }
+}
+
+/**
+ * What to call the place a request went, for the omitted-noise summary.
+ *
+ * Benign entries always PARSE (the class needs `same_origin: false`, which an
+ * unparseable URL can never ground) but parsing is not the same as having a
+ * hostname: `blob:`, `data:`, `about:` and `filesystem:` URLs all parse with
+ * `hostname === ""`, and a content-blocker kill on one of those would have put
+ * an empty string in a list the docstring tells agents to READ. A blob URL
+ * carries its real origin, so prefer that; opaque schemes have none, so name
+ * the scheme rather than emitting `"null"`.
+ */
+function hostLabel(url: string): string {
+  const u = new URL(url)
+  if (u.hostname) return u.hostname
+  if (u.origin && u.origin !== 'null') return u.origin
+  return u.protocol.replace(/:$/, '')
 }
 
 /**
@@ -590,10 +624,14 @@ function localDiagnostics(
   pageUrl: string | null,
 ): Record<string, unknown> {
   const errors = consoleSince(tabId, startedAt, { only_errors: true, limit: MAX_CONSOLE_IN_RESULT })
-  const { entries, omitted } = classifiedFailures(tabId, startedAt, pageUrl)
+  const { entries, keptTotal, omitted } = classifiedFailures(tabId, startedAt, pageUrl)
   return {
     ...(errors.length ? { console_errors: errors } : {}),
     ...(entries.length ? { failed_requests: entries } : {}),
+    // Emitted ONLY when the cap actually cut something, so an uncut answer
+    // keeps its shape and this never becomes always-on furniture (the same
+    // rule `matched_total` follows on the capture reads).
+    ...(keptTotal > entries.length ? { failed_requests_total: keptTotal } : {}),
     ...(omitted ? { failed_requests_benign_omitted: omitted } : {}),
   }
 }
@@ -2901,6 +2939,16 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
   // named outright with its answer route; the liveness probe stays behind it
   // for the causes ownership cannot see (a pre-attach dialog, a long-running
   // script). It covers every action, not just the ones with probeable events.
+  // Read BEFORE the two refusals below, because they need it too. `currentUrl`
+  // is a `chrome.tabs.get`, so it never touches the renderer and is safe under
+  // a standing dialog or a hung one. Both refusals used to pass null here,
+  // which silently switched the noise classification OFF on exactly the two
+  // paths where the diagnostics are all the agent has: with no page URL every
+  // entry's origin is unknown, nothing can be classed as routine noise, so the
+  // full ad-pixel list came back AND the omission summary was absent, which
+  // the contract defines as "nothing was omitted" (review catch).
+  const urlBefore = await currentUrl(tabId)
+
   const preDialog = standingDialog(tabId)
   if (preDialog) {
     return {
@@ -2910,7 +2958,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       data: {
         action: a.action,
         dialog: standingDialogPayload(tabId, preDialog),
-        ...localDiagnostics(tabId, startedAt, null),
+        ...localDiagnostics(tabId, startedAt, urlBefore),
       },
     }
   }
@@ -2919,11 +2967,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
       ok: false,
       status: 'error',
       error: stalledError(a.action),
-      data: { action: a.action, ...localDiagnostics(tabId, startedAt, null) },
+      data: { action: a.action, ...localDiagnostics(tabId, startedAt, urlBefore) },
     }
   }
 
-  const urlBefore = await currentUrl(tabId)
   const navSeqBefore = commitSeq(tabId)
   const modifiers = modifierMask(a.modifiers)
   const target = a.ref ?? null
@@ -3655,7 +3702,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         // you were" and moves the agent OFF the option it just asked for
         // (this.value is assigned above, before the reason is composed).
         extra.synthetic_reason =
-          'native select popups cannot receive browser-level input, so the value was set directly. It IS now selected; if this page ignores synthetic events and did not react, re-drive it with trusted keys on the same ref: action="key" with "ArrowDown" or "ArrowUp" moves from the option already selected, so step back to it and confirm with a read before "Enter"'
+          'native select popups cannot receive browser-level input, so the value was set directly and IS now selected. If this page ignores synthetic events and did not react, re-drive it with trusted keys on the same ref: action="key" with "ArrowDown" or "ArrowUp" steps FROM the option already selected and commits each step as it goes, so move to the one you want and re-read to confirm. Do not send Enter to finish: the arrow already committed it, and on a select inside a form Enter can submit the form'
         break
       }
       case 'check':

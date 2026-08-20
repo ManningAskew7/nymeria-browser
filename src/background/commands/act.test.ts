@@ -1793,16 +1793,19 @@ describe('argument handling', () => {
     expect(reason).toMatch(/cannot receive browser-level input/)
     expect(reason, 'names the tool and args, not just "use the keyboard"').toMatch(/action="key"/)
     expect(reason).toMatch(/ArrowDown/)
-    expect(reason).toMatch(/Enter/)
-    // The correction a review round caught: the synthetic path assigns
-    // this.value BEFORE composing the reason, so the option asked for is
-    // already selected. Advice that reads as "arrow, then Enter" walks the
-    // agent OFF it. The copy has to say the value is already applied and that
-    // arrowing moves FROM it.
+    // Correction 1: the synthetic path assigns this.value BEFORE composing the
+    // reason, so the option asked for is already selected. "Arrow, then Enter"
+    // walks the agent OFF it.
     expect(reason, 'says the option is already selected').toMatch(/IS now selected/)
-    expect(reason, 'says arrowing moves from the current option').toMatch(
-      /moves from the option already selected/,
+    expect(reason, 'says arrowing steps from the current option').toMatch(
+      /steps FROM the option already selected/,
     )
+    // Correction 2, and the one with teeth: arrowing a focused select commits
+    // as it goes, so Enter adds nothing, and on a select inside a form Enter
+    // can trigger implicit submission. Advising it would have put an
+    // unintended submit on exactly the checkout pages this item came from.
+    expect(reason, 'warns off Enter rather than recommending it').toMatch(/Do not send Enter/)
+    expect(reason).toMatch(/Enter can submit the form/)
   })
 
   it('fails a select whose value matches no option', async () => {
@@ -6189,7 +6192,7 @@ describe('failed_requests classification', () => {
   // them is LOSSLESS for everything else: a non-benign entry always outranked
   // a benign one, so the class removed is the class already last in line.
 
-  type Omitted = { count?: number; hosts?: string[]; hosts_omitted?: number }
+  type Omitted = { count?: number; hosts?: string[]; errors?: string[]; hosts_omitted?: number }
   const omitted = (r: { data?: unknown }): Omitted | undefined =>
     (r.data as { failed_requests_benign_omitted?: Omitted }).failed_requests_benign_omitted
   const benignCount = (r: { data?: unknown }): unknown => omitted(r)?.count
@@ -6428,6 +6431,150 @@ describe('failed_requests classification', () => {
     expect(o?.count).toBe(25)
     expect(o?.hosts).toHaveLength(20)
     expect(o?.hosts_omitted, 'the five it could not name are still declared').toBe(5)
+  })
+
+  it('says so when the CAP cut real failures, instead of letting five read as all of them', async () => {
+    // The list the agent acts on is capped at 5 and nothing said so, while the
+    // omission summary carefully counted what IT dropped. Beside a docstring
+    // promising the omission costs no real failure, five entries read as the
+    // complete set. Same `matched_total` rule, applied where it matters most.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    for (let i = 0; i < 7; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://example.com/api/real-${i}`,
+        method: 'POST',
+        error: 'net::ERR_FAILED',
+        resource_type: 'XHR',
+        ts: future() + i,
+      })
+    }
+    for (let i = 0; i < 2; i += 1) {
+      pushNetwork(TAB, {
+        url: `https://ads-${i}.example.net/pixel`,
+        method: 'GET',
+        error: 'net::ERR_BLOCKED_BY_CLIENT',
+        resource_type: 'Fetch',
+        ts: future() + 100 + i,
+      })
+    }
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const data = result.data as {
+      failed_requests?: unknown[]
+      failed_requests_total?: number
+    }
+    expect(data.failed_requests).toHaveLength(5)
+    expect(data.failed_requests_total, 'seven matched, five shown').toBe(7)
+    // The discriminating case for what the omission count MEANS. Everywhere
+    // else in this suite the non-benign entries fit inside the cap, so
+    // "benign entries" and "everything the cap dropped" are the same number
+    // and the key's meaning is unpinned. Here they differ: 2 vs 4.
+    expect(omitted(result)?.count, 'counts the benign class, NOT the cap remainder').toBe(2)
+  })
+
+  it('omits failed_requests_total when the cap cut nothing', async () => {
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://example.com/api/save',
+      method: 'POST',
+      error: 'net::ERR_FAILED',
+      resource_type: 'XHR',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect('failed_requests_total' in (result.data as object)).toBe(false)
+  })
+
+  it('names the error kinds it omitted, so "benign" is evidence and not a label', async () => {
+    // The QA operator's finding on the first shipped cut: the key said benign
+    // but never said why, so a deliberate page abort and something worth
+    // caring about looked identical without a second call.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'https://ads.example.net/pixel',
+      method: 'GET',
+      error: 'net::ERR_BLOCKED_BY_CLIENT',
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+    pushNetwork(TAB, {
+      url: 'https://api.example.com/stream',
+      method: 'GET',
+      error: 'canceled',
+      resource_type: 'Fetch',
+      ts: future() + 1,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(omitted(result)?.errors).toEqual(['net::ERR_BLOCKED_BY_CLIENT', 'canceled'])
+  })
+
+  it('never puts an empty host in a list the copy tells agents to read', async () => {
+    // A blob:/data:/about: URL PARSES (so it can ground the class) but has no
+    // hostname, and the naive read put "" in the list.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    pushNetwork(TAB, {
+      url: 'blob:https://ads.example.net/9f8e7d',
+      method: 'GET',
+      error: 'net::ERR_BLOCKED_BY_CLIENT',
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+    pushNetwork(TAB, {
+      url: 'data:text/plain,beacon',
+      method: 'GET',
+      error: 'net::ERR_BLOCKED_BY_CLIENT',
+      resource_type: 'Fetch',
+      ts: future() + 1,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    const hosts = omitted(result)?.hosts ?? []
+    expect(hosts, 'no empty strings').not.toContain('')
+    expect(hosts, 'a blob keeps its real origin; an opaque scheme names itself').toEqual([
+      'https://ads.example.net',
+      'data',
+    ])
+  })
+
+  it('classifies noise on the DIALOG refusal path, where diagnostics are all there is', async () => {
+    // Both pre-dispatch refusals passed a null page URL, so every entry's
+    // origin read as unknown, nothing could be classed as noise, and the full
+    // ad-pixel list came back with the summary ABSENT, which the contract
+    // defines as "nothing was omitted". The exact payload this change exists
+    // to prevent, on the path with the least other signal.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock()
+    vi.mocked(standingDialog).mockReturnValue({
+      type: 'confirm',
+      message: 'Delete this item?',
+      url: TAB_URL,
+      openedAt: Date.now(),
+      deadlineAt: Date.now() + 60_000,
+    })
+    pushNetwork(TAB, {
+      url: 'https://ads.example.net/pixel',
+      method: 'GET',
+      error: 'net::ERR_BLOCKED_BY_CLIENT',
+      resource_type: 'Fetch',
+      ts: future(),
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect('failed_requests' in (result.data as object), 'the pixel is not listed').toBe(false)
+    expect(omitted(result)?.count).toBe(1)
+    expect(omitted(result)?.hosts).toEqual(['ads.example.net'])
   })
 
   it('a burst of noise cannot starve an older real failure out of the ranking', async () => {

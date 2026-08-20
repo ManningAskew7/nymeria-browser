@@ -807,18 +807,22 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     Each failed_requests entry carries "same_origin" where it can be judged,
     and the capped list is ranked so a broken first-party POST is never
     crowded out by third-party telemetry beacons; weigh same-origin data
-    failures heaviest. Routine page noise is OMITTED rather than listed: a
-    CROSS-ORIGIN request that was canceled or eaten by the user's own content
-    blocker (analytics streams, ad pixels) is dropped from the list and
-    summarised as "failed_requests_benign_omitted", an object carrying
-    "count" and the "hosts" those requests went to (plus "hosts_omitted" when
-    there were more hosts than it names). READ THE HOSTS rather than just the
-    count. Cross-origin here is an EXACT origin match, so a site's own api.*
-    subdomain is cross-origin to its www: a request of YOURS that the
-    navigation you just triggered canceled can land in this summary, and the
-    host is how you tell it from an ad pixel. A summary with NO
-    failed_requests beside it is the ordinary shape on a commercial page and
-    means every failure in the window was that class, never that nothing
+    failures heaviest. The list is capped: "failed_requests_total" appears
+    when the cap cut it, and it counts REAL failures, so five entries beside
+    a total of nine means four you cannot see. Routine page noise is OMITTED
+    rather than listed: a CROSS-ORIGIN request that was canceled or eaten by
+    the user's own content blocker (analytics streams, ad pixels) is dropped
+    from the list and summarised as "failed_requests_benign_omitted", an
+    object carrying "count", the "hosts" those requests went to, and the
+    "errors" they failed with (plus "hosts_omitted" when there were more
+    hosts than it names). READ THE HOSTS AND ERRORS rather than just the
+    count: they are what let you re-judge the classification instead of
+    trusting the word "benign". Cross-origin here is an EXACT origin match,
+    so a site's own api.* subdomain is cross-origin to its www: a request of
+    YOURS that the navigation you just triggered canceled can land in this
+    summary, and the host is how you tell it from an ad pixel. A summary with
+    NO failed_requests beside it is the ordinary shape on a commercial page
+    and means every failure in the window was that class, never that nothing
     failed. For the entries themselves, chrome_network reads the same buffer
     unfiltered.
     Navigation is reported honestly. "url_changed" means the tab's URL

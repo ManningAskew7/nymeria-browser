@@ -40,9 +40,18 @@ POSTs results. Consequences:
   pass: `version_after` in the reload result is the build confirmation,
   and a stale value means the rebuild has not landed yet (measured
   2026-08-16: 3 minutes was once not enough; wait ~2 more and retry the
-  reload rather than QA'ing old code). Fallback: a build that fails to
-  load strands the extension (the reload tool cannot revive it); only then
-  ask the user to reload by hand at chrome://extensions.
+  reload rather than QA'ing old code). The 3 minutes are the QA driver's
+  wait, NOT the thread agent's: measured 2026-08-20, a reload fired ~70s
+  after the push returned the OLD version and the extension then went
+  disconnected and stayed there, because the rebuild swapped files under a
+  running extension. So do the waiting BEFORE dispatching the round, and
+  never write a round that says "reload, and if the version is stale wait
+  and reload again": the retry lands inside the rebuild window, which is
+  the one place a reload can strand the thing it is trying to refresh. A
+  stranded extension cannot be revived by the reload tool, so this costs a
+  manual reload at chrome://extensions and blocks QA until the user is
+  around, which on an unattended loop can be hours. Same fallback applies
+  to a build that fails to load.
 - Backend code changes are inert until COMMITTED to main: deploy-sync (a
   5-min idle-gated timer) restarts the stack on commit. Never manually
   restart after a push; for QA of the backend half, commit first, then
@@ -290,9 +299,9 @@ POSTs results. Consequences:
   refuse fresh refs as `navigated`). Same pass: cross-origin
   `canceled`/`ERR_BLOCKED_BY_CLIENT` failures with status < 400 are the
   routine-noise class; same-origin/unparseable/error-status never join it.
-  Since #220 (v0.19.0) that class is OMITTED from act payloads rather than
+  Since #220 (v0.20.0) that class is OMITTED from act payloads rather than
   ranked last inside them, and rides as `failed_requests_benign_omitted`
-  = `{count, hosts, hosts_omitted?}`. Ranking it last just let it pad
+  = `{count, hosts, errors, hosts_omitted?}`. Ranking it last just let it pad
   whatever the cap of 5 had spare, so a retail click spent all five slots on
   ad pixels (~6,000 chars, measured). Dropping it cannot evict a real
   failure, since a real one always outranked it: that is the argument to
@@ -305,12 +314,24 @@ POSTs results. Consequences:
   Order case the item came from. Do not "simplify" the hosts away.
   `chrome_network` reads the same buffer unfiltered and is the way back to
   the entries, though it exposes no `since`, so the reread cannot be scoped
-  to the act's window. A summary with NO `failed_requests` beside it is the
-  ordinary commercial-page shape, never "nothing failed". Same pass removed
-  the `FAILURE_RANK_POOL` pre-truncation (newest 50, applied BEFORE
+  to the act's window. `errors` exists because QA measured the hosts-only
+  cut and said the key "says benign but never says WHY, so I have to take
+  the extension's word for it": the kinds are what let an agent re-judge the
+  classification instead of trusting the label. A summary with NO
+  `failed_requests` beside it is the ordinary commercial-page shape, never
+  "nothing failed". Three more from the same pass. `failed_requests_total`
+  appears when the CAP cut the real list, which nothing said before, and
+  five-of-nine read as all nine especially beside a summary that counts what
+  IT dropped. `FAILURE_RANK_POOL` is gone (newest 50, applied BEFORE
   classification, so a burst of noise starved older real failures out of the
   ranking that exists to protect them); the buffer's own `MAX_PER_TAB` is
-  the bound. Since #203
+  the bound. And both PRE-DISPATCH refusals (standing dialog, unresponsive
+  renderer) now pass the real page URL: they passed `null`, which made every
+  origin unknown, so nothing classified as noise and the payload carried the
+  full ad-pixel list with the summary ABSENT, meaning "nothing omitted", on
+  the two paths where diagnostics are all the agent has. `currentUrl` is a
+  `chrome.tabs.get` and never touches the renderer, so it is safe to read
+  before those gates. Since #203
   (v0.15.x) resolved_frame is THREE-state: absent=root, null=frame
   located with an empty URL, string=live URL; both emission sites
   (target-backed + confirmed keyboard) guard `!== undefined`, never
