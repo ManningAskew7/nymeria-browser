@@ -538,7 +538,26 @@ POSTs results. Consequences:
     window on screen and ignores `clip`. Do not reach for it again.
   - `clip` is DOCUMENT space, not viewport space. A viewport-space rect
     captures the wrong place, or pure white. Add the scroll offset and clamp
-    to `cssContentSize`.
+    to `cssContentSize`. The ECHOED `region.x/y` is therefore document space
+    too, under the same key name as the viewport-space `region` ARGUMENT,
+    which is the mis-aim trap #194 closed: `chrome_act` takes viewport px, so
+    a point in a crop needs divide-by-scale, add-origin, SUBTRACT-scroll, and
+    only the first two were discoverable. The backend now publishes that
+    composed (`region.x - scroll.x`) as a `[Frame]` line. It is WITHHELD when
+    the capture reached off screen, because that pays `captureBeyondViewport`
+    and reflows the page the frame is measured against, mid-capture: the same
+    reason `full_page` never gets one. Do not "simplify" that guard away, and
+    do not publish a frame beside a `[Reflow]` line.
+  - NEVER express a capture-derived conversion as a factor of the returned
+    PNG's pixels. The backend downscales any image past the model's ceiling
+    (2000px on every model checked) before the model sees it, and `autoScale`'s
+    `REGION_SCALE_FLOOR = 2` overrides its own 1600px budget, so a magnified
+    crop is the shape MOST likely to be downscaled: measured, 3200x2400 is
+    delivered at 2000x1500. A first cut of `[Frame]` published
+    `origin + image_x/scale`, went green, and mis-aimed by up to 285x210 CSS
+    px while reporting success. The frame is therefore stated as the CSS BOX
+    the image covers, read by relative position across it, because a
+    proportion has no ratio a resize can invalidate.
   - An off-surface clip returns a SUCCESSFUL capture of one flat colour with
     no error at all, which is why the backend flags a single-colour image.
   - `captureBeyondViewport` permanently reflows the live page (layout

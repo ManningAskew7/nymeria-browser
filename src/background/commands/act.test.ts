@@ -91,6 +91,9 @@ interface MockOptions {
   } | null
   bodyText?: string
   selectMatches?: boolean
+  /** Where the matched option sits, which drives the resolved arrow direction
+   *  in the recovery copy (#230). Default is a middle option of three. */
+  selectPosition?: { index: number; count: number }
   /** false models a tab where the delivery probe's world cannot be created. */
   deliveryWorld?: boolean
   /** false models a tab where the TRUST probes' world cannot be created. */
@@ -218,6 +221,7 @@ function installCdpMock(opts: MockOptions = {}) {
     scrollAfter = null,
     bodyText = '',
     selectMatches = true,
+    selectPosition = { index: 1, count: 3 },
     deliveryWorld = true,
     probeWorld = true,
     deliveryCount = 1,
@@ -365,7 +369,11 @@ function installCdpMock(opts: MockOptions = {}) {
         return { result: { value: targetConnected } }
       }
       if (fn.includes('ownerDocument')) return { result: { value: targetInTopDocument } }
-      if (fn.includes('this.options')) return { result: { value: selectMatches } }
+      if (fn.includes('this.options')) {
+        // The probe returns the matched option's POSITION (or null), not a
+        // boolean: the recovery copy resolves the arrow direction from it.
+        return { result: { value: selectMatches ? selectPosition : null } }
+      }
       if (fn.includes('atob')) return { result: { value: { ok: true, mode: 'file-input' } } }
       if (fn.includes('this.checked') && fn.includes('return')) return { result: { value: value } }
       if (fn.includes('this.value !== undefined')) return { result: { value } }
@@ -1804,9 +1812,15 @@ describe('argument handling', () => {
     expect(reason, 'names the real problem as a missing trusted event').toMatch(
       /missing is a TRUSTED event on it, not navigation/,
     )
-    expect(reason, 'prescribes the away-and-back pair').toMatch(/arrow ONE step away and one step back/)
-    expect(reason, 'covers the last-option case where one direction is a no-op').toMatch(
-      /the reverse if you are on the last option/,
+    // Correction 4 (#230), from the QA operator again: the copy USED to say
+    // '"ArrowDown" then "ArrowUp", or the reverse if you are on the last
+    // option' without saying whether this WAS the last option, sending the
+    // agent to re-read the page and count. The probe already knows.
+    expect(reason, 'prescribes a resolved key pair, not a conditional').toMatch(
+      /send "ArrowDown" then "ArrowUp"/,
+    )
+    expect(reason, 'and no longer makes the agent work out the direction').not.toMatch(
+      /if you are on the last option/,
     )
     // Correction 2, and the one with teeth: arrowing a focused select commits
     // as it goes, so Enter adds nothing, and on a select inside a form Enter
@@ -1814,6 +1828,82 @@ describe('argument handling', () => {
     // unintended submit on exactly the checkout pages this item came from.
     expect(reason, 'warns off Enter rather than recommending it').toMatch(/Do not send Enter/)
     expect(reason).toMatch(/Enter can submit the form/)
+  })
+
+  it('reports the matched option position from the page, not from the caller', () => {
+    // Runs the INJECTED body against a stub select. The CDP layer is mocked
+    // everywhere else in this file, so the probe's own arithmetic is otherwise
+    // never executed: a mutation hardcoding `index: 0` passed all 312 tests.
+    // The index is what resolves the arrow direction, so it has to be real.
+    const events: string[] = []
+    const makeSelect = (labels: string[]) => ({
+      options: labels.map((text) => ({ value: text.toLowerCase(), label: '', text })),
+      value: '',
+      dispatchEvent(e: { type: string }) {
+        events.push(e.type)
+        return true
+      },
+    })
+    const run = (el: unknown, v: string) =>
+      new Function(`return (${__test.SET_SELECT_OPTION}).apply(this, arguments)`).call(
+        el,
+        v,
+      ) as { index: number; count: number } | null
+
+    const three = makeSelect(['Standard', 'Express', 'Overnight'])
+    expect(run(three, 'Overnight'), 'the LAST option reports index 2 of 3').toEqual({
+      index: 2,
+      count: 3,
+    })
+    expect(three.value, 'and the value is actually set').toBe('overnight')
+    expect(events, 'both events fire, in order, so a listening page reacts').toEqual([
+      'input',
+      'change',
+    ])
+
+    const mid = makeSelect(['Standard', 'Express', 'Overnight'])
+    expect(run(mid, 'Express'), 'a middle option is not reported as last').toEqual({
+      index: 1,
+      count: 3,
+    })
+
+    expect(run(makeSelect(['Only']), 'Only'), 'a lone option is index 0 of 1').toEqual({
+      index: 0,
+      count: 1,
+    })
+    expect(run(makeSelect(['Standard']), 'Teleport'), 'and a miss is null, not a position').toBe(
+      null,
+    )
+  })
+
+  it('reverses the arrow pair on the last option, where ArrowDown is a no-op', async () => {
+    // The whole reason the old copy carried a conditional: arrowing past the
+    // end of a select does nothing, so the away step has to go INWARD. Getting
+    // this backwards means the recovery fires no event at all and the agent
+    // concludes the page is unfixable.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ selectMatches: true, selectPosition: { index: 2, count: 3 } })
+
+    const result = await execAct({ tab_id: TAB, action: 'select', ref: '@e1', value: 'Overnight' })
+
+    const reason = String((result.data as { synthetic_reason?: string }).synthetic_reason)
+    expect(reason, 'steps inward first, then back out').toMatch(/send "ArrowUp" then "ArrowDown"/)
+  })
+
+  it('says a one-option select has no trusted-input route rather than advising a no-op', async () => {
+    // Degenerate case the resolved form has to handle: with nothing to arrow
+    // to, the away-and-back pair fires no change event. Emitting the advice
+    // anyway would be confidently useless, which is the class this surface
+    // exists to remove.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ selectMatches: true, selectPosition: { index: 0, count: 1 } })
+
+    const result = await execAct({ tab_id: TAB, action: 'select', ref: '@e1', value: 'Only' })
+
+    const reason = String((result.data as { synthetic_reason?: string }).synthetic_reason)
+    expect(reason, 'names the actual situation').toMatch(/only one option/)
+    expect(reason, 'and does not prescribe an arrow that cannot fire').not.toMatch(/Arrow/)
+    expect(reason, 'but still says what IS left').toMatch(/a real user gesture or a different control/)
   })
 
   it('fails a select whose value matches no option', async () => {

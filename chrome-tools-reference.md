@@ -608,7 +608,10 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         Viewport CSS pixels, which are NOT the pixels of a screenshot on a
         HiDPI display or a zoomed page: convert with the image and viewport
         sizes chrome_screenshot reports before aiming at something you saw
-        in a picture.
+        in a picture. A region capture is the exception: it publishes a
+        "[Frame]" line, and that box is the conversion for that image, so
+        use it instead of the two sizes. Whole numbers only, a fractional
+        pair is rejected.
     modifiers: any of ["Ctrl", "Shift", "Alt", "Meta"].
     direction / amount_px: for scroll (default down, 500px). action="scroll"
         with a ref wheels AT that element (at its visible point), which
@@ -967,8 +970,10 @@ Capture what the user's Chrome tab looks like, and see it.
         that part of the page. Chrome RE-RENDERS the region rather than
         cropping the picture, so region_scale above the display's own pixel
         ratio (reported with every capture) resolves detail no crop of the
-        full image could. A region that runs past the edge of the viewport is
-        trimmed to it and says so.
+        full image could. A region may reach BELOW the fold without scrolling:
+        it is trimmed to the DOCUMENT, not to the viewport, and says so when
+        it was. Reaching off screen reflows the page to do it (the payload's
+        [Reflow] line), which is why an off-screen region gets no [Frame].
     region_ref: what to capture instead of a rectangle, as a "@eN" ref or a
         "css=" / "xpath=" selector; its box is measured in the page. Selectors
         are the route to anything the tree mints no ref for, static text and
@@ -992,9 +997,20 @@ Capture what the user's Chrome tab looks like, and see it.
     the page zoom when it is not 100%. chrome_act(coordinate=...) takes
     viewport CSS pixels, and those are NOT image pixels on a HiDPI display or
     a zoomed page, so convert with the two reported sizes before aiming at
-    something you spotted in a picture. A region or full_page image is not a
-    picture of the viewport at all, so no coordinate can be read off it
-    directly.
+    something you spotted in a picture. A full_page image is not a picture of
+    the viewport at all, so no coordinate can be read off it directly.
+
+    A region image is not one either, but it carries its own conversion. When
+    the geometry can be trusted, the payload adds a "[Frame]" line naming the
+    viewport CSS box THAT capture covers, so a point you spotted in the crop
+    becomes a chrome_act coordinate by where it sits across the image: read
+    it as a proportion between the stated edges and round, rather than
+    working back to the full picture by eye. Proportional on purpose, so it
+    survives the image being downscaled on its way to you. It holds until the
+    page scrolls. No [Frame] means the geometry could not be trusted, most
+    often because the capture reached off screen and reflowed the page it
+    would be measured against; the other lines say what could not be
+    corroborated.
 
     Trust that viewport over one you measured yourself a moment earlier.
     Driving a tab puts Chrome's "being debugged" infobar on it, which shortens
