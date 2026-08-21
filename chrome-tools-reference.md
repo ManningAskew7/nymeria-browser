@@ -68,12 +68,14 @@ List or manage tabs in the user's Chrome. Start here to get a tab_id.
     zoom: for action="zoom". Omit it to READ the tab's zoom, give a factor
         (0.25 to 5.0, so 1.5 is 150%) to set it, or 0 to undo a set.
 
-    Read the zoom before trusting a coordinate on an unfamiliar tab. Page zoom
-    is per-site and sticky in Chrome, so a tab can be sitting at 125% from
-    something the user did weeks ago, and at any zoom but 100% a region
-    capture is aimed at the wrong box and publishes no [Frame] (#231). "zoom"
-    is how you find that out, and how you fix it: set 1.0, do the work, then
-    send 0.
+    Page zoom is per-site and sticky in Chrome, so a tab can be sitting at
+    125% from something the user did weeks ago. Captures handle that
+    themselves (a zoomed region capture folds the zoom in and still carries
+    its [Frame]; if you instead see a [Zoom] line with no [Frame] and no
+    stated reason, the extension build predates the fold, and zoom=1.0
+    restores coordinates); "zoom" is for when you want the zoom itself: read
+    it (omit the factor, free), change it for legibility or layout testing,
+    then send 0 to hand the tab back to the user's own setting.
 
     Setting is deliberately TEMPORARY and confined to the one tab. Chrome's
     ordinary zoom is per-site and permanent, and quietly rewriting a user's
@@ -81,7 +83,10 @@ List or manage tabs in the user's Chrome. Start here to get a tab_id.
     wanted one accurate screenshot is not a trade this tool makes. The cost of
     that choice is that a set does NOT survive a navigation, so re-apply it
     after one. Sending 0 hands the tab back to the user's own setting, which
-    is why it is the undo rather than "zoom to zero".
+    is why it is the undo rather than "zoom to zero". Undo, not
+    reset-to-100%: on a site whose saved preference is not 100%, zoom=0
+    returns THERE (a payload with scope "per-origin" is the tell); send an
+    explicit zoom=1.0 when you need a true 100%.
 
     "create" and "reload" wait for the page to load and report `complete`,
     exactly as chrome_navigate does, so the tab you get back is one you can
@@ -1038,9 +1043,14 @@ Capture what the user's Chrome tab looks like, and see it.
     survives the image being downscaled on its way to you. It holds until the
     page scrolls. No [Frame] means the geometry could not be trusted: most
     often the capture reached off screen and reflowed the page it would be
-    measured against, and it is also withheld on any zoomed page, where the
-    capture itself is aimed at the wrong box. The other lines say what could
-    not be corroborated.
+    measured against, and it is also withheld when the extension could not
+    read the page's zoom to aim the clip (the payload says so when that is
+    the case). A zoomed page is otherwise no exception: the capture folds
+    the zoom in and the frame stays valid. Exception to the exception: an
+    older extension build that does not fold the zoom gets the pre-fold
+    withhold at any zoom, recognizable as a [Zoom] line with no [Frame] and
+    no stated reason; resetting zoom to 1.0 restores coordinates there. The
+    other lines say what could not be corroborated.
 
     Trust that viewport over one you measured yourself a moment earlier.
     Driving a tab puts Chrome's "being debugged" infobar on it, which shortens
