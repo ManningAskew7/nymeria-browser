@@ -37,8 +37,14 @@ const REGION_SCALE_MAX = 4
 const REGION_AUTO_BUDGET_PX = 1600
 const REGION_SCALE_FLOOR = 2
 
-function autoScale(rect: Rect): number {
-  const longest = Math.max(rect.width, rect.height)
+/** The budget is OUTPUT pixels, and output is clip-in-DIP x scale, so the
+ *  page-zoom fold divides what fits (#231): an 800 CSS px box on a 150% page
+ *  renders 1200 DIP wide before scale, and ignoring that would let auto
+ *  picks sail past the model's delivery ceiling on exactly the zoomed pages
+ *  the fold fixed. The floor still wins below it, deliberately: legibility
+ *  was the reason the floor exists. */
+function autoScale(rect: Rect, fold: number): number {
+  const longest = Math.max(rect.width, rect.height) * (fold > 0 ? fold : 1)
   if (!(longest > 0)) return REGION_SCALE_FLOOR
   const fits = Math.floor(REGION_AUTO_BUDGET_PX / longest)
   return Math.min(REGION_SCALE_MAX, Math.max(REGION_SCALE_FLOOR, fits))
@@ -394,6 +400,11 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
   let clip: (Rect & { scale: number }) | null = null
   let clamped = false
   let beyondViewport = false
+  // The CSS-to-DIP fold, decided ONCE for both its consumers (autoScale's
+  // output budget and the wire clip): two copies of this predicate would be
+  // a budget for a fold the wire did not get, or vice versa. Null means the
+  // metrics read could not answer (or answered junk) and nothing is folded.
+  let clipZoom: number | null = null
   if (wantsRegion) {
     metrics = await readMetrics(a.tab_id)
     if (!metrics.scroll) {
@@ -458,10 +469,11 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
       bounded.y !== inDocument.y ||
       bounded.width !== inDocument.width ||
       bounded.height !== inDocument.height
+    clipZoom = metrics.zoom !== null && metrics.zoom > 0 ? metrics.zoom : null
     const asked = finite(a.region_scale)
     const scale =
       asked === null
-        ? autoScale(bounded)
+        ? autoScale(bounded, clipZoom ?? 1)
         : Math.min(Math.max(asked, REGION_SCALE_MIN), REGION_SCALE_MAX)
     // Only a box that is not entirely on screen needs the beyond-viewport
     // path, and that path is not free (see below), so it is asked for only
@@ -474,6 +486,32 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
       : true
     clip = { ...bounded, scale }
   }
+
+  // CDP's `clip` is DEVICE INDEPENDENT px (CSS x page zoom), while every rect
+  // source here answers CSS px, so the zoom multiply happens HERE, once, on
+  // the wire payload only. Measured live 2026-08-21 (backlog #231): a CSS-px
+  // clip sent at 150% zoom captured a box ~1/1.5 of the way back toward the
+  // page origin (a ref-measured element came back as blank margin), while the
+  // returned PNG still measured sent-width x scale, so no downstream check
+  // could see it. Corroborated by openai/codex#19429, the same bug in another
+  // CDP driver, fixed by the same multiply. The ECHO stays CSS px untouched:
+  // the backend's [Frame] composes `region.x - scroll.x` in CSS, and an
+  // in-place multiply would break it in a new way. When zoom is unreadable
+  // (`Page.getLayoutMetrics` deadlined), the clip goes out unmultiplied and
+  // `clip_zoom: null` says so; defaulting an unknown zoom to 1 would silently
+  // restore the bug on exactly the pages that are slow to answer, and the
+  // backend withholds the frame on a null rather than trusting the aim.
+  const cdpClip = !clip
+    ? null
+    : clipZoom === null
+      ? clip
+      : {
+          x: clip.x * clipZoom,
+          y: clip.y * clipZoom,
+          width: clip.width * clipZoom,
+          height: clip.height * clipZoom,
+          scale: clip.scale,
+        }
 
   const resp = await sendCommand<{ data: string }>(a.tab_id, 'Page.captureScreenshot', {
     format: 'png',
@@ -488,7 +526,7 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
     // successful capture of PURE WHITE with no error anywhere. Everything
     // else clips off the visible surface and leaves the page alone.
     captureBeyondViewport: fullPage || beyondViewport,
-    ...(clip ? { clip } : {}),
+    ...(cdpClip ? { clip: cdpClip } : {}),
   })
 
   if (!metrics) metrics = await readMetrics(a.tab_id)
@@ -518,7 +556,12 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
       scale: metrics.scale,
       zoom: metrics.zoom,
       scroll: metrics.scroll,
-      region: clip ? { ...clip, clamped, beyond_viewport: beyondViewport } : null,
+      // `clip_zoom` is the CSS-to-DIP factor folded into the clip Chrome was
+      // ASKED for (null when zoom was unreadable and nothing was folded).
+      // The backend verifies the claim against the PNG itself: a real clip
+      // returns width x scale x clip_zoom, so a wrong factor is disowned by
+      // the size cross-check rather than trusted.
+      region: clip ? { ...clip, clamped, beyond_viewport: beyondViewport, clip_zoom: clipZoom } : null,
       beyond_viewport: reachedBeyond,
     },
   }

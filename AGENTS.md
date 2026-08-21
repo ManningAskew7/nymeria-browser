@@ -98,7 +98,14 @@ POSTs results. Consequences:
   Set the model on a new thread (`/model claude-opus-5 thread`); a fresh
   thread otherwise inherits the default, which is not the QA-grade one.
 - After an extension push, the round starts with `chrome_reload_extension`
-  (see the deploy flow above) so QA always runs the just-shipped code.
+  (see the deploy flow above) so QA always runs the just-shipped code. A
+  round measuring ALREADY-shipped behavior opens with it too: measured
+  2026-08-21, the running build was a day stale (#233's zoom action erroring
+  as unknown) because nothing reloads the user's Chrome until a round does.
+- Verify the round RAN on the model you set (`context_stats.model`): a
+  thread whose turns failed during a provider outage can wedge onto the
+  fallback model while `/model` still shows the override (backlog #236,
+  measured 2026-08-21; a haiku-driven round misread its own instructions).
 - Standing user request: after functional rounds, ALWAYS ask the thread
   agent for its opinion/suggestions on the tooling as its operator, and
   relay those to the user (they routinely become backlog rows).
@@ -569,15 +576,24 @@ POSTs results. Consequences:
     do not publish a frame beside a `[Reflow]` line.
   - `clip` is documented in DEVICE INDEPENDENT px, while `getBoundingClientRect`,
     `getContentQuads` and `scrollX` are CSS px. `cssVisualViewport.zoom` is the
-    documented conversion, and `screenshot.ts` reads it but only REPORTS it, so
-    at any zoom other than 100% the clip asks for the wrong box (worked
-    example at 150%: 423x257 CSS px out). Silent, because the PNG still
-    returns at `clip.width * scale` and the backend's corroboration passes.
-    Backlog #231, and the backend withholds `[Frame]` at any zoom until it is
-    fixed. It was filed UNCONFIRMED only because nothing could set zoom;
-    `chrome_tabs(action="zoom")` shipped in v0.22.0 (#233), so **confirming it
-    is now one round**: set 150%, region-capture a known element, look at
-    whether the crop shows that element. Setting is per-TAB and temporary on
+    documented conversion. CONFIRMED live and FIXED in v0.23.0 (#231, measured
+    2026-08-21: a ref-measured element at 150% came back as blank margin,
+    content ~1/1.5 toward the origin, while the PNG size check passed
+    cleanly). The multiply lives at ONE seam, the `cdpClip` built beside the
+    `Page.captureScreenshot` call: `clampToContent` and the beyond-viewport
+    test upstream are CSS-px comparisons, and the ECHO stays CSS px because
+    the backend's `[Frame]` composes `region.x - scroll.x` in CSS. The echo
+    carries `clip_zoom` (the folded factor; null when zoom was unreadable, in
+    which case the clip goes out UNMULTIPLIED and the backend withholds the
+    frame rather than trust the aim; never default a null zoom to 1). The
+    same measurement settled #227: devicePixelRatio folds NOTHING into a
+    clipped capture's output, the PNG is sent-clip x scale exactly. Two
+    contracts the backend now rests on: its frame verdict requires
+    `clip_zoom` to EQUAL the payload's top-level zoom, which holds only
+    because both are the one `getLayoutMetrics` read (never split those
+    sources); and `autoScale`'s 1600px budget is OUTPUT px, so the fold
+    divides what fits (explicit `region_scale` is only clamped, unchanged).
+    `chrome_tabs(action="zoom")` (#233, v0.22.0) is per-TAB and temporary on
     purpose, since Chrome's ordinary zoom scope is per-origin and would
     permanently rewrite the user's preference for the whole site.
   - NEVER express a capture-derived conversion as a factor of the returned
@@ -603,8 +619,10 @@ POSTs results. Consequences:
     comes only from `getLayoutMetrics`.
   - Chrome rounds the clip box before rendering, so a fractional element box
     returns a few pixels off `width x scale` (measured: 244 where 248 was
-    predicted). The backend's did-Chrome-actually-clip cross-check is
-    therefore RELATIVE (5%), not an absolute pixel window.
+    predicted). The backend's did-Chrome-actually-clip cross-check is an
+    ABSOLUTE window sized to that rounding, `max(4, 2 x scale x clip_zoom
+    + 2)` per axis (it was relative 5% until the #194 review made it gate a
+    coordinate frame; a 5% window on a wide box was real mis-aim).
   - Backgrounded-tab capture is not slow and not stale: ~1.3s with live
     pixels, canvas and composited layers included, through the tool and
     through raw CDP. The old "backgrounded tabs capture badly" premise did

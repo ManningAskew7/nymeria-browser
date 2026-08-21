@@ -198,9 +198,11 @@ export async function execTabs(args: unknown): Promise<CommandResult> {
         }
       }
 
-      // No factor given is a READ. Cheap, and the only way for a driving agent
-      // to discover it is on a zoomed page at all: page zoom silently breaks
-      // every coordinate the capture path produces (#231).
+      // No factor given is a READ. Cheap, and the only way for a driving
+      // agent to know a tab's zoom at all. Captures fold the zoom into their
+      // clip themselves since #231; the read remains useful for legibility
+      // and layout work, and on a build predating the fold it is still the
+      // way to discover why every frame is being withheld.
       if (a.zoom === undefined || a.zoom === null) return report({})
 
       // 0 is the UNDO, and it is a scope restore rather than a factor. Setting

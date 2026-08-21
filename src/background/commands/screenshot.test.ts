@@ -29,6 +29,7 @@ interface MockOpts {
   /** Make the probe-world lookup resolve to no element at all. */
   selectorMisses?: boolean
   contentSize?: { width: number; height: number }
+  zoom?: number
 }
 
 function installCdpMock(opts: MockOpts = {}) {
@@ -44,7 +45,7 @@ function installCdpMock(opts: MockOpts = {}) {
             clientHeight: 705,
             pageX: 7,
             pageY: 407,
-            zoom: 1.5,
+            zoom: opts.zoom ?? 1.5,
           },
           cssContentSize: opts.contentSize ?? { width: 1280, height: 5000 },
         }
@@ -306,10 +307,12 @@ describe('execScreenshot', () => {
 
 describe('execScreenshot regions', () => {
   it('puts the asked-for rectangle where clip actually reads it, in the document', async () => {
-    // The agent's rect is VIEWPORT space (it read it off a screenshot) and
-    // `clip` is DOCUMENT space. Measured live 2026-08-16: scrolled to 600, a
-    // clip.y of 0 returned the document top. The mock is scrolled to y=400, so
-    // a region at viewport y=400 is document y=800. Get this backwards and the
+    // The agent's rect is VIEWPORT space (it read it off a screenshot), the
+    // ECHO is DOCUMENT space, and the wire clip is DOCUMENT space times page
+    // zoom, because CDP's clip reads device-independent px (#231, measured
+    // live 2026-08-21: a CSS-px clip at 150% captured a box ~1/1.5 toward the
+    // origin). The mock is scrolled to y=400 at zoom 1.5, so viewport y=400 is
+    // document y=800 and wire y=1200. Get either conversion backwards and the
     // picture is of somewhere else, or of nothing at all.
     const mock = installCdpMock()
 
@@ -320,10 +323,10 @@ describe('execScreenshot regions', () => {
     })
 
     expect(paramsOf(captureOf(mock)).clip).toEqual({
-      x: 200,
-      y: 800,
-      width: 140,
-      height: 60,
+      x: 300,
+      y: 1200,
+      width: 210,
+      height: 90,
       scale: 3,
     })
     expect((result.data as { region: unknown }).region).toEqual({
@@ -334,7 +337,45 @@ describe('execScreenshot regions', () => {
       scale: 3,
       clamped: false,
       beyond_viewport: false,
+      clip_zoom: 1.5,
     })
+  })
+
+  it('sends the clip untouched at zoom 1, and says which factor it folded', async () => {
+    // The identity case must stay byte-identical to the pre-#231 wire shape:
+    // a 100% page is the common case and the multiply must cost it nothing.
+    const mock = installCdpMock({ zoom: 1 })
+
+    const result = await execScreenshot({ tab_id: TAB, region: [200, 400, 140, 60], region_scale: 3 })
+
+    expect(paramsOf(captureOf(mock)).clip).toEqual({ x: 200, y: 800, width: 140, height: 60, scale: 3 })
+    expect((result.data as { region: { clip_zoom: number } }).region.clip_zoom).toBe(1)
+  })
+
+  it('treats a zero or negative zoom as unreadable, not as a fold', async () => {
+    // Page.getLayoutMetrics answering 0 is a junk reading, and folding it in
+    // would collapse the clip to nothing. Same rule as null: unmultiplied
+    // wire clip, clip_zoom null, backend withholds the frame.
+    const mock = installCdpMock({ zoom: 0 })
+
+    const result = await execScreenshot({ tab_id: TAB, region: [200, 400, 140, 60], region_scale: 3 })
+
+    expect(paramsOf(captureOf(mock)).clip).toEqual({ x: 200, y: 800, width: 140, height: 60, scale: 3 })
+    expect((result.data as { region: { clip_zoom: null } }).region.clip_zoom).toBeNull()
+  })
+
+  it('does not guess a zoom it could not read, and says so (#231)', async () => {
+    // With Page.getLayoutMetrics gone the zoom is unknown. Defaulting it to 1
+    // would silently restore the misaim on exactly the pages that are slow to
+    // answer, so the clip goes out unmultiplied and clip_zoom is null: the
+    // backend withholds the coordinate frame on a null rather than trusting
+    // an aim nothing verified.
+    const mock = installCdpMock({ noLayoutMetrics: true })
+
+    const result = await execScreenshot({ tab_id: TAB, region: [200, 400, 140, 60], region_scale: 3 })
+
+    expect(paramsOf(captureOf(mock)).clip).toEqual({ x: 200, y: 800, width: 140, height: 60, scale: 3 })
+    expect((result.data as { region: { clip_zoom: null } }).region.clip_zoom).toBeNull()
   })
 
   it('reaches past the viewport only for a box that is not entirely on screen', async () => {
@@ -384,6 +425,20 @@ describe('execScreenshot regions', () => {
     expect(scales[2], 'an explicit ask still wins').toBe(1)
   })
 
+  it('budgets the auto scale in OUTPUT pixels, so the zoom fold divides what fits', async () => {
+    // The 1600px budget is output pixels and output is clip-in-DIP x scale
+    // (#231), so a 500px box fits scale 3 on a 100% page but only 2 at 150%:
+    // ignoring the fold would sail auto picks past the delivery ceiling on
+    // exactly the zoomed pages the fold fixed.
+    const at100 = installCdpMock({ zoom: 1 })
+    await execScreenshot({ tab_id: TAB, region: [0, 0, 500, 100] })
+    const at150 = installCdpMock({ zoom: 1.5 })
+    await execScreenshot({ tab_id: TAB, region: [0, 0, 500, 100] })
+
+    expect((paramsOf(captureOf(at100)).clip as { scale: number }).scale).toBe(3)
+    expect((paramsOf(captureOf(at150)).clip as { scale: number }).scale).toBe(2)
+  })
+
   it('holds an explicit region scale inside its bounds', async () => {
     const mock = installCdpMock()
 
@@ -406,11 +461,11 @@ describe('execScreenshot regions', () => {
     const result = await execScreenshot({ tab_id: TAB, region: [1200, 700, 400, 400] })
 
     expect(paramsOf(captureOf(mock)).clip).toEqual({
-      x: 1200,
-      y: 1100,
-      width: 80,
-      height: 400,
-      scale: 4,
+      x: 1800,
+      y: 1650,
+      width: 120,
+      height: 600,
+      scale: 2,
     })
     expect((result.data as { region: { clamped: boolean } }).region.clamped).toBe(true)
   })
@@ -470,12 +525,13 @@ describe('execScreenshot regions', () => {
     const result = await execScreenshot({ tab_id: TAB, region_ref: '@e1' })
 
     expect(result.ok).toBe(true)
-    // Quads are viewport-relative, clip is document-relative, page scrolled 400.
+    // Quads are viewport-relative, the clip is document-relative times the
+    // 1.5 page zoom (CDP clips in device-independent px), page scrolled 400.
     expect(paramsOf(captureOf(mock)).clip).toEqual({
-      x: 200,
-      y: 800,
-      width: 140,
-      height: 60,
+      x: 300,
+      y: 1200,
+      width: 210,
+      height: 90,
       scale: 4,
     })
   })
@@ -494,10 +550,10 @@ describe('execScreenshot regions', () => {
 
     expect(result.ok).toBe(true)
     expect(paramsOf(captureOf(mock)).clip).toEqual({
-      x: 10,
-      y: 420,
-      width: 100,
-      height: 40,
+      x: 15,
+      y: 630,
+      width: 150,
+      height: 60,
       scale: 4,
     })
   })
@@ -556,12 +612,13 @@ describe('execScreenshot regions', () => {
     const result = await execScreenshot({ tab_id: TAB, region_ref: 'css=#tiny-a' })
 
     expect(result.ok).toBe(true)
-    // Viewport box plus the scroll offset (400), as any other region.
+    // Viewport box plus the scroll offset (400), then the 1.5 zoom fold, as
+    // any other region.
     expect(paramsOf(captureOf(mock)).clip).toEqual({
-      x: 40,
-      y: 460,
-      width: 220,
-      height: 18,
+      x: 60,
+      y: 690,
+      width: 330,
+      height: 27,
       scale: 4,
     })
     const lookup = mock.mock.calls.find(
@@ -647,11 +704,11 @@ describe('execScreenshot regions', () => {
     await execScreenshot({ tab_id: TAB, region_ref: '@e1' })
 
     expect(paramsOf(captureOf(mock)).clip).toEqual({
-      x: 100,
-      y: 500,
-      width: 500,
-      height: 40,
-      scale: 3,
+      x: 150,
+      y: 750,
+      width: 750,
+      height: 60,
+      scale: 2,
     })
   })
 
