@@ -36,7 +36,12 @@ POSTs results. Consequences:
   EXACTLY 3 minutes (the user's machine auto-pulls and rebuilds on its own
   schedule), then start the QA session on the sanctioned thread and have it
   run `chrome_reload_extension` FIRST, before any testing. No manual step
-  remains in the ordinary loop. Bump the manifest version each shipped
+  remains in the ordinary loop. Since #223 (backend, 2026-08-22) a
+  tab-free `chrome_health` reports the ANNOUNCED build and its age with
+  NO dispatch, so the driver can poll for the rebuild's announce cheaply
+  before firing the reload; it proves subscription, not execution, so
+  `version_after` stays the execution-grade confirmation. Bump the
+  manifest version each shipped
   pass: `version_after` in the reload result is the build confirmation,
   and a stale value means the rebuild has not landed yet (measured
   2026-08-16: 3 minutes was once not enough; wait ~2 more and retry the
@@ -123,6 +128,14 @@ POSTs results. Consequences:
 - Etiquette: fresh tabs only, close QA tabs at the end, never touch the
   user's own tabs. The browser-control kit binds with a 2h TTL; the agent
   re-binds itself when lapsed.
+- Fixture catalog for ROUND PROMPTS (#235, 2026-08-22): the main repo's
+  `Nymeria/docs/private/browser-qa-fixtures.md` lists every `nymeria-qa-*`
+  gist page with its inventory in paste-able rows, plus the known fixture
+  gaps. The DRIVEN agent cannot discover fixtures on its own (its
+  filesystem is the container's), so a round that needs one carries the
+  URL and inventory in the prompt, or the catalog is seeded into the QA
+  thread's notepad once. Keep the catalog and this file's traps in step
+  when adding a fixture.
 - Reliable QA targets: `https://example.com/` (200),
   `https://www.google.com/nonexistent-page-xyz` (real 404),
   `https://the-internet.herokuapp.com/upload` (file input + Upload button,
@@ -731,8 +744,8 @@ verifying with `diff -q`.
 
 `chrome-tools-reference.md` beside this file is the VERBATIM 14-tool kit
 surface (args schema + model-facing docstring per tool), generated from the
-live code at backend commit `3178b155` / extension `b8b2b4d` (v0.23.0,
-2026-08-21).
+live code at backend commit `b77785e3` / extension `b8b2b4d` (v0.23.0,
+2026-08-22).
 It is a convenience snapshot and can lag `chrome_browser.py`; the code is
 the truth. Regenerate after any tool change (from this repo root):
 

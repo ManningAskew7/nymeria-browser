@@ -1340,8 +1340,16 @@ Args schema:
 ```json
 {
   "tab_id": {
-    "title": "Tab Id",
-    "type": "integer"
+    "anyOf": [
+      {
+        "type": "integer"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Tab Id"
   }
 }
 ```
@@ -1355,6 +1363,15 @@ One read that says whether a Chrome tab is healthy and what state it is in.
     something that failed: it replaces scattering probes across chrome_console,
     chrome_network and a throwaway action. It has NO side effects: it does not
     attach the tab, start capture, or touch the page.
+
+    Call it with NO tab_id for a session-start CONNECTION PROBE: answered
+    entirely from the backend's own records, nothing is sent to the extension,
+    so it works before any tab exists and cannot disturb driving state. It
+    reports whether an extension event stream is subscribed, the build it
+    announced, and how long ago; that proves subscription, NOT execution (the
+    result says so), so use it to poll for a connection or a new build after a
+    deploy without paying a reload, and pass a tab_id when you need proof that
+    commands execute.
 
     The payload carries: extension_version, the build that EXECUTED this
     command, so a round verifying a just-shipped capability can tell "broken"
