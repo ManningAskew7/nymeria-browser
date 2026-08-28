@@ -124,6 +124,44 @@ the popup, which rides the extension's loopback permission.
 
 On success the popup shows your identity, "Connected", and a running event counter. Send a chat via the CLI (`cd Nymeria && python3 run.py cli`) or another client — you'll see events tick over in the popup's "Last event" panel.
 
+## Headless server install (no display, no popup)
+
+A VPS can run this extension in headless Chrome so a server-hosted Nymeria
+gets a fully driveable browser: `headless/nymeria-headless.sh` owns the
+whole flow (bash, curl, python3 only; no node on the server). Verified
+end-to-end on Chrome for Testing 152 (branded Google Chrome dropped
+`--load-extension` in v137, so the launcher installs Chrome for Testing).
+
+```bash
+./headless/nymeria-headless.sh install     # fetch current stable Chrome for Testing
+./headless/nymeria-headless.sh configure \
+    --base-url https://nymeria.example.com --token <account-token> \
+    --source ./dist                        # stage extension + bake config
+./headless/nymeria-headless.sh run         # foreground; wrap in systemd
+./headless/nymeria-headless.sh status      # is Chrome up, is the worker there
+```
+
+How it works: `configure` copies the build, rewrites the manifest so the
+host permissions are REQUIRED (auto-granted at unpacked load: this replaces
+every popup click, page-status grant included), and writes a `config.json`
+(mode 600) the worker adopts at first startup. Storage wins once adopted:
+to apply a CHANGED config, remove the profile dir and rerun.
+
+Notes:
+- Sandbox: Ubuntu 23.10+ restricts unprivileged user namespaces via
+  AppArmor, so stock Chrome aborts at launch. Install the one-time
+  AppArmor profile from Chromium's apparmor-userns-restrictions doc
+  (root), or pass `run --no-sandbox` as an explicit, logged opt-out.
+- One browser per account: browser commands are broadcast to every
+  extension connected on the account, so two connected browsers would BOTH
+  execute every command. Give a headless server its own Nymeria account.
+- The baked token is a full account token sitting on the server (0600).
+  Use a dedicated account and rotate like any credential.
+- Systemd shape: a simple service with
+  `ExecStart=/path/nymeria-headless.sh run` and `Restart=on-failure`
+  under a linger-enabled user is sufficient; the profile dir keeps
+  identity across restarts.
+
 ## Verification checklist
 
 - [ ] `npm install && npm run build` succeeds; `dist/` loads as an unpacked extension.

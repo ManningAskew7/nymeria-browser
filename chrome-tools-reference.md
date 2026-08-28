@@ -343,7 +343,9 @@ Description (verbatim docstring):
 ````
 Read the visible text of a Chrome tab. Cheaper than a screenshot for prose.
 
-    selector: optional CSS selector to read one region instead of the page.
+    selector: optional CSS selector to read one region instead of the page
+        (the act-target css= prefix is accepted with the same meaning; an
+        invalid selector is refused by name, never "read failed").
     max_chars: model-facing cap; the overflow spills to a file you can read.
     extraction_prompt: leave empty to get the text as-is. Provide a prompt
         (e.g. "the order total and delivery date") and a secondary LLM reads

@@ -13,7 +13,9 @@
 #   configure --base-url U --token T [--source DIR]
 #                                 stage the extension + bake the config
 #   run [--profile DIR] [--debug-port N] [--no-sandbox]
-#                                 launch (foreground; systemd-friendly)
+#                                 launch (foreground; systemd-friendly);
+#                                 refuses while an instance is already up
+#   stop                          kill every instance launched from here
 #   status [--debug-port N]       is Chrome up, and is our worker present
 #
 # State lives under $NYMERIA_HEADLESS_HOME (default ~/.nymeria-browser):
@@ -143,6 +145,12 @@ cmd_run() {
   chrome=$(chrome_binary) || die "no Chrome for Testing installed; run: $0 install"
   [ -f "$EXT_DIR/manifest.json" ] || die "extension not staged; run: $0 configure"
   [ -f "$EXT_DIR/config.json" ] || die "no baked config; run: $0 configure"
+  # One instance per home, enforced: a second one subscribes the SAME
+  # account and both then execute every broadcast command (measured
+  # 2026-08-28: non-deterministic tab routing, probe showing only one).
+  if pgrep -f "$HOME_DIR/cft/.*chrome-linux64/chrome" >/dev/null; then
+    die "an instance from $HOME_DIR is already running; use: $0 stop"
+  fi
   mkdir -p "$profile"
   if [ -n "$sandbox_flag" ]; then
     echo "WARNING: running with --no-sandbox (explicit opt-out; prefer the AppArmor profile, see header)."
@@ -159,6 +167,28 @@ cmd_run() {
     --remote-debugging-port="$port" \
     --no-first-run \
     --disable-gpu
+}
+
+cmd_stop() {
+  # Kill every Chrome launched from THIS home's staged install. Exists
+  # because a hand-rolled pkill pattern missed the versioned path once
+  # (2026-08-28) and the surviving instance stayed subscribed on the same
+  # account as its replacement: two browsers then executed every command
+  # with non-deterministic tab routing, while the connection probe showed
+  # only one of them. Always stop through here before a relaunch.
+  local pids
+  pids=$(pgrep -f "$HOME_DIR/cft/.*chrome-linux64/chrome" || true)
+  if [ -z "$pids" ]; then
+    echo "No headless Chrome from $HOME_DIR running."
+    return 0
+  fi
+  echo "$pids" | xargs -r kill
+  sleep 2
+  if pgrep -f "$HOME_DIR/cft/.*chrome-linux64/chrome" >/dev/null; then
+    echo "$pids" | xargs -r kill -9 2>/dev/null || true
+    sleep 1
+  fi
+  pgrep -f "$HOME_DIR/cft/.*chrome-linux64/chrome" >/dev/null && die "instances survived kill -9" || echo "Stopped."
 }
 
 cmd_status() {
@@ -186,6 +216,7 @@ case "${1:-}" in
   install) shift; cmd_install "$@" ;;
   configure) shift; cmd_configure "$@" ;;
   run) shift; cmd_run "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
   status) shift; cmd_status "$@" ;;
   *) sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; exit 1 ;;
 esac
