@@ -80,6 +80,27 @@ Load the unpacked extension from `dist/`:
    entry, load unpacked again, then reconnect and re-enable page status
    (one-time migration).
 
+## Install from the release zip (beta)
+
+Beta distribution is a packaged zip: no node, no build step.
+
+1. Unzip `nymeria-browser-v<version>.zip` anywhere permanent (Chrome loads
+   the extension from that folder from then on; do not delete it).
+2. Open `chrome://extensions`, enable **Developer Mode** (top right).
+3. Click **Load unpacked** and pick the unzipped
+   `nymeria-browser-v<version>/` folder.
+4. Chrome will show its "developer mode extensions" notice at startup;
+   that is the cost of the beta path (a Web Store listing is planned).
+5. Continue with "Connecting to a Nymeria backend" below. Upgrading to a
+   new zip: unzip the new version, **Remove** the old entry, Load unpacked
+   the new folder (the pinned ID keeps it the same extension to the
+   backend), reconnect, and re-enable page status.
+
+Maintainer side: `scripts/package.sh` (optionally `--build`) zips `dist/`
+into `release/nymeria-browser-v<version>.zip` (gitignored) and prints its
+sha256. The headless launcher accepts the same zip via
+`configure --source <zip>`.
+
 ## Connecting to a Nymeria backend
 
 **The backend must be `https://` or on `localhost`.** Chrome only lets an
@@ -136,7 +157,7 @@ end-to-end on Chrome for Testing 152 (branded Google Chrome dropped
 ./headless/nymeria-headless.sh install     # fetch current stable Chrome for Testing
 ./headless/nymeria-headless.sh configure \
     --base-url https://nymeria.example.com --token <account-token> \
-    --source ./dist                        # stage extension + bake config
+    --source ./dist                        # a build dir, or a release zip
 ./headless/nymeria-headless.sh run         # foreground; wrap in systemd
 ./headless/nymeria-headless.sh status      # is Chrome up, is the worker there
 ```

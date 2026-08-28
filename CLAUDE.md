@@ -232,7 +232,12 @@ POSTs results. Consequences:
 
 - Extension: `/opt/Project-Nymeria/nymeria-browser/`. Its OWN git repo
   (`github.com/ManningAskew7/nymeria-browser`), gitignored inside the main
-  tree, push separately. Module invariants live in module docstrings: read
+  tree, push separately. Beta distribution artifact:
+  `scripts/package.sh` (optionally `--build`) zips dist into the
+  gitignored `release/nymeria-browser-v<version>.zip` (one top-level
+  folder inside, sha256 printed); the headless launcher's
+  `configure --source` accepts that zip directly. Web Store lodgement is
+  backlog #283. Module invariants live in module docstrings: read
   them before editing; this file is the standing map, not their
   replacement. Commits need a `Co-Authored-By:` trailer naming the model that
   actually did the work (`<noreply@anthropic.com>`). This line used to pin

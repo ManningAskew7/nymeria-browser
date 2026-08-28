@@ -98,7 +98,27 @@ cmd_configure() {
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
     source="$script_dir/../dist"
   fi
-  [ -f "$source/manifest.json" ] || die "no extension build at $source (run npm run build, or pass --source)"
+  # A release zip (scripts/package.sh) is accepted directly: unpack it and
+  # stage from whichever directory holds manifest.json (the zip wraps one
+  # top-level folder). python3 zipfile, same no-extra-binaries rule as
+  # install's Chrome fetch.
+  if [ -f "$source" ] && [[ "$source" == *.zip ]]; then
+    local unpack_dir="$HOME_DIR/unpacked-release"
+    rm -rf "$unpack_dir"
+    mkdir -p "$unpack_dir"
+    python3 - "$source" "$unpack_dir" <<'PYEOF'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1]) as z:
+    z.extractall(sys.argv[2])
+PYEOF
+    if [ -f "$unpack_dir/manifest.json" ]; then
+      source="$unpack_dir"
+    else
+      source=$(find "$unpack_dir" -mindepth 2 -maxdepth 2 -name manifest.json -printf '%h\n' | head -1)
+      [ -n "$source" ] || die "no manifest.json inside the zip"
+    fi
+  fi
+  [ -f "$source/manifest.json" ] || die "no extension build at $source (run npm run build, pass --source <dir>, or pass a release zip)"
   rm -rf "$EXT_DIR"
   mkdir -p "$HOME_DIR"
   cp -r "$source" "$EXT_DIR"
