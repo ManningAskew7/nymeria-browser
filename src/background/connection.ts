@@ -2,6 +2,7 @@ import { backgroundLogger as logger } from '../utils/logger'
 import { getConfig } from '../utils/storage'
 import { HttpError, whoami } from './api'
 import { dispatchBrowserCommand } from './commands'
+import { releaseAllHolds } from './debuggerSession'
 import { frameToData, parseSseFrames } from './sse'
 import { recordEvent, setStatus } from './state'
 import type { AutonomousEvent, BrowserCommandEvent, MeResponse } from '../shared/types'
@@ -153,6 +154,13 @@ async function connectOnce(): Promise<void> {
         if (event.type === 'browser_command') {
           // Fire-and-forget; per-command try/catch is inside the dispatcher.
           void dispatchBrowserCommand(event as BrowserCommandEvent)
+        } else if (event.type === 'browser_session_release') {
+          // Turn-end signal (#191): the agent has answered, so idle debugger
+          // holds end NOW and the banner drops, instead of riding out the
+          // safety-net linger. Not a command: no result to POST, no budget.
+          // Synchronous and self-contained (detach itself is fired
+          // fire-and-forget inside it), so no guard here.
+          releaseAllHolds()
         }
         // Journal AFTER dispatch, and never on its critical path. The journal
         // writes to `chrome.storage.local`, whose 10MB quota REJECTS a large

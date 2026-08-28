@@ -60,6 +60,7 @@ import {
 } from '../input'
 import { commitSeq, commitSince, navigationPending, waitForNavSignal } from '../navWatch'
 import { cssResolveExpression, SELECTOR_INVALID, SELECTOR_MISS } from '../shadowWalk'
+import { dropViewportStamp, readViewportStamp, viewportReadExpression } from '../viewportStamp'
 import {
   evaluateInProbeWorld,
   GLOBAL_READ_SNIPPET,
@@ -800,6 +801,18 @@ interface PointTarget {
   frameOwner: boolean
 }
 
+/** One probe answers two questions about a coordinate act (#191): what is
+ *  under the point (null when nothing is: an out-of-viewport point), and the
+ *  live viewport the probe ran in, which the staleness gate compares against
+ *  the aim-time stamp. The viewport is read even when the point hits nothing,
+ *  BECAUSE it hits nothing: a stale coordinate past the shrunk viewport's
+ *  edge is exactly the case the gate exists for. Null viewport = unreadable,
+ *  and the gate fails open. */
+interface PointProbe {
+  target: PointTarget | null
+  viewport: { width: number; height: number } | null
+}
+
 /**
  * What is actually under a coordinate, and whether activating it opens the
  * file chooser. One evaluate answers both, so the description is free.
@@ -823,7 +836,7 @@ interface PointTarget {
  * click; the page-wide chooser interception is the backstop), and it never
  * re-runs in the main world.
  */
-async function describePoint(tabId: number, point: Point | null): Promise<PointTarget | null> {
+async function describePoint(tabId: number, point: Point | null): Promise<PointProbe | null> {
   if (!point) return null
   // The verdict is computed FIRST and the description is separately guarded,
   // so an element whose getters throw loses the label and keeps the safety
@@ -831,15 +844,23 @@ async function describePoint(tabId: number, point: Point | null): Promise<PointT
   // file-input refusal (pre-world history, kept on principle: the world
   // protects the PRIMITIVES, not a page-defined getter the description walks
   // into via named access).
-  const value = await evaluateInProbeWorld<PointTarget | null>(
+  // The viewport rides the same evaluate (#191): the staleness gate needs it
+  // on every coordinate act, and a second probe call would break the
+  // one-probe-world-per-act ratchet. It is `viewportReadExpression`, the ONE
+  // expression the capture-side stamp also reads, spliced rather than
+  // paraphrased: the gate compares stamp against live, and two hand-kept
+  // copies of "read the viewport" is how the two sides drift into a mismatch
+  // no re-capture can clear (the stamp-source review finding).
+  const value = await evaluateInProbeWorld<PointProbe | null>(
     tabId,
     `(() => {
+      const viewport = ${viewportReadExpression};
       const el = document.elementFromPoint(${Math.round(point.x)}, ${Math.round(point.y)});
-      if (!el) return null;
+      if (!el) return { target: null, viewport: viewport };
       const opens = (function(){ ${OPENS_FILE_CHOOSER} }).call(el) === true;
       const description = (function(){ ${DESCRIBE_ELEMENT} }).call(el);
       const frameOwner = /^(iframe|frame)$/i.test(el.tagName || '');
-      return { description: String(description || 'unknown'), opensFileChooser: opens, frameOwner: frameOwner };
+      return { target: { description: String(description || 'unknown'), opensFileChooser: opens, frameOwner: frameOwner }, viewport: viewport };
     })()`,
   )
   return value ?? null
@@ -971,6 +992,42 @@ function crossOriginFrameCoordinateError(action: ActionName, frameUrl: string): 
     'coordinate cannot reach it and the event would silently vanish. Nothing ' +
     'was dispatched. Read the page and use the element\'s @ref instead (the ' +
     "frame's contents appear as their own labelled section with refs)."
+  )
+}
+
+/**
+ * How long the staleness gate waits before its ONE re-probe on a mismatch.
+ *
+ * The mismatch the gate exists for is a settled one (a capture taken before
+ * the debugging infobar landed, a zoom between turns). But the same attach
+ * that runs this very act is what lands the infobar, so the FIRST coordinate
+ * act after a capture on a fresh tab can read the viewport mid-transition
+ * and refuse a point that is about to be right again. The infobar reflow is
+ * a single layout pass, well under this window; a real change is still
+ * mismatched after it and refuses as before. Refusal-path only, so the
+ * happy path never pays it.
+ */
+const VIEWPORT_SETTLE_MS = 300
+
+/**
+ * A coordinate aimed in a viewport that no longer exists (#191): refused
+ * BEFORE dispatch. The measured failure this replaces is the worst payload
+ * shape on this surface: a trusted click on the wrong element reporting
+ * success. The copy names both sizes and the usual cause, and points at the
+ * targets that never go stale this way, so the refusal is a one-step fix.
+ */
+function viewportChangedError(
+  action: ActionName,
+  aimed: { width: number; height: number },
+  live: { width: number; height: number },
+): string {
+  return (
+    `the ${action} coordinate was aimed in a ${aimed.width}x${aimed.height} viewport, but ` +
+    `this tab's viewport is now ${live.width}x${live.height}: the page has reflowed since ` +
+    "that screenshot (Chrome's own debugging banner appearing or leaving is the usual " +
+    'cause; zoom and window resizes do it too), so the point no longer lands where it ' +
+    'was aimed. Nothing was dispatched. Take a fresh screenshot and re-aim, or target ' +
+    'by @ref or css=, which re-resolve and never go stale this way.'
   )
 }
 
@@ -3366,7 +3423,54 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     // not they activate: knowing a hover landed on `body` is the same
     // information, and it is the same call either way.
     if (!objectId && ACCEPTS_COORDINATE.has(a.action)) {
-      pointTarget = await describePoint(tabId, explicitPoint)
+      const probe = await describePoint(tabId, explicitPoint)
+      pointTarget = probe?.target ?? null
+      // #191, the staleness gate: a coordinate is read off a capture, and the
+      // viewport under it moves (the debugging infobar lands and un-lands
+      // with the attach, ~56 CSS px, plus zoom/resize/docking). When the live
+      // viewport no longer matches the one the tab's last capture answered
+      // in, the point is aimed in a space that no longer exists: refuse
+      // BEFORE dispatch, where "nothing was sent" is still true, instead of
+      // clicking the neighbour and reporting success (the measured #191
+      // misclick). No stamp, or an unreadable live viewport, fails OPEN.
+      // (`probe.viewport` implies a point existed: `describePoint` answers
+      // null for a point-less act, so no separate explicitPoint guard.)
+      if (probe?.viewport) {
+        let live = probe.viewport
+        const aimed = await readViewportStamp(tabId)
+        if (aimed && (aimed.width !== live.width || aimed.height !== live.height)) {
+          // Converge-then-refuse: the attach running THIS act is what lands
+          // the infobar, so the first read after a capture can catch the
+          // reflow mid-flight. One settle-and-re-probe before refusing, on
+          // the refusal path only (the codebase's re-ask idiom: readonly and
+          // pointer-events do the same). The second probe's answer replaces
+          // the first wholesale, viewport and hit alike, since it is the
+          // space the act would actually dispatch into; an unreadable
+          // re-probe leaves the measured mismatch standing rather than
+          // letting a page that stopped answering un-gate itself.
+          await new Promise((r) => setTimeout(r, VIEWPORT_SETTLE_MS))
+          const settled = await describePoint(tabId, explicitPoint)
+          if (settled?.viewport) {
+            live = settled.viewport
+            pointTarget = settled.target ?? null
+          }
+          if (aimed.width !== live.width || aimed.height !== live.height) {
+            return {
+              ok: false,
+              status: 'error',
+              error: viewportChangedError(a.action, aimed, live),
+              data: {
+                action: a.action,
+                refused: 'viewport_changed',
+                aimed_viewport: [aimed.width, aimed.height],
+                current_viewport: [live.width, live.height],
+                ...(pointTarget ? { hit: pointTarget.description } : {}),
+                input: 'none',
+              },
+            }
+          }
+        }
+      }
     }
 
     // A coordinate whose point stops at a frame owner: if that frame is an
@@ -3566,6 +3670,10 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
                 // behaviour, delegated handlers). Checked here, after the
                 // #174 exception, so a text-entry target's click-through
                 // path is untouched.
+                // #191: the taught click_point comes from LIVE geometry in
+                // the current viewport, not from a capture, so the aim-time
+                // stamp must not gate the follow-up this refusal asks for.
+                if (teachPoint) dropViewportStamp(tabId)
                 if (peMiss) {
                   return {
                     ok: false,
@@ -3877,6 +3985,8 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
               // instead of blaming the element the click would hit instead,
               // and hands over the same deliberate-click coordinate (a
               // styled checkbox's own label is the everyday case).
+              // #191: taught point = live geometry; see the click family.
+              if (teachPoint) dropViewportStamp(tabId)
               if (peMiss) {
                 return {
                   ok: false,

@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { rendererResponsive, settle } from './settle'
 import type { SettleResult } from './settle'
-import { isAttached, resetForTests as resetDebugger } from './debuggerSession'
+import { DETACH_LINGER_MS, isAttached, resetForTests as resetDebugger } from './debuggerSession'
 
 const TAB = 1
 
@@ -96,7 +96,7 @@ describe('rendererResponsive', () => {
       ;(chrome.debugger.sendCommand as unknown) = vi.fn(async () => ({ result: { value: 1 } }))
 
       await rendererResponsive(TAB)
-      await vi.advanceTimersByTimeAsync(60_000)
+      await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 5_000)
 
       expect(isAttached(TAB), 'the session must be released when the probe is done').toBe(false)
     } finally {

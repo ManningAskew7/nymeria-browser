@@ -4,6 +4,7 @@ import {
   installCdpEventRouter,
   installDetachHandler,
   release,
+  releaseAllHolds,
   resetForTests as resetDebugger,
 } from './debuggerSession'
 import {
@@ -340,15 +341,19 @@ describe('the attach boundary', () => {
   })
 
   it('holds a voluntary detach until the standing dialog resolves', async () => {
+    // Since the #191 hold, the voluntary detach that meets a standing dialog
+    // is ordinarily the TURN-END release (the 120s safety-net linger now
+    // outlives the dialog grace, so the timer path rarely races a dialog).
     const cdp = mockCdp()
     const fire = cdpEvents()
     await acquire(TAB)
     fire(TAB, 'Page.javascriptDialogOpening', { type: 'confirm', message: 'Sure?' })
     release(TAB)
 
-    // The linger expires with the dialog standing: the detach must WAIT, or
+    // The turn ends with the dialog standing: the detach must WAIT, or
     // ownership would end with an owned dialog unanswered.
-    await vi.advanceTimersByTimeAsync(11_000)
+    releaseAllHolds()
+    await vi.advanceTimersByTimeAsync(1_000)
     expect(chrome.debugger.detach).not.toHaveBeenCalled()
 
     // The user answers on screen; the gate releases and the detach proceeds.
@@ -364,7 +369,8 @@ describe('the attach boundary', () => {
     await acquire(TAB)
     fire(TAB, 'Page.javascriptDialogOpening', { type: 'confirm', message: 'Sure?' })
     release(TAB)
-    await vi.advanceTimersByTimeAsync(11_000)
+    releaseAllHolds()
+    await vi.advanceTimersByTimeAsync(1_000)
     expect(chrome.debugger.detach).not.toHaveBeenCalled()
 
     // Ride past the grace deadline: the timeout default answers, and even

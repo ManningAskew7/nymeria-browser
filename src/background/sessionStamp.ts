@@ -1,15 +1,16 @@
 /**
  * sessionStamp: the ONE shape behind the extension's per-tab evidence
- * stamps (#204). Three stores ride it: the last-driven stamp
+ * stamps (#204). Four stores ride it: the last-driven stamp
  * (`driveStamp.ts`), swallowed-input evidence and the positive
- * delivery-proof stamp (both `delivery.ts`).
+ * delivery-proof stamp (both `delivery.ts`), and the aim-time viewport
+ * stamp (`viewportStamp.ts`, #191).
  *
  * The shared shape, deliberate in every part (the driveStamp.ts rationale):
  *  - `chrome.storage.session`, keyed `${prefix}${tabId}`: survives MV3
  *    worker recycles, dies with the browser session like the tabs it
- *    describes. Storage-only, no in-memory front: the one reader (the
- *    health command) can afford an async read, and a memory copy would be
- *    a second source of truth.
+ *    describes. Storage-only, no in-memory front: the readers (health's
+ *    diagnostics, act's pre-dispatch viewport gate) can afford an async
+ *    read, and a memory copy would be a second source of truth.
  *  - Writes are fire-and-forget with their own `.catch`, per the transport
  *    rule (v0.9.0): bookkeeping must never sit in front of a dispatch.
  *  - Reads are shape-validated: storage is a store, not a trusted

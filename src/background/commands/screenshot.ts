@@ -4,7 +4,8 @@ import { callOn } from '../input'
 import { resolve as resolveRef } from '../snapshotRefs'
 import { withDeadline } from '../settle'
 import { sameDocumentUrl } from '../urlMatch'
-import { withProbeWorld } from '../worlds'
+import { dropViewportStamp, recordViewport, viewportReadExpression } from '../viewportStamp'
+import { evaluateInProbeWorld, withProbeWorld } from '../worlds'
 
 /**
  * The viewport metrics are a nice-to-have on a page that may be wedged, so
@@ -530,6 +531,28 @@ export async function execScreenshot(args: unknown): Promise<CommandResult> {
   })
 
   if (!metrics) metrics = await readMetrics(a.tab_id)
+
+  // #191: stamp the viewport this capture ANSWERED in, so a later coordinate
+  // act can refuse when the viewport has moved instead of clicking 56px off.
+  // One PROBE-WORLD read, after the shutter, always fresh: post-shutter
+  // because `captureBeyondViewport` reflows the page and the stamp must be
+  // the truth the agent is now aiming in; probe-world and same-expression
+  // as the act-side gate because a stamp from `readMetrics` diverges from
+  // the gate on two review-found paths (the `cssVisualViewport` fallback
+  // excludes the scrollbar, and a page can patch main-world `innerWidth`),
+  // and a stamp the gate can never match is a false-refusal loop, worse
+  // than no gate. Unreadable (deadline, probe failure) DROPS the stamp:
+  // fail open, never gate this capture's coordinates against an older one.
+  const vp = await evaluateInProbeWorld<{ width: number; height: number } | null>(
+    a.tab_id,
+    viewportReadExpression,
+    { deadlineMs: METRICS_DEADLINE_MS },
+  )
+  if (vp && Number.isFinite(vp.width) && Number.isFinite(vp.height)) {
+    recordViewport(a.tab_id, vp.width, vp.height)
+  } else {
+    dropViewportStamp(a.tab_id)
+  }
 
   // A full-page capture ASKS to reach past the viewport, which is not the same
   // as reaching. On a document that already fits there is no scrollbar to drop

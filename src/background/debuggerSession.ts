@@ -5,8 +5,16 @@ import { backgroundLogger as logger } from '../utils/logger'
  *
  * Attach is expensive (shows the yellow "is being debugged" banner) and
  * pages glitch when re-attached. Multiple in-flight commands on the same
- * tab share one attach. We detach 10s after the last release so a rapid
- * back-to-back sequence of `chrome_*` commands doesn't flicker the banner.
+ * tab share one attach, and the attach is HELD for a linger window after
+ * the last release. The window is sized to the agent's think-pauses, not
+ * to command bursts (#191): the original 10s linger expired inside every
+ * long think, and each expiry dropped the banner and reflowed the page
+ * ~56 CSS px, which is how a coordinate aimed from an earlier screenshot
+ * clicked the neighbouring row and reported success. The backend also
+ * publishes a `browser_session_release` event when the agent's turn ends
+ * (`releaseAllHolds`), so in the ordinary case the banner drops the moment
+ * the agent answers and the linger below is only the safety net for a
+ * lost release (backend crash mid-turn, dropped stream).
  *
  * Two things ride on the attach beyond one-shot commands:
  *
@@ -21,7 +29,10 @@ import { backgroundLogger as logger } from '../utils/logger'
  */
 
 const DEBUGGER_VERSION = '1.3'
-const DETACH_LINGER_MS = 10_000
+/** The safety-net hold (#191): sized to survive a long think between two
+ *  commands, because the turn-end release is the ordinary detach path.
+ *  Exported for the lifecycle tests. */
+export const DETACH_LINGER_MS = 120_000
 
 /**
  * Domains enabled on every attach so their event streams are never late.
@@ -567,7 +578,7 @@ export function frameSessions(tabId: number): FrameSession[] {
  * The ORIGIN of the frame behind a live session id, for capture
  * attribution (#177). Resolved at event-receipt time while the session is
  * live, and stored as a plain string on the buffer entry, so attribution
- * survives the 10s detach without keying anything on the ephemeral
+ * survives the idle detach without keying anything on the ephemeral
  * sessionId. The URL comes from auto-attach and is kept current by the
  * `Target.targetInfoChanged` handler above (#201 review), so a frame that
  * navigates in-place updates its attribution where Chrome reports the
@@ -589,9 +600,9 @@ export function frameOriginForSession(tabId: number, sessionId: string): string 
  * The LIVE session for a frame's stable target id, waiting briefly for
  * auto-attach to announce it.
  *
- * Sessions are ephemeral: the tab detaches 10s after its last command
- * (DETACH_LINGER_MS), killing every frame session, and the next attach
- * re-announces the same frames under NEW session ids. Anything durable
+ * Sessions are ephemeral: the tab detaches at turn end or after the idle
+ * linger (DETACH_LINGER_MS), killing every frame session, and the next
+ * attach re-announces the same frames under NEW session ids. Anything durable
  * (refs) therefore keys on the frame's target id, which Chrome keeps stable
  * for the frame element's lifetime, and maps to a session here at use time.
  * The wait covers the re-attach race: `Target.attachedToTarget` events for
@@ -905,6 +916,29 @@ export function release(tabId: number): void {
     s.detachTimer = setTimeout(() => {
       void detachNow(tabId)
     }, DETACH_LINGER_MS)
+  }
+}
+
+/**
+ * End every idle hold NOW (#191, the turn-end release): the backend
+ * publishes `browser_session_release` when the agent's turn ends, so the
+ * banner drops the moment the agent answers instead of riding out the
+ * safety-net linger. Only idle sessions are touched: a command still in
+ * flight (refCount > 0) keeps its attach, and its own release re-arms the
+ * linger, which the NEXT turn's release then collapses. Detaching still
+ * goes through `detachNow`, so the dialog-ownership gate applies: a
+ * standing confirm extends its hold to its own resolution, exactly as it
+ * does on the timer path.
+ */
+export function releaseAllHolds(): void {
+  for (const [tabId, s] of sessions) {
+    if (s.attached && s.refCount === 0) {
+      if (s.detachTimer) {
+        clearTimeout(s.detachTimer)
+        s.detachTimer = null
+      }
+      void detachNow(tabId)
+    }
   }
 }
 

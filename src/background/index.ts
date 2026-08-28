@@ -8,6 +8,7 @@ import { activeTabs as activeDebuggerTabs, forgetTab as forgetDebuggerTab } from
 import { clearProvenDelivery, clearSwallowedInput } from './delivery'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
 import { dropDriveStamp } from './driveStamp'
+import { dropViewportStamp } from './viewportStamp'
 import { clearWheelAckLatchForTab } from './input'
 import { clearTabWorlds } from './worlds'
 import { clear as clearRefs, dropTab as dropTabRefs, refsReady } from './snapshotRefs'
@@ -103,6 +104,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   dropDriveStamp(tabId)
   clearSwallowedInput(tabId)
   clearProvenDelivery(tabId)
+  // #191: nor the viewport its captures were aimed in.
+  dropViewportStamp(tabId)
   // The wheel-ack latch (#207): a reused tab id must not inherit the
   // short ack tolerance from the widget that closed.
   clearWheelAckLatchForTab(tabId)

@@ -23,7 +23,8 @@
  * in background/index.ts), by tab close, and by the recorded URL no longer
  * matching the tab's current URL, the backstop for the cases the hooks
  * miss. A frame SESSION detaching deliberately does NOT invalidate refs:
- * the debugger detaches from the whole tab after a 10s idle linger, taking
+ * the debugger detaches from the whole tab at turn end or after the idle
+ * linger (`DETACH_LINGER_MS`), taking
  * every frame session with it, and session-keyed frame refs therefore died
  * between one tool call and the agent's next thought (measured 2026-08-16
  * live QA: three consecutive stale reads to land one click). Frame refs
@@ -98,8 +99,8 @@ export function fingerprintNameKey(name: string): string {
  * an iframe ref from silently resolving to an unrelated main-frame element.
  *
  * The frame is identified by its TARGET id (== its `Page.FrameId`), never by
- * the debugger session id. Sessions are ephemeral: the tab detaches 10s
- * after its last command and every frame session dies with it, coming back
+ * the debugger session id. Sessions are ephemeral: the tab detaches at turn
+ * end or after the idle linger, every frame session dies with it, coming back
  * under NEW ids on the next attach, while the target id stays stable for the
  * frame element's lifetime. Session-keyed refs died whenever the agent
  * thought for longer than the linger between two commands, which live QA

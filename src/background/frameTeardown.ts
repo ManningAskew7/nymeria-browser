@@ -11,7 +11,8 @@ import { clearSessionWorlds } from './worlds'
  *
  * Deliberately NOT ref invalidation any more. This module used to clear the
  * frame's refs here too, but sessions die routinely: the debugger detaches
- * from the whole tab after a 10s idle linger, taking every frame session
+ * from the whole tab at turn end or after the idle linger
+ * (`DETACH_LINGER_MS`), taking every frame session
  * with it, and the same frames re-announce under new session ids on the
  * next attach. Session-keyed refs therefore died between one tool call and
  * the agent's next thought (measured 2026-08-16 live QA: three consecutive

@@ -414,7 +414,7 @@ POSTs results. Consequences:
   latched widget loses acks routinely while its offsets read perfectly
   well (see the freshness bullet).
 - Ref lifetime (since stage B, 2026-08-16): frame refs key on the frame's
-  STABLE target id and SURVIVE the 10s idle detach (never session-keyed);
+  STABLE target id and SURVIVE the idle detach (never session-keyed);
   they refuse honestly when the frame left (`frame-gone`) or navigated
   (mint-URL compare). Do not "fix" a stale-looking frame ref by re-keying
   it to a session id. Since the reads-honesty pass (v0.4.0/0.5.0) the same
@@ -519,6 +519,51 @@ POSTs results. Consequences:
   `var NEEDLE = "..."` binding and THROW on shape drift: changing
   `waitTextExpression`'s shape means updating every site, and all of them
   return booleans, so a scan that returned anything else breaks them all.
+- Session hold + viewport gate (v0.27.0, #191): `DETACH_LINGER_MS` is 120s
+  (exported; the lifecycle tests derive their advances from it, never
+  hard-code a linger) and is the SAFETY NET, not the ordinary detach: the
+  backend publishes `browser_session_release` at every turn end that
+  dispatched a browser command (ledger stamped in
+  `BrowserCommandCoordinator.register`, popped + published from
+  `core/agent.py`'s two DONE observe fire points, the exactly-once turn-end
+  funnel), and `connection.ts` routes that event to
+  `releaseAllHolds()`: an EVENT, deliberately not a command (no result to
+  POST, no budget, no CommandType row). `releaseAllHolds` skips
+  `refCount > 0` sessions AND `detachNow` re-checks it: an
+  ignores-refcount mutation is EQUIVALENT, do not read that survivor as a
+  test gap. The viewport gate: every capture stamps the viewport it
+  answered in (`viewportStamp.ts`, sessionStamp family: rides
+  `chrome.storage.session`, so a worker recycle does NOT drop it). The
+  stamp is ONE probe-world read taken AFTER the shutter
+  (`viewportReadExpression`, exported from viewportStamp.ts and spliced
+  into `describePoint` too): same source, same world as the act-side gate,
+  because a `readMetrics` stamp diverges from it (the cssVisualViewport
+  fallback excludes the scrollbar; a page can patch main-world innerWidth)
+  and a stamp the gate can never match is a false-refusal loop; after the
+  shutter because captureBeyondViewport reflows what it measures. A
+  coordinate act whose live viewport differs waits `VIEWPORT_SETTLE_MS`
+  (~300ms) and re-probes ONCE, refusal-path only (the attach running that
+  very act lands the infobar, so the first read after a capture can catch
+  the reflow mid-flight; the second probe's viewport AND hit replace the
+  first), then refuses `viewport_changed` BEFORE dispatch, naming both
+  sizes; the refusal KEEPS the stamp. Scroll is structurally exempt (not
+  in the refusable coordinate set; its `scroll_moved` report verifies the
+  effect instead). Fail-open by design: no stamp or an unreadable live
+  viewport means no gate. Refusals that TEACH a coordinate
+  (pointer-events, covered-point) CLEAR the stamp, since the taught point
+  is live geometry the gate would wrongly refuse (tab-wide until the next
+  capture, accepted residual). A worker death cannot silently orphan an
+  attach in practice: Chrome 116+ keeps the worker alive while a
+  `chrome.debugger` session is attached, so the linger normally gets to
+  run. Test traps: `describePoint` returns `{target, viewport}` (the
+  act.test elementFromPoint fixture returns that wrapper, with
+  `pointViewport` defaulting null = gate off and `pointViewportSettled`
+  carrying the re-probe's answer), its expression contains BOTH
+  `elementFromPoint` and `innerWidth`, so the mock's elementFromPoint
+  branch must stay BEFORE the bare-innerWidth one; screenshot.test's
+  stamp read is a probe-world evaluate whose expression also carries
+  `innerWidth`, and its branch must come BEFORE the selector-objectId
+  one.
 - Wait miss report (v0.24.0, #196): a timed-out TEXT wait runs ONE extra
   probe-world evaluate (`waitMissReportExpression`) whose payload keys are
   `page_text_excerpt` (root document, whitespace-collapsed, 240 chars,

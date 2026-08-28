@@ -28,6 +28,9 @@ interface MockOpts {
   selectorBox?: { x: number; y: number; width: number; height: number } | null
   /** Make the probe-world lookup resolve to no element at all. */
   selectorMisses?: boolean
+  /** The post-shutter probe-world viewport read (#191) answers null, the
+   *  expression's own "could not read it" shape. */
+  viewportUnreadable?: boolean
   contentSize?: { width: number; height: number }
   zoom?: number
 }
@@ -51,9 +54,19 @@ function installCdpMock(opts: MockOpts = {}) {
         }
       }
       if (method === 'Runtime.evaluate') {
-        // The selector lookup is the one that runs in the probe world, so a
-        // contextId is what separates it from the metrics read.
+        // Two probe-world evaluates run here (contextId set), and the
+        // viewport-stamp read must route BEFORE the selector branch, which
+        // matches ANY probe-world evaluate. Only the stamp's expression
+        // carries `innerWidth` (`viewportReadExpression`); its numbers
+        // deliberately differ from BOTH the metrics evaluate's below and the
+        // layout metrics above, so the stamp tests can prove which source
+        // wrote the stamp.
         if (params.contextId !== undefined) {
+          if (String(params.expression ?? '').includes('innerWidth')) {
+            return {
+              result: { value: opts.viewportUnreadable ? null : { width: 1296, height: 728 } },
+            }
+          }
           return opts.selectorMisses ? { result: {} } : { result: { objectId: 'obj-selector' } }
         }
         if (opts.noEvaluate) return new Promise<never>(() => {})
@@ -122,6 +135,41 @@ function paramsOf(call: unknown[] | undefined): Record<string, unknown> {
 beforeEach(() => {
   resetDebugger()
   resetRefs()
+})
+
+describe('the aim-time viewport stamp (#191)', () => {
+  it('a capture stamps the viewport from the PROBE-WORLD read, not from readMetrics', async () => {
+    // The stamp exists to be compared against the act-side gate's own
+    // probe-world read, so it must come from that same source: the mock's
+    // probe-world viewport (1296x728) differs from both the metrics
+    // evaluate's (1280x720) and cssVisualViewport's (1265x705), so a stamp
+    // rewired to either metrics source turns this red (the review-found
+    // false-refusal loop: a stamp the gate can never match).
+    installCdpMock()
+
+    await execScreenshot({ tab_id: TAB })
+
+    await new Promise((r) => setTimeout(r, 0))
+    const got = await chrome.storage.session.get(`nymViewport:${TAB}`)
+    expect(got[`nymViewport:${TAB}`]).toEqual({ width: 1296, height: 728 })
+  })
+
+  it('an unreadable viewport DROPS the stamp rather than leaving a stale one', async () => {
+    // A stale stamp would gate coordinates aimed from THIS capture against
+    // an older capture's viewport: worse than no gate. Unreadable = fail
+    // open, which means removing the record. The metrics read still answers
+    // here, so a "helpful" metrics fallback for the stamp turns this red.
+    await chrome.storage.session.set({
+      [`nymViewport:${TAB}`]: { width: 1280, height: 1271 },
+    })
+    installCdpMock({ viewportUnreadable: true })
+
+    await execScreenshot({ tab_id: TAB })
+
+    await new Promise((r) => setTimeout(r, 0))
+    const got = await chrome.storage.session.get(`nymViewport:${TAB}`)
+    expect(got[`nymViewport:${TAB}`]).toBeUndefined()
+  })
 })
 
 describe('execScreenshot', () => {

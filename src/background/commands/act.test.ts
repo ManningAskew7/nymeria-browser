@@ -175,6 +175,14 @@ interface MockOptions {
   fileChooserOpened?: boolean
   /** What `elementFromPoint` finds under a bare coordinate. */
   pointDescription?: string
+  /** The live viewport the coordinate probe reports (#191). Default null =
+   *  unreadable, which keeps the staleness gate failing open in every test
+   *  that is not about the gate. */
+  pointViewport?: { width: number; height: number } | null
+  /** What the SECOND coordinate probe reports: the gate's one settle-and-
+   *  re-probe on a mismatch (#191 converge-then-refuse). Undefined = same
+   *  answer as pointViewport, the settled-mismatch shape. */
+  pointViewportSettled?: { width: number; height: number } | null
   /** true classifies the ref'd element as a text-entry control (#174). */
   textEntry?: boolean
   /** Whether focus landed in the target after a clicked-through covered click. */
@@ -250,6 +258,8 @@ function installCdpMock(opts: MockOptions = {}) {
     connectedThrows,
     fileChooserOpened = false,
     pointDescription = 'body',
+    pointViewport = null,
+    pointViewportSettled,
     pageHasFrames = false,
     targetInTopDocument = true,
     textEntry = false,
@@ -270,6 +280,7 @@ function installCdpMock(opts: MockOptions = {}) {
   const TRUST_CONTEXT = 88
   let dispatched = false
   let inputEvents = 0
+  let pointProbeCalls = 0
 
   // Every method that needs the renderer's main thread. A page suspended by its
   // own dialog answers NONE of them, which is what makes a single-method hang
@@ -474,9 +485,26 @@ function installCdpMock(opts: MockOptions = {}) {
             { result: { value: scrollAfter && { fresh: true, vis: 'visible', ...scrollAfter } } }
       }
       // The coordinate-target probe, which has no objectId to ask: one call
-      // answers both the file-input guard and what the point landed on.
+      // answers the file-input guard, what the point landed on, and (#191)
+      // the live viewport the staleness gate compares against the stamp.
+      // Routed BEFORE the bare-innerWidth branch below: this expression
+      // contains innerWidth too (the viewport rides the same probe). The
+      // per-call counter serves the converge tests: the gate's one re-probe
+      // is the SECOND call, answered with pointViewportSettled when given.
       if (expression.includes('elementFromPoint')) {
-        return { result: { value: { description: pointDescription, opensFileChooser: isFileInput } } }
+        pointProbeCalls += 1
+        const vp =
+          pointProbeCalls > 1 && pointViewportSettled !== undefined
+            ? pointViewportSettled
+            : pointViewport
+        return {
+          result: {
+            value: {
+              target: { description: pointDescription, opensFileChooser: isFileInput },
+              viewport: vp,
+            },
+          },
+        }
       }
       if (expression.includes('readyState')) return { result: { value: settleValue } }
       if (expression.includes('activeElement')) {
@@ -3167,6 +3195,119 @@ describe('targeting honesty', () => {
     expect(data.input_delivered).toBe('yes')
   })
 
+  it('refuses a coordinate act aimed in a viewport that has since changed (#191)', async () => {
+    // The measured misclick: a capture at 1280x1271, the debugging infobar
+    // lands (1280x1215), and the stale coordinate clicks the neighbouring
+    // row AND reports success. The stamp is the last capture's viewport; a
+    // live mismatch refuses BEFORE dispatch. No pointViewportSettled: the
+    // gate's one re-probe reads the same mismatch, the settled-stale shape.
+    await chrome.storage.session.set({
+      [`nymViewport:${TAB}`]: { width: 1280, height: 1271 },
+    })
+    const cdp = installCdpMock({
+      pointDescription: 'a "Tigerair"',
+      pointViewport: { width: 1280, height: 1215 },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [640, 400] })
+
+    expect(result.ok).toBe(false)
+    const error = String(result.error)
+    expect(error).toContain('1280x1271')
+    expect(error).toContain('1280x1215')
+    expect(error).toMatch(/fresh screenshot/i)
+    const data = result.data as Record<string, unknown>
+    expect(data.refused).toBe('viewport_changed')
+    expect(data.input).toBe('none')
+    expect(data.aimed_viewport).toEqual([1280, 1271])
+    expect(data.current_viewport).toEqual([1280, 1215])
+    // The refusal's whole claim: nothing was dispatched.
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+    // And the refusal KEEPS the stamp: the fix it asks for is a fresh
+    // capture, and only a capture (or a teaching refusal) may move it. A
+    // refusal that dropped it would un-gate the very next stale click.
+    const got = await chrome.storage.session.get(`nymViewport:${TAB}`)
+    expect(got[`nymViewport:${TAB}`]).toEqual({ width: 1280, height: 1271 })
+  })
+
+  it('converges instead of refusing when the mismatch was the infobar mid-landing (#191)', async () => {
+    // The attach running THIS act is what lands the infobar, so the first
+    // read after a capture can catch the reflow mid-flight: the capture
+    // stamped the settled 1280x1215, the first probe still sees the
+    // pre-attach 1280x1271, and one settle-and-re-probe reads the stamp's
+    // own size back. That is not staleness, and refusing it would gate the
+    // FIRST coordinate act on every fresh tab.
+    await chrome.storage.session.set({
+      [`nymViewport:${TAB}`]: { width: 1280, height: 1215 },
+    })
+    const cdp = installCdpMock({
+      pointViewport: { width: 1280, height: 1271 },
+      pointViewportSettled: { width: 1280, height: 1215 },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [65, 146] })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toContain('mousePressed')
+  })
+
+  it('the refusal quotes the SETTLED viewport, the one the act would dispatch into (#191)', async () => {
+    // Both probes mismatch the stamp but disagree with each other: the
+    // second read is the current truth (the first was mid-transition), so
+    // the payload and copy must carry it, or the agent re-aims against a
+    // size that no longer exists either.
+    await chrome.storage.session.set({
+      [`nymViewport:${TAB}`]: { width: 1280, height: 1271 },
+    })
+    const cdp = installCdpMock({
+      pointViewport: { width: 1280, height: 1200 },
+      pointViewportSettled: { width: 1280, height: 1215 },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [640, 400] })
+
+    expect(result.ok).toBe(false)
+    expect(String(result.error)).toContain('1280x1215')
+    const data = result.data as Record<string, unknown>
+    expect(data.refused).toBe('viewport_changed')
+    expect(data.current_viewport).toEqual([1280, 1215])
+    expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('a coordinate act proceeds when the live viewport matches the stamp', async () => {
+    await chrome.storage.session.set({
+      [`nymViewport:${TAB}`]: { width: 1280, height: 1215 },
+    })
+    const cdp = installCdpMock({
+      pointDescription: 'body',
+      pointViewport: { width: 1280, height: 1215 },
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', coordinate: [65, 146] })
+
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toContain('mousePressed')
+  })
+
+  it('the viewport gate fails OPEN with no stamp or an unreadable live viewport', async () => {
+    // Stamp present, live viewport unreadable: proceed (the gate is a
+    // capability aid; a page that cannot answer must not lose its clicks).
+    await chrome.storage.session.set({
+      [`nymViewport:${TAB}`]: { width: 1280, height: 1215 },
+    })
+    let cdp = installCdpMock({ pointViewport: null })
+    let result = await execAct({ tab_id: TAB, action: 'click', coordinate: [65, 146] })
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toContain('mousePressed')
+
+    // No stamp (never captured), live viewport readable: proceed.
+    await chrome.storage.session.remove(`nymViewport:${TAB}`)
+    cdp = installCdpMock({ pointViewport: { width: 1280, height: 1215 } })
+    result = await execAct({ tab_id: TAB, action: 'click', coordinate: [65, 146] })
+    expect(result.ok).toBe(true)
+    expect(inputEventTypes(cdp)).toContain('mousePressed')
+  })
+
   it('names the drag source as such rather than as what the drag hit', async () => {
     setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
     installCdpMock({ pointDescription: 'div.card' })
@@ -3483,6 +3624,49 @@ describe('actionability gates', () => {
     expect(error).toMatch(/not take the click/i)
     expect((result.data as { refused?: string }).refused).toBe('pointer_events_none')
     expect(inputEventTypes(cdp)).toHaveLength(0)
+  })
+
+  it('a refusal that teaches a coordinate clears the aim-time viewport stamp (#191)', async () => {
+    // The taught click_point comes from LIVE geometry in the current
+    // viewport, not from a capture: an older capture's stamp must not gate
+    // the very follow-up the refusal asks for.
+    await chrome.storage.session.set({
+      [`nymViewport:${TAB}`]: { width: 1280, height: 1271 },
+    })
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({
+      hit: { hit: false, blocker: 'div#page-backdrop' },
+      pointerEventsNone: true,
+    })
+
+    const result = await execAct({ tab_id: TAB, action: 'click', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect((result.data as { click_point?: number[] }).click_point).toBeDefined()
+    // The clear is fire-and-forget; give the microtask a beat.
+    await new Promise((r) => setTimeout(r, 0))
+    const got = await chrome.storage.session.get(`nymViewport:${TAB}`)
+    expect(got[`nymViewport:${TAB}`]).toBeUndefined()
+  })
+
+  it('the check-family teaching refusal clears the stamp too (#191)', async () => {
+    // The OTHER teach site: check/uncheck on a styled checkbox teaches a
+    // coordinate CLICK on the covering element. Same live-geometry rule as
+    // the click-family site; a stamp left standing would refuse the exact
+    // follow-up this refusal composes.
+    await chrome.storage.session.set({
+      [`nymViewport:${TAB}`]: { width: 1280, height: 1271 },
+    })
+    setRefs(TAB, new Map([['e1', fpRef(77)]]), TAB_URL)
+    installCdpMock({ hit: { hit: false, blocker: 'span.styled-box' }, value: null })
+
+    const result = await execAct({ tab_id: TAB, action: 'check', ref: '@e1' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/coordinate=\[50, 60\]/)
+    await new Promise((r) => setTimeout(r, 0))
+    const got = await chrome.storage.session.get(`nymViewport:${TAB}`)
+    expect(got[`nymViewport:${TAB}`]).toBeUndefined()
   })
 
   it('refuses when an ANCESTOR is what the click would hit, which the hit test calls a hit', async () => {

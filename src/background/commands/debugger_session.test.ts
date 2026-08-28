@@ -2,12 +2,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import {
   acquire,
   activeTabs,
+  DETACH_LINGER_MS,
   installCdpEventRouter,
   installDetachHandler,
   isAttached,
   onSessionEnd,
   registerDetachGate,
   release,
+  releaseAllHolds,
   resetForTests,
   sendCommand,
 } from '../debuggerSession'
@@ -31,9 +33,9 @@ describe('debuggerSession ref counting', () => {
     expect(activeTabs()).toEqual([7])
 
     release(7)
-    // detach is delayed by DETACH_LINGER_MS (10s).
+    // detach is delayed by DETACH_LINGER_MS.
     expect(chrome.debugger.detach).not.toHaveBeenCalled()
-    await vi.advanceTimersByTimeAsync(11_000)
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 1_000)
     expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
     expect(isAttached(7)).toBe(false)
   })
@@ -44,11 +46,11 @@ describe('debuggerSession ref counting', () => {
     expect(chrome.debugger.attach).toHaveBeenCalledTimes(1)
 
     release(7)
-    await vi.advanceTimersByTimeAsync(11_000)
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 1_000)
     expect(chrome.debugger.detach).not.toHaveBeenCalled() // still one outstanding refcount
 
     release(7)
-    await vi.advanceTimersByTimeAsync(11_000)
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 1_000)
     expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
   })
 
@@ -57,9 +59,42 @@ describe('debuggerSession ref counting', () => {
     release(7)
     await vi.advanceTimersByTimeAsync(2_000)
     await acquire(7) // re-acquire mid-linger
-    await vi.advanceTimersByTimeAsync(15_000)
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 5_000)
     expect(chrome.debugger.detach).not.toHaveBeenCalled()
     expect(chrome.debugger.attach).toHaveBeenCalledTimes(1) // no re-attach
+  })
+})
+
+describe('turn-end release (#191)', () => {
+  it('releaseAllHolds detaches an idle held session immediately', async () => {
+    // The ordinary detach path now: the backend says the turn ended, and the
+    // banner drops NOW instead of riding out the safety-net linger.
+    await acquire(7)
+    release(7)
+    await vi.advanceTimersByTimeAsync(1_000) // well inside the linger
+    expect(chrome.debugger.detach).not.toHaveBeenCalled()
+
+    releaseAllHolds()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
+    expect(isAttached(7)).toBe(false)
+  })
+
+  it('releaseAllHolds leaves an in-flight command attached', async () => {
+    // A release arriving while a command still runs (a queued sub-turn, a
+    // race) must not detach under it; that command's own release re-arms
+    // the safety net, which still detaches on its own.
+    await acquire(7)
+
+    releaseAllHolds()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(chrome.debugger.detach).not.toHaveBeenCalled()
+    expect(isAttached(7)).toBe(true)
+    release(7)
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 1_000)
+    expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
   })
 })
 
@@ -91,7 +126,7 @@ describe('CDP call deadlines', () => {
     expect(String(err)).toMatch(/reload recovers a discarded or frozen tab/i)
     // The refcount was released at the deadline, so the detach linger runs:
     // an abandoned call must not pin the debugger banner forever.
-    await vi.advanceTimersByTimeAsync(11_000)
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 1_000)
     expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
     expect(isAttached(1)).toBe(false)
   })
@@ -155,7 +190,7 @@ describe('CDP call deadlines', () => {
     tabs.find((t) => t.id === 57)!.discarded = false
     await acquire(57)
     release(57)
-    await vi.advanceTimersByTimeAsync(11_000)
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 1_000)
     expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
   })
 
@@ -177,7 +212,7 @@ describe('CDP call deadlines', () => {
     expect(isAttached(7)).toBe(true)
     release(7)
     release(7)
-    await vi.advanceTimersByTimeAsync(11_000)
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 1_000)
     expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
   })
 
@@ -191,7 +226,7 @@ describe('CDP call deadlines', () => {
     )
     await acquire(8)
     release(8)
-    await vi.advanceTimersByTimeAsync(10_100) // linger expires, detach starts and hangs
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 100) // linger expires, detach starts and hangs
     expect(chrome.debugger.detach).toHaveBeenCalledTimes(1)
 
     const late = acquire(8) // must wait the detach out, then cold-attach
@@ -208,7 +243,7 @@ describe('CDP call deadlines', () => {
     ;(chrome.debugger.detach as unknown) = vi.fn(() => new Promise<never>(() => {}))
     await acquire(9)
     release(9)
-    await vi.advanceTimersByTimeAsync(10_100) // linger expires, detach hangs
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 100) // linger expires, detach hangs
     await vi.advanceTimersByTimeAsync(5_100) // detach deadline gives up on it
     expect(isAttached(9)).toBe(false)
     // A fresh session must start cold, not ride the dead entry.
@@ -230,12 +265,12 @@ describe('detach single-flight and session end (#169 review)', () => {
 
     await acquire(7)
     release(7)
-    await vi.advanceTimersByTimeAsync(10_100) // detachNow #1 blocks in the gate
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 100) // detachNow #1 blocks in the gate
     expect(gateResolvers.length).toBe(1)
 
     await acquire(7) // a mid-gate command bumps and releases the refcount
     release(7)
-    await vi.advanceTimersByTimeAsync(10_100) // its linger expires mid-gate
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 100) // its linger expires mid-gate
 
     expect(gateResolvers.length, 'one detach drives the session; the second linger yields').toBe(1)
     for (const resolve of gateResolvers) resolve()
@@ -266,7 +301,7 @@ describe('detach single-flight and session end (#169 review)', () => {
 
     await acquire(7)
     release(7)
-    await vi.advanceTimersByTimeAsync(10_100) // voluntary detach starts and hangs
+    await vi.advanceTimersByTimeAsync(DETACH_LINGER_MS + 100) // voluntary detach starts and hangs
     onDetach({ tabId: 7 }, 'target_closed')
     expect(ends).toEqual([7])
 

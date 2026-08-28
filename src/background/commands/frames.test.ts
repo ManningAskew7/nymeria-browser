@@ -424,7 +424,10 @@ describe('coordinate acts over frames', () => {
       if (method === 'Runtime.evaluate' && params.expression?.includes('elementFromPoint')) {
         return {
           result: {
-            value: { description: 'iframe', opensFileChooser: false, frameOwner: true },
+            value: {
+              target: { description: 'iframe', opensFileChooser: false, frameOwner: true },
+              viewport: null,
+            },
           },
         }
       }
@@ -1237,7 +1240,8 @@ describe('in-frame delivery verification', () => {
 
 describe('frame refs across the idle detach', () => {
   it("a held frame ref survives session churn: it re-resolves through the frame's NEW session", async () => {
-    // The debugger detaches from the tab 10s after its last command, killing
+    // The debugger detaches from the tab at turn end or after the idle
+    // linger (DETACH_LINGER_MS), killing
     // every frame session; the next attach re-announces the same frames
     // under NEW session ids. Session-keyed refs died right here (measured
     // 2026-08-16 live QA: three consecutive stale reads to land one click);

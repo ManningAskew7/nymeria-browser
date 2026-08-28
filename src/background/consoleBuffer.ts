@@ -57,8 +57,8 @@ export function count(tabId: number): number {
 /**
  * Push unless an identical entry is already buffered.
  *
- * Runtime and Log REPLAY their backlog on every enable, and the attach is
- * per-command-burst (10s linger), so each re-attach re-delivers entries the
+ * Runtime and Log REPLAY their backlog on every enable, and the attach ends
+ * at turn end or on the idle linger, so each re-attach re-delivers entries the
  * buffer already holds; measured live 2026-08-16 as duplicate advisories at
  * identical timestamps. A replayed entry is byte-identical including its
  * CDP timestamp, so an exact-tuple match is the discriminator. The
