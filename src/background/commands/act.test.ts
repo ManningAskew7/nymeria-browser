@@ -201,6 +201,9 @@ interface MockOptions {
   /** The selector expression THREW (a malformed xpath, a broken query). CDP
    *  still returns a `result`: the Error object, with an objectId. */
   selectorThrows?: boolean
+  /** The wait miss report's evaluate fails (a world lost at the deadline):
+   *  the miss must stay a plain miss, never a new failure class (#196). */
+  missReportFails?: boolean
 }
 
 /**
@@ -257,6 +260,7 @@ function installCdpMock(opts: MockOptions = {}) {
     matchCountCapped,
     shadowMatch,
     selectorThrows,
+    missReportFails = false,
   } = opts
   // Two worlds, two context ids: the delivery probe's (its counter state) and
   // the trust probes' (geometry, hit tests, selectors). Distinct so a test can
@@ -436,6 +440,7 @@ function installCdpMock(opts: MockOptions = {}) {
       const mustBeInWorld =
         expression.includes('elementFromPoint') ||
         expression.includes('innerText.includes') ||
+        expression.includes('MISS_REPORT') ||
         expression.includes('innerWidth') ||
         expression.includes('__nymScroll') ||
         expression.includes('document.querySelector(') ||
@@ -478,6 +483,26 @@ function installCdpMock(opts: MockOptions = {}) {
         return { result: { value: { tag: 'input', label: 'Email' } } }
       }
       if (expression.includes('innerWidth')) return { result: { value: { x: 400, y: 300 } } }
+      if (expression.includes('MISS_REPORT')) {
+        // The miss report (#196) carries its needle pre-lowercased as a
+        // `var NEEDLE_LOWER = "..."` binding, same fail-loudly rule as the
+        // scan's NEEDLE. Routed BEFORE the querySelector branch: the ci
+        // scan's frame descent contains `querySelectorAll`, which that
+        // branch's substring would swallow into selector semantics.
+        const m = expression.match(/var NEEDLE_LOWER = (".*");/)
+        if (!m) throw new Error('miss-report needle not found in expression')
+        if (missReportFails) {
+          return { exceptionDetails: { text: 'world gone', exceptionId: 9 } }
+        }
+        return {
+          result: {
+            value: {
+              ci: bodyText.toLowerCase().includes(JSON.parse(m[1]) as string),
+              excerpt: bodyText.replace(/\s+/g, ' ').trim().slice(0, 240),
+            },
+          },
+        }
+      }
       if (expression.includes('innerText.includes')) {
         // The frame-descending scan (QA round 2) carries its needle as a
         // `var NEEDLE = "..."` binding; a shape drift must fail loudly, not
@@ -1129,6 +1154,21 @@ describe('verification payload', () => {
     expect((result.data as { dom_mutations?: number }).dom_mutations).toBe(0)
   })
 
+  it('a FILL carries the tally: the zero-mutation fill is the #217 shape', async () => {
+    // fill commits via Input.insertText (one trusted input event, no key
+    // events), so a keystroke-driven widget can take the value and never
+    // react. The backend's [Fill note] keys on exactly this payload shape
+    // (action "fill" + a measured zero), so the pair is pinned here.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ deliveryTally: 0, textEntry: true })
+
+    const result = await execAct({ tab_id: TAB, action: 'fill', ref: '@e1', value: 'Sydney' })
+
+    expect(result.ok).toBe(true)
+    expect((result.data as { action?: string }).action).toBe('fill')
+    expect((result.data as { dom_mutations?: number }).dom_mutations).toBe(0)
+  })
+
   it('a NAVIGATING act carries no tally: the observer died with the document (#180)', async () => {
     // The settle-window version leaked the DESTINATION document's count
     // (measured live: mutations 5 on a navigating click). The probe-world
@@ -1165,6 +1205,151 @@ describe('verification payload', () => {
     expect(result.ok).toBe(false)
     expect(result.error).toMatch(/wait timed out/)
     expect((result.data as { found: boolean }).found).toBe(false)
+  })
+
+  // ---- the miss report (#196): a timed-out TEXT wait still says what IS there.
+
+  it('a case-only miss carries the case-blind tell and the page excerpt (#196)', async () => {
+    // "Add to Cart" against a page reading "add to cart": the matcher stays
+    // exact and case-sensitive (existing waits keep their semantics), and
+    // the MISS carries both halves the operator had to dig for.
+    // The doubled space sits OUTSIDE the needle phrase on purpose: the
+    // case-blind tell is un-collapsed like the matcher itself (only the
+    // excerpt collapses), so a gap inside the phrase would defeat both.
+    const cdp = installCdpMock({ bodyText: 'Cart page.  add to cart now' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'wait',
+      wait_for: { text: 'Add to Cart' },
+      timeout_ms: 150,
+    })
+
+    expect(result.ok).toBe(false)
+    const data = result.data as {
+      found: boolean
+      found_case_insensitive?: boolean
+      page_text_excerpt?: string
+    }
+    expect(data.found).toBe(false)
+    expect(data.found_case_insensitive).toBe(true)
+    expect(data.page_text_excerpt).toBe('Cart page. add to cart now')
+    const reports = cdp.mock.calls.filter(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression).includes('MISS_REPORT'),
+    )
+    expect(reports.length, 'the report runs ONCE, at the deadline, never per poll').toBe(1)
+  })
+
+  it('a noun-variant miss carries the excerpt and NO case-blind tell (#196)', async () => {
+    // The measured Amazon shape: waited on "Added to Basket", the page says
+    // "Added to cart". No spelling of the needle matches, so the tell stays
+    // absent and the excerpt is what answers "did this even work".
+    installCdpMock({ bodyText: 'Added to cart' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'wait',
+      wait_for: { text: 'Added to Basket' },
+      timeout_ms: 150,
+    })
+
+    const data = result.data as { found_case_insensitive?: boolean; page_text_excerpt?: string }
+    expect(data.found_case_insensitive).toBeUndefined()
+    expect(data.page_text_excerpt).toBe('Added to cart')
+  })
+
+  it('a successful text wait carries no miss report', async () => {
+    installCdpMock({ bodyText: 'Order confirmed' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'wait',
+      wait_for: { text: 'Order confirmed' },
+      timeout_ms: 500,
+    })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as { found_case_insensitive?: boolean; page_text_excerpt?: string }
+    expect(data.found_case_insensitive).toBeUndefined()
+    expect(data.page_text_excerpt).toBeUndefined()
+  })
+
+  it('a failed miss report degrades to the plain miss, never a new failure (#196)', async () => {
+    // The wait has already timed out; a world lost at the deadline must not
+    // convert that into a different error or invent report keys.
+    installCdpMock({ bodyText: 'irrelevant', missReportFails: true })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'wait',
+      wait_for: { text: 'Order confirmed' },
+      timeout_ms: 150,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toMatch(/wait timed out/)
+    const data = result.data as { found_case_insensitive?: boolean; page_text_excerpt?: string }
+    expect(data.found_case_insensitive).toBeUndefined()
+    expect(data.page_text_excerpt).toBeUndefined()
+  })
+
+  it('a spent budget skips the miss report before it touches the page (#196)', async () => {
+    // The report runs strictly AFTER a wait that already consumed its
+    // window; on a clamped batch only the result reserve remains, and the
+    // report must not spend it forcing innerText layout on a slow page.
+    const cdp = installCdpMock({ bodyText: 'Order confirmed' })
+
+    const report = await __test.waitMissReport(TAB, 'Order confirmed', Date.now() - 1)
+
+    expect(report).toEqual({})
+    const evaluates = cdp.mock.calls.filter(
+      (c) =>
+        c[1] === 'Runtime.evaluate' &&
+        String((c[2] as { expression?: string }).expression).includes('MISS_REPORT'),
+    )
+    expect(evaluates, 'a spent budget never reaches the page').toHaveLength(0)
+  })
+
+  it('a non-string wait text still yields a usable miss report (#196, batch path)', async () => {
+    // chrome_batch nests act args with no pydantic validation, so `text`
+    // can arrive as a number. The String() at the report call site is what
+    // keeps the report alive there; without it the toLowerCase throw is
+    // eaten by the degrade catch and the miss goes untold.
+    installCdpMock({ bodyText: 'Total: 42 items' })
+
+    const report = await __test.waitMissReport(TAB, 42, null)
+
+    expect(report.excerpt).toBe('Total: 42 items')
+    expect(report.foundCaseInsensitive, 'the stringified needle drove a real scan').toBe(true)
+  })
+
+  it('the miss-report expression bounds its excerpt PAGE-side (executed for real)', () => {
+    // The slice lives in the in-page expression, so this runs it, not a
+    // mock of it (#210's lesson: a bound staged at the mock pins nothing).
+    document.body.textContent = `  leading   ${'word '.repeat(200)}`
+    const report = (
+      new Function(`return (${__test.waitMissReportExpression('absent needle')})`) as () => {
+        ci: boolean
+        excerpt: string
+      }
+    )()
+    expect(report.ci).toBe(false)
+    expect(report.excerpt.length).toBeLessThanOrEqual(240)
+    expect(report.excerpt.startsWith('leading word word')).toBe(true)
+  })
+
+  it('the miss-report expression answers the case-blind tell without touching the matcher', () => {
+    document.body.textContent = 'Please ADD TO CART today'
+    const report = (
+      new Function(`return (${__test.waitMissReportExpression('add to cart')})`) as () => {
+        ci: boolean
+        excerpt: string
+      }
+    )()
+    expect(report.ci).toBe(true)
+    expect(report.excerpt).toBe('Please ADD TO CART today')
   })
 
   it('waits on a url substring', async () => {
@@ -1474,6 +1659,31 @@ describe('verification payload', () => {
     expect(data.found).toBe(false)
     expect(data.condition).toBe('text:Order confirmed')
     expect(data.input_delivered).toBe('yes')
+  })
+
+  it('a FUSED miss carries the same miss report as a bare wait (#196)', async () => {
+    // The Amazon case was a fused shape: click, then wait on the wrong
+    // noun. The report must not be a bare-wait privilege.
+    setRefs(TAB, new Map([['e1', fpRef(100)]]), TAB_URL)
+    installCdpMock({ bodyText: 'Added to cart' })
+
+    const result = await execAct({
+      tab_id: TAB,
+      action: 'click',
+      ref: '@e1',
+      wait_for: { text: 'added to CART' },
+      timeout_ms: 150,
+    })
+
+    expect(result.ok).toBe(true)
+    const data = result.data as {
+      found?: boolean
+      found_case_insensitive?: boolean
+      page_text_excerpt?: string
+    }
+    expect(data.found).toBe(false)
+    expect(data.found_case_insensitive).toBe(true)
+    expect(data.page_text_excerpt).toBe('Added to cart')
   })
 
   it('timeout_ms with no condition widens the one settle and never arms a condition', async () => {

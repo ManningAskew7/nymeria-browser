@@ -503,9 +503,27 @@ POSTs results. Consequences:
   points come from `DOM.getContentQuads` on the element's OWN session
   (backendNodeIds are per-process; root-session quads for a
   nested-in-OOPIF node describe the wrong element). act.test's wait
-  mocks extract the needle from the scan expression's
+  mocks route on the literal `innerText.includes` at FIVE sites (count
+  them fresh with grep in act.test.ts; a hardcoded count and line list
+  both went stale here) and
+  three extract the needle from the scan expression's
   `var NEEDLE = "..."` binding and THROW on shape drift: changing
-  `waitTextExpression`'s shape means updating both mock sites.
+  `waitTextExpression`'s shape means updating every site, and all of them
+  return booleans, so a scan that returned anything else breaks them all.
+- Wait miss report (v0.24.0, #196): a timed-out TEXT wait runs ONE extra
+  probe-world evaluate (`waitMissReportExpression`) whose payload keys are
+  `page_text_excerpt` (root document, whitespace-collapsed, 240 chars,
+  sliced PAGE-side) and `found_case_insensitive` (present only when true;
+  the ci scan descends same-origin frames but no OOPIF sweep, a bounded
+  blind spot taken for one round trip). The expression deliberately does
+  NOT contain the literal `innerText.includes` (the five mock sites above
+  would swallow it) and mocks route it on its own `MISS_REPORT` marker,
+  which must stay BEFORE act.test's `querySelector` branch (the ci scan
+  contains `querySelectorAll`). Matching semantics unchanged: exact,
+  case-sensitive, per decision. The backend's [Fill note] (#217) keys on
+  `action == "fill"` + `dom_mutations == 0` + delivery not "no", so
+  changing `PROBE_EVENTS.fill` or the tally's verb-agnostic read changes
+  what that note fires on.
 - Actionability traps (v0.6.0, measured): `elementFromPoint` on a
   `pointer-events: none` target answers its ANCESTOR, so a gate keyed on
   `hit === false` alone would almost never fire live while the click landed

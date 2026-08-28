@@ -2805,15 +2805,20 @@ async function readValue(session: Cdp, objectId: string): Promise<string | null>
  * honestly. The descent is exercised as EXECUTED code by the wait tests'
  * evaluate mock, not string-matched.
  */
-function waitTextExpression(text: string): string {
-  return `(function(){
-    var NEEDLE = ${JSON.stringify(text)};
-    var budget = 16;
+/**
+ * The bounded same-origin frame descent BOTH wait expressions compose: one
+ * walk, two predicates, so the matcher and the miss report cannot drift
+ * apart about what was scanned (the shadowWalk rule: two probes that need
+ * the same walk must agree about it, and a copy diverges silently). `hitFn`
+ * is a complete `function hit(doc) { ... }` source; the walk try/catches
+ * its call per document, preserving the original per-document tolerance.
+ */
+function frameScanSource(hitFn: string): string {
+  return `var budget = 16;
+    ${hitFn}
     function scan(doc, depth) {
       if (!doc || depth > 4) return false;
-      try {
-        if (doc.body && doc.body.innerText && doc.body.innerText.includes(NEEDLE)) return true;
-      } catch (e) {}
+      try { if (hit(doc)) return true; } catch (e) {}
       var frames;
       try { frames = doc.querySelectorAll('iframe,frame'); } catch (e) { return false; }
       for (var i = 0; i < frames.length; i++) {
@@ -2824,9 +2829,89 @@ function waitTextExpression(text: string): string {
         if (inner && scan(inner, depth + 1)) return true;
       }
       return false;
-    }
+    }`
+}
+
+function waitTextExpression(text: string): string {
+  return `(function(){
+    var NEEDLE = ${JSON.stringify(text)};
+    ${frameScanSource(`function hit(doc) {
+      return !!(doc.body && doc.body.innerText && doc.body.innerText.includes(NEEDLE));
+    }`)}
     return scan(document, 0);
   })()`
+}
+
+/**
+ * What a MISSED text wait can still report: whether the needle would have
+ * matched case-insensitively, and an excerpt of what the page visibly says
+ * (#196). Runs ONCE, at the deadline, never per poll: the polls stay
+ * boolean-cheap and their five test-mock sites keep routing on the
+ * `innerText.includes` substring, which this expression deliberately does
+ * not contain (it reads via indexOf and routes its own mocks on the
+ * `MISS_REPORT` marker instead; drifting either spelling breaks the other's
+ * routing). The ci scan descends same-origin frames with the same bounds as
+ * the matcher; the excerpt is the ROOT document only, whitespace-collapsed
+ * and sliced page-side, so a huge page never crosses the wire for it. Page
+ * text lands INSIDE the fenced payload, the same precedent as
+ * `focused.label`.
+ */
+function waitMissReportExpression(text: string): string {
+  return `(function(){
+    var MISS_REPORT = 1;
+    var NEEDLE_LOWER = ${JSON.stringify(text.toLowerCase())};
+    ${frameScanSource(`function hit(doc) {
+      var t = '';
+      try { t = (doc.body && doc.body.innerText) || ''; } catch (e) { t = ''; }
+      return !!(t && t.toLowerCase().indexOf(NEEDLE_LOWER) !== -1);
+    }`)}
+    var rootText = '';
+    try { rootText = (document.body && document.body.innerText) || ''; } catch (e) { rootText = ''; }
+    return {
+      ci: scan(document, 0),
+      excerpt: rootText.replace(/\\s+/g, ' ').trim().slice(0, 240),
+    };
+  })()`
+}
+
+/**
+ * How long the miss report may spend in the page. It runs strictly AFTER
+ * the wait window, which `clampToBudget` sizes to consume the deadline
+ * exactly, so only the result reserve remains, and it forces an innerText
+ * layout on a page that just proved slow (#162 review catch: the default
+ * 15s CDP deadline here could blow the whole payload into a bare transport
+ * timeout, the exact failure the budget exists to remove).
+ */
+const MISS_REPORT_DEADLINE_MS = 2_000
+
+/**
+ * One evaluate, root session only, degrading to an empty report on any
+ * failure: the wait has already timed out, so a broken report must not mint
+ * a new failure class (a non-string `text` arrives via chrome_batch, whose
+ * nested act args get no pydantic validation, hence the String() and the
+ * catch) or spend the batch's result reserve on a frame sweep (the
+ * expression already descends same-origin frames; an OOPIF-only
+ * case-variant goes untold, a bounded blind spot taken for one round trip).
+ */
+async function waitMissReport(
+  tabId: number,
+  text: unknown,
+  budgetDeadline: number | null,
+): Promise<{ foundCaseInsensitive?: true; excerpt?: string }> {
+  try {
+    if (budgetSpent(budgetDeadline)) return {}
+    const report = await evaluateInProbeWorld<{ ci?: boolean; excerpt?: string }>(
+      tabId,
+      waitMissReportExpression(String(text)),
+      { deadlineMs: clampToDeadline(MISS_REPORT_DEADLINE_MS, budgetDeadline) },
+    )
+    const out: { foundCaseInsensitive?: true; excerpt?: string } = {}
+    if (report?.ci === true) out.foundCaseInsensitive = true
+    if (typeof report?.excerpt === 'string' && report.excerpt) out.excerpt = report.excerpt
+    return out
+  } catch {
+    return {}
+  }
 }
 
 /**
@@ -2847,7 +2932,15 @@ async function performWait(
   tabId: number,
   waitFor: WaitFor | undefined,
   timeoutMs: number,
-): Promise<{ found: boolean; condition: string; alreadyTrue?: boolean; unwatchable?: string }> {
+  budgetDeadline: number | null = null,
+): Promise<{
+  found: boolean
+  condition: string
+  alreadyTrue?: boolean
+  unwatchable?: string
+  foundCaseInsensitive?: true
+  excerpt?: string
+}> {
   const deadline = Date.now() + timeoutMs
   // Conditions are OR'd: the first to hold wins and is the one NAMED, so a
   // `found: true` is never a claim about a condition that was not met. Only
@@ -2933,7 +3026,20 @@ async function performWait(
         // payload and read as "nothing was sent". Keep polling instead.
       }
     }
-    if (Date.now() >= deadline) return { found: false, condition: allConditions }
+    if (Date.now() >= deadline) {
+      // A text miss still says what IS there (#196): the case-blind tell and
+      // a root-document excerpt, so "found: false" stops reading as "did
+      // this even work" when the answer is on the page under a different
+      // spelling. The matcher itself stays exact and case-sensitive.
+      if (waitFor.text) {
+        return {
+          found: false,
+          condition: allConditions,
+          ...(await waitMissReport(tabId, waitFor.text, budgetDeadline)),
+        }
+      }
+      return { found: false, condition: allConditions }
+    }
     await new Promise((r) => setTimeout(r, WAIT_POLL_MS))
     polls += 1
   }
@@ -3041,7 +3147,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     // `waited_ms` a number about the whole command rather than about the
     // wait it names.
     const waitStart = Date.now()
-    const raced = await raceStandingDialog(tabId, performWait(tabId, a.wait_for, waitWindowMs))
+    const raced = await raceStandingDialog(tabId, performWait(tabId, a.wait_for, waitWindowMs, budgetDeadline))
     if (raced.kind === 'dialog') {
       const d = raced.dialog
       return {
@@ -3057,7 +3163,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         },
       }
     }
-    const { found, condition, alreadyTrue, unwatchable } = raced.value
+    const { found, condition, alreadyTrue, unwatchable, foundCaseInsensitive, excerpt } = raced.value
     // A condition that can never come true is a caller error, not a page
     // outcome, and it is reported the moment the resolver says so rather
     // than after the window it would otherwise have burned.
@@ -3088,6 +3194,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
         waited_ms: Date.now() - waitStart,
         ...(alreadyTrue ? { condition_met_before_wait: true } : {}),
         ...(waitClamped && !found ? { budget_clamped: true } : {}),
+        // The miss report (#196): present only on a timed-out text condition.
+        ...(foundCaseInsensitive ? { found_case_insensitive: true } : {}),
+        ...(excerpt ? { page_text_excerpt: excerpt } : {}),
       },
     })
     return {
@@ -4466,7 +4575,7 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     // budget cut is the wrong-claim class this whole pass removes.
     const fusedAskedMs = agentTimeoutMs ?? DEFAULT_WAIT_MS
     const fusedWindowMs = clampToBudget(fusedAskedMs)
-    const raced = await raceStandingDialog(tabId, performWait(tabId, a.wait_for, fusedWindowMs))
+    const raced = await raceStandingDialog(tabId, performWait(tabId, a.wait_for, fusedWindowMs, budgetDeadline))
     if (raced.kind === 'dialog') {
       return pendingDialogResult(a.action, target, tabId, raced.dialog, inputMode, startedAt, urlBefore, extra)
     }
@@ -4477,6 +4586,9 @@ export async function execAct(args: unknown, ctx?: ExecContext): Promise<Command
     // the condition was never watchable instead of leaving a bare
     // `found: false` to read as the page's answer.
     if (raced.value.unwatchable) extra.condition_error = raced.value.unwatchable
+    // The miss report (#196): present only on a timed-out text condition.
+    if (raced.value.foundCaseInsensitive) extra.found_case_insensitive = true
+    if (raced.value.excerpt) extra.page_text_excerpt = raced.value.excerpt
     // No `condition_met_before_wait` here, deliberately. The fused wait opens
     // AFTER the action has been dispatched and settled, so a condition the
     // action produced is already true at the first check: the flag would ride
@@ -4679,6 +4791,8 @@ export const __test = {
   resolveTarget,
   performWait,
   buildVerification,
+  waitMissReport,
+  waitMissReportExpression,
   cssResolveExpression,
   NEEDS_TARGET,
   OPENS_FILE_CHOOSER,
