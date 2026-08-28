@@ -2,8 +2,13 @@ import { useEffect, useMemo, useState } from 'react'
 import { popupLogger as logger } from '../utils/logger'
 import { BROADCAST_CHANNEL, type PopupRequest, type PopupResponse, type SnapshotBroadcast } from '../shared/messages'
 import type { BackgroundSnapshot, ConnectionStatus } from '../shared/types'
+import { loadDraft, saveDraft } from './draft'
 
 const DEFAULT_BASE_URL = 'http://localhost:8000'
+
+/** The manifest is the one source of the version: a hand-kept copy here sat
+ *  at "v0.2.0" for twenty-five releases before anyone noticed. */
+const VERSION = chrome.runtime.getManifest().version
 
 /**
  * The optional host permissions behind page-status reporting (#175): the
@@ -92,6 +97,31 @@ export function Popup() {
   const [now, setNow] = useState(Date.now())
   /** null = still asking Chrome; the button renders disabled until it answers. */
   const [pageStatusGranted, setPageStatusGranted] = useState<boolean | null>(null)
+  /** Gates draft SAVES until the initial load has applied, so the default
+   *  value cannot clobber a real draft before it is read back. */
+  const [draftReady, setDraftReady] = useState(false)
+
+  // Connect-form draft (see draft.ts): restore what a dead popup ate, then
+  // mirror every edit. The permission prompt Connect opens can dismiss the
+  // popup; the grant survives, the typed fields did not.
+  useEffect(() => {
+    let mounted = true
+    void loadDraft().then((draft) => {
+      if (!mounted) return
+      if (draft) {
+        setBaseUrl(draft.baseUrl)
+        setToken(draft.token)
+      }
+      setDraftReady(true)
+    })
+    return () => {
+      mounted = false
+    }
+  }, [])
+
+  useEffect(() => {
+    if (draftReady) saveDraft({ baseUrl, token })
+  }, [draftReady, baseUrl, token])
 
   useEffect(() => {
     let mounted = true
@@ -201,7 +231,7 @@ export function Popup() {
     <div className="container">
       <div className="header">
         <h1>Nymeria Browser</h1>
-        <div className="version">v0.2.0</div>
+        <div className="version">v{VERSION}</div>
       </div>
       <div className="body">
         <StatusCard status={snapshot?.status ?? { kind: 'unconfigured' }} now={now} />
