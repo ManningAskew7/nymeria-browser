@@ -349,6 +349,11 @@ Read the visible text of a Chrome tab. Cheaper than a screenshot for prose.
         (e.g. "the order total and delivery date") and a secondary LLM reads
         the page and returns only that, which keeps a long page out of your
         context entirely. Best for big pages where you need a few facts.
+        The [Extracted by ...] tag says so when that model was cut at its
+        output limit mid-answer (the tail may be missing: narrow the
+        prompt); without that clause the extraction ran to its own finish.
+        A [Read cap] note means the extension cut the page text itself
+        before anything here ran.
 
     Reads the ROOT document only: iframe text is chrome_read_page's job. A
     read that FAILED says so rather than reporting a page with no text.
@@ -730,7 +735,18 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         makes "click and confirm the row appeared" ONE call, not a click
         then a wait. action="wait" alone (nothing dispatched) still FAILS on
         timeout. Multiple conditions are OR'd: the first to hold ends the
-        wait and is the one named; a timeout names them all. timeout_ms with
+        wait and is the one named; a timeout names them all. The text
+        condition is an EXACT, case-sensitive substring of the page's
+        visible text, so wait on the shortest stable fragment ("Added", not
+        "Added to Cart", which misses when the site says Basket). A missed
+        text condition reports what IS there: "page_text_excerpt" carries
+        the ROOT document's visible text (bounded; same-origin frames are
+        scanned for the match but not excerpted, and a cross-origin frame's
+        text is invisible to this report, though the wait itself does match
+        it) and "found_case_insensitive": true means a case-insensitive scan
+        found it (usually only the casing missed); read both before
+        concluding the action failed. Both keys are absent on an older
+        extension build, never meaningful by absence. timeout_ms with
         no condition simply gives the page longer to go quiet (reported
         under "settled", never as a failed condition). timeout_ms is capped:
         an ask that cannot fit under the transport ceiling with the
@@ -782,7 +798,13 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     un-prevented click on the link you meant, with no navigation following,
     means the page or browser declined the default action, not that your
     input missed. A fill reports "input_delivered" through its trusted input
-    event the same way.
+    event the same way, and carries fill's own limit: the value is committed
+    in one IME-style insert (a real input event, NO per-key events), so a
+    widget that reacts per keystroke (autocomplete, a dependent dropdown,
+    live validation) can take the value and never react. A fill whose
+    document showed no reaction says so in a [Fill note]; action="type" on
+    the same ref drives such a widget key by key (slower, and unlike fill it
+    is suppressed under a standing dialog).
 
     Frames are full targets, not blind spots. A ref inside an iframe, whether
     cross-origin or same-origin, gets its input dispatched into that frame
@@ -834,8 +856,9 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
     the strong signal, the document made nothing observable of your input
     (the phantom-success shape where every delivery field is truthful and
     nothing happened): verify a page fact before retrying rather than
-    re-firing blind. A nonzero count is weak evidence, since dynamic pages
-    mutate constantly. Synchronous handler reactions ARE counted (the
+    re-firing blind. A zero-mutation fill is additionally MARKED with a
+    [Fill note] naming the keystroke limit above. A nonzero count is weak
+    evidence, since dynamic pages mutate constantly. Synchronous handler reactions ARE counted (the
     watch starts before dispatch); reactions inside shadow roots are not.
     The key is ABSENT wherever nothing can be measured: a navigating act
     (the watch died with the document; the navigation is the reaction),
