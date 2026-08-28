@@ -1539,3 +1539,135 @@ Reload the Nymeria browser extension from disk (dev-loop helper).
     dialogs are dropped) and loses any in-flight commands: run it alone,
     never inside chrome_batch.
 ````
+
+---
+
+## chrome_request_login
+
+Args schema:
+
+```json
+{
+  "url": {
+    "title": "Url",
+    "type": "string"
+  },
+  "tab_id": {
+    "anyOf": [
+      {
+        "type": "integer"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Tab Id"
+  }
+}
+```
+
+Description (verbatim docstring):
+
+````
+Hand one tab to the USER so they sign a site in by hand.
+
+    Opens a live view of the tab in Nymeria Desktop where the user drives
+    with their own mouse and keyboard (real, trusted input), for a login
+    wall, a 2FA step, or any verify-you-are-human wall you cannot and must
+    not pass yourself. You never see that screen: while the session runs,
+    every chrome_* command aimed at the tab is refused, and the frames go
+    to the user's viewer only, so their password is never in your context.
+    Once they finish, the tab is signed in and the browser profile keeps
+    the session across restarts, so one handoff fixes a site for good.
+
+    url: where the login happens. With no tab_id it is opened in a NEW tab;
+        with a tab_id it is only the label the user sees on the viewer, so
+        pass the page the tab is actually on.
+    tab_id: hand over THIS tab, already at the wall you hit. Omit to open a
+        fresh tab at url instead. The tab is returned to you when the
+        session ends.
+
+    Dispatch contract, like request_credential: returns immediately with
+    status="dispatched" and a session_id. The session runs up to 10 minutes
+    (hard cap, not extended by activity) and one session per user can be
+    open at a time. Tell the user the login window is ready in Nymeria
+    Desktop and what to do there. Then either call chrome_await_login with
+    the session_id to wait for the outcome (usually right away, so you can
+    continue the task the moment they finish), or keep working on OTHER
+    tabs and await later. chrome_cancel_login ends it early if the user
+    changes their mind in chat.
+````
+
+---
+
+## chrome_await_login
+
+Args schema:
+
+```json
+{
+  "session_id": {
+    "title": "Session Id",
+    "type": "string"
+  },
+  "timeout_seconds": {
+    "default": 240,
+    "title": "Timeout Seconds",
+    "type": "integer"
+  }
+}
+```
+
+Description (verbatim docstring):
+
+````
+Wait for a login handoff to end and learn how it ended.
+
+    Blocks up to timeout_seconds (5 to 270, default 240) for the session
+    opened by chrome_request_login to finish. Waiting does not end or
+    extend the session; it only listens, so calling this immediately after
+    dispatching is the normal pattern: the moment the user clicks "finish"
+    in the viewer you get the outcome and can continue the task.
+
+    Returns the outcome payload once the session has ended (now or
+    earlier): status is "completed" (user signed in; resume driving the
+    tab), "expired" (10-minute cap hit first), "cancelled", "aborted"
+    (thread stopped), or "failed" (the live view never started). If the
+    wait runs out with the session still live, you get status="active"
+    with the seconds remaining; the user may simply be mid-2FA, so say
+    something reassuring and call this again to keep waiting. Outcomes
+    stay readable for 15 minutes after a session ends; a finished login
+    outlives that regardless, in the browser profile itself.
+````
+
+---
+
+## chrome_cancel_login
+
+Args schema:
+
+```json
+{
+  "session_id": {
+    "default": "",
+    "title": "Session Id",
+    "type": "string"
+  }
+}
+```
+
+Description (verbatim docstring):
+
+````
+End a live login handoff early, before the user finishes.
+
+    For when plans change mid-handoff: the user says in chat to forget the
+    login, or the task no longer needs the site. Ends the session opened by
+    chrome_request_login (or /browser login), closes the user's viewer, and
+    returns the tab to your control. This does not undo anything the user
+    already did on the page.
+
+    session_id: which session to end. Omit it to end the user's one active
+        session (only one can be open at a time).
+````

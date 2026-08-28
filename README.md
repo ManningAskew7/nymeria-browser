@@ -211,8 +211,18 @@ copying a session in from your desktop, do not apply to a session created
 here, since a headless Linux host has no secure key storage and Chrome
 falls back to ordinary cookies).
 
-An in-app login view is planned. Until it lands, the interim path is Chrome's
-own remote inspector over an SSH tunnel, which `run` already permits
+The built-in path is the **login handoff** (v0.28.0): the agent (or
+`/browser login <url>` from any Nymeria surface) opens a login session on a
+tab, and nymeria-desktop raises a live viewer of that tab. You sign in by
+hand there, 2FA phone prompts included, and click "Hand the tab back" when
+done. While the session is live the agent is locked out of that tab and
+never sees a frame of it; sessions expire on their own after 10 minutes.
+The tools are `chrome_request_login` / `chrome_await_login` /
+`chrome_cancel_login`, and the typical shape is the agent hitting a login
+wall, opening a session, and asking you to take the wheel.
+
+The fallback, when no desktop client is around, is Chrome's own remote
+inspector over an SSH tunnel, which `run` already permits
 (`--remote-allow-origins`):
 
 ```bash
@@ -226,11 +236,11 @@ IP, so a hostname-based reverse proxy will not work. `http://localhost:9222/json
 lists the live targets and their `devtoolsFrontendUrl` if you would rather open
 one directly. Log in there by hand, including 2FA on your phone.
 
-Caveats, in the spirit of not overselling an interim: the underlying
-mechanisms are measured working, but the exact click path through the
-DevTools UI was not verifiable from a server with no display, so treat it as
-approximate. It hands over the whole debugging surface rather than a scoped
-login window, which is why it is interim. Passkeys and USB security keys
+Caveats on the tunnel path: the underlying mechanisms are measured working,
+but the exact click path through the DevTools UI was not verifiable from a
+server with no display, so treat it as approximate, and it hands over the
+whole debugging surface rather than a scoped login window, which is why the
+handoff viewer is the primary path. Passkeys and USB security keys
 cannot work in the server browser at all (no platform authenticator), so an
 account that insists on one needs a fallback factor: an authenticator-app
 code, a backup code, or a phone prompt.
