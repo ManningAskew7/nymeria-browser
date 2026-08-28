@@ -173,6 +173,19 @@ Notes:
   AppArmor, so stock Chrome aborts at launch. Install the one-time
   AppArmor profile from Chromium's apparmor-userns-restrictions doc
   (root), or pass `run --no-sandbox` as an explicit, logged opt-out.
+- Sign-in compatibility: `run` overrides the User-Agent with the headful
+  string for the same Chrome build (derived from the binary, so it stays
+  correct across upgrades). Chrome's headless mode otherwise advertises
+  `HeadlessChrome/<v>`, which Google treats as a bot: measured 2026-08-28,
+  the stock UA gets Google's degraded sign-in flow and is refused at the
+  email step ("this browser or app may not be secure"), while the headful UA
+  gets the normal flow and is accepted. The refusal is a verdict on the
+  browser, not on the person typing, so a human driving it by hand is
+  refused identically. `--enable-automation` is never passed for the same
+  reason (it sets `navigator.webdriver`, an independent trigger). If Google
+  changes the rule server-side, `chrome_navigate` and the page reads surface
+  a "[Sign-in refused by Google]" note rather than letting it read as a bad
+  password.
 - Upgrading the extension: after re-staging a NEW build with `configure`,
   launch with `run --fresh-profile`. An existing profile can serve the OLD
   service-worker script from its cache even across a full browser restart,
@@ -188,6 +201,43 @@ Notes:
   `ExecStart=/path/nymeria-headless.sh run` and `Restart=on-failure`
   under a linger-enabled user is sufficient; the profile dir keeps
   identity across restarts.
+
+### Signing the server browser into websites
+
+The server browser has no screen, so somebody has to log it in once per site.
+Because the profile persists, once is enough: sessions survive restarts, and
+"remember this device" sticks (device-bound cookies, which would defeat
+copying a session in from your desktop, do not apply to a session created
+here, since a headless Linux host has no secure key storage and Chrome
+falls back to ordinary cookies).
+
+An in-app login view is planned. Until it lands, the interim path is Chrome's
+own remote inspector over an SSH tunnel, which `run` already permits
+(`--remote-allow-origins`):
+
+```bash
+ssh -L 9222:127.0.0.1:9222 <user>@<server>     # from your own machine
+```
+
+Then in your local Chrome, open `chrome://inspect`, click **Configure...**,
+add `localhost:9222`, and inspect the target you want; the tunnel is required
+because the debugger endpoint refuses any `Host` that is not `localhost` or an
+IP, so a hostname-based reverse proxy will not work. `http://localhost:9222/json`
+lists the live targets and their `devtoolsFrontendUrl` if you would rather open
+one directly. Log in there by hand, including 2FA on your phone.
+
+Caveats, in the spirit of not overselling an interim: the underlying
+mechanisms are measured working, but the exact click path through the
+DevTools UI was not verifiable from a server with no display, so treat it as
+approximate. It hands over the whole debugging surface rather than a scoped
+login window, which is why it is interim. Passkeys and USB security keys
+cannot work in the server browser at all (no platform authenticator), so an
+account that insists on one needs a fallback factor: an authenticator-app
+code, a backup code, or a phone prompt.
+
+Keep the debugger port loopback-bound, as `run` leaves it. It is
+unauthenticated total control of the browser, and anyone who reaches it can
+read every cookie in that profile.
 
 ## Verification checklist
 

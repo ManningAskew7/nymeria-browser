@@ -230,6 +230,24 @@ POSTs results. Consequences:
 
 ## Repos and deployment
 
+- Headless sign-in (browser-login Phase A, 2026-08-28): `run` overrides the
+  UA with the HEADFUL string derived from the CfT binary
+  (`headful_user_agent`, `Chrome/<major>.0.0.0`), because the
+  `HeadlessChrome` product token is a HARD Google sign-in block (measured
+  3/3: stock UA gets `flowName=WebLiteSignIn` then refusal at the identifier
+  step; overridden UA gets `GlifWebSignIn` and is accepted). Independent
+  second trigger, never pass `--enable-automation` (sets
+  `navigator.webdriver`). Everything else was measured NOT to matter:
+  datacenter IP, attached debugger, SwiftShader, `--no-sandbox`, 800x600.
+  CDP input is `isTrusted: true`, so the block is a verdict on the BROWSER,
+  not on scripted-vs-human typing: a human at a remote viewer is refused
+  identically. Client hints still lack the `Google Chrome` brand (a CfT
+  build fact, not fixable by the UA flag): the next lever if Google
+  tightens. Backend `_signin_rejected_sentence` surfaces the refusal on
+  navigate + reads. Login must happen INSIDE this browser: transplanting a
+  desktop Google session is dead on arrival (device-bound cookies + ~10min
+  rotating tokens). Derivation, measurements and sources:
+  `Nymeria/docs/private/browser-login-research.md`.
 - Extension: `/opt/Project-Nymeria/nymeria-browser/`. Its OWN git repo
   (`github.com/ManningAskew7/nymeria-browser`), gitignored inside the main
   tree, push separately. Beta distribution artifact:

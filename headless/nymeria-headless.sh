@@ -46,6 +46,33 @@ chrome_binary() {
   echo "$first"
 }
 
+# The User-Agent a HEADFUL Chrome of this exact binary would send.
+#
+# `--headless=new` puts the product token `HeadlessChrome/<v>` in the UA, and
+# that string alone is a hard sign-in block at Google: measured 2026-08-28 on
+# this binary, the stock headless UA gets the degraded `WebLiteSignIn` flow and
+# the identifier is REJECTED ("this browser or app may not be secure"), while
+# the same browser with the headful UA gets the normal `GlifWebSignIn` flow and
+# is accepted (3/3). Nothing else we run triggers it: not the datacenter IP,
+# the attached debugger, SwiftShader rendering, nor `--no-sandbox`.
+#
+# DERIVED from the binary, never hardcoded: a UA whose version drifts from the
+# browser's own is itself an anomaly signal, and this file outlives any given
+# Chrome for Testing release. Chrome's reduced-UA format zeroes everything
+# below the major, so `152.0.7977.64` presents as `Chrome/152.0.0.0`.
+#
+# NOT covered by this override: client hints (`sec-ch-ua`) still advertise
+# `Chromium` without the `Google Chrome` brand real Chrome carries, because
+# they come from the build, not the UA string. Measured not to matter to
+# Google's sign-in; it is the next lever if that ever changes.
+headful_user_agent() {
+  local chrome major
+  chrome=$(chrome_binary) || return 1
+  major=$("$chrome" --version 2>/dev/null | grep -oE '[0-9]+' | head -1)
+  [ -n "$major" ] || return 1
+  echo "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/${major}.0.0.0 Safari/537.36"
+}
+
 cmd_install() {
   mkdir -p "$CFT_DIR"
   echo "Resolving current stable Chrome for Testing..."
@@ -190,11 +217,26 @@ cmd_run() {
   if [ -n "$sandbox_flag" ]; then
     echo "WARNING: running with --no-sandbox (explicit opt-out; prefer the AppArmor profile, see header)."
   fi
+  local user_agent
+  user_agent=$(headful_user_agent) || die "could not read the Chrome version for the UA override"
   echo "Launching $($chrome --version) on debug port $port (profile: $profile)."
+  echo "UA: $user_agent"
   # Foreground on purpose: systemd (or the operator's supervisor) owns the
   # lifecycle. --remote-debugging-port stays loopback-bound by Chrome.
+  #
+  # --remote-allow-origins lets a BROWSER-based DevTools frontend attach over
+  # an SSH tunnel, which is the interim way a human signs this browser into a
+  # site before the in-app login viewer exists (README: "Signing the server
+  # browser into websites"). Chrome 111+ rejects any Origin not listed here,
+  # and a non-browser CDP client (ours) sends none and is unaffected. Safe
+  # because the port itself stays loopback-only: reaching it already requires
+  # SSH access to this host. NEVER pair this with
+  # --remote-debugging-address=0.0.0.0, which would publish unauthenticated
+  # total control of the browser.
   exec "$chrome" \
     --headless=new \
+    --user-agent="$user_agent" \
+    --remote-allow-origins=https://chrome-devtools-frontend.appspot.com,devtools://devtools \
     $sandbox_flag \
     --user-data-dir="$profile" \
     --disable-extensions-except="$EXT_DIR" \
