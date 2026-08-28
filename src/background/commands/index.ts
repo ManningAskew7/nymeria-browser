@@ -10,6 +10,7 @@ import { execDialog } from './dialog'
 import { execExtractText } from './extract_text'
 import { execHealth } from './health'
 import { execHistory } from './history'
+import { execLoginSessionStart, execLoginSessionStop } from './login_session'
 import { execNavigate } from './navigate'
 import { execNetwork } from './network'
 import { execReloadExtension } from './reload_extension'
@@ -91,6 +92,13 @@ const READS_THE_PAGE: Record<CommandType, boolean> = {
   // Talks only to chrome.runtime; a suspended renderer is irrelevant, and
   // reloading is exactly what a wedged extension needs.
   reload_extension: false,
+  // The login handoff's own control commands. They must answer on a page
+  // the agent cannot read (that is the point), and a pre-flight read here
+  // would be the one `chrome_*` touch on a tab reserved for a human. Stop
+  // in particular has to work on a wedged page: it is how the tab and the
+  // debugger hold are given back.
+  login_session_start: false,
+  login_session_stop: false,
 }
 
 async function runSingle(type: string, args: unknown, ctx?: ExecContext): Promise<CommandResult> {
@@ -157,6 +165,8 @@ export const EXECUTORS: Record<CommandType, Executor> = {
   health: execHealth,
   cdp: execCdp,
   reload_extension: execReloadExtension,
+  login_session_start: execLoginSessionStart,
+  login_session_stop: execLoginSessionStop,
 }
 
 function errorToString(e: unknown): string {

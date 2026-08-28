@@ -597,6 +597,26 @@ POSTs results. Consequences:
   stamp read is a probe-world evaluate whose expression also carries
   `innerWidth`, and its branch must come BEFORE the selector-objectId
   one.
+- Login handoff (v0.28.0, browser-login Phase B): `commands/login_session.ts`
+  screencasts one tab out to nymeria-desktop so a HUMAN can sign the browser
+  in, and replays their input back. Four things fail SILENTLY if changed:
+  the screencast must pass `format: 'jpeg'` (the PNG default measured ~67x
+  the bytes), EVERY frame must be acked or Chrome stops after three in
+  flight with no error, the frame POST's `session_active: false` is the ONLY
+  downward signal for an ending the extension never heard (Done, the time
+  limit, a thread abort), and `browser_login_input` must never be journalled
+  (`connection.ts` skips it explicitly: the journal is
+  `chrome.storage.local`, so journalling would persist the characters of the
+  user's password). The attach is a HELD `acquire`/`release`, not a
+  `withSession`, which is also why the turn-end `releaseAllHolds` cannot
+  detach it (it skips refCount > 0). Frame POSTs are adaptively batched with
+  no timer: one in flight at a time, whatever piled up goes next, oldest
+  dropped past `MAX_QUEUED_FRAMES`. Pointer coords arrive NORMALIZED 0..1
+  and are multiplied by the live `viewportReadExpression` read; an
+  unreadable viewport DROPS the event rather than guessing, because a
+  mis-aimed trusted click on a login page can submit. Backend half:
+  `core/browser_login_sessions.py` + `api/routers/browser_login.py`, which
+  also refuses every `chrome_*` aimed at a tab while a session holds it.
 - Wait miss report (v0.24.0, #196): a timed-out TEXT wait runs ONE extra
   probe-world evaluate (`waitMissReportExpression`) whose payload keys are
   `page_text_excerpt` (root document, whitespace-collapsed, 240 chars,

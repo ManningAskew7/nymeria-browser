@@ -88,4 +88,49 @@ export async function postCommandResult(commandId: string, result: CommandResult
   return { delivered: body.delivered !== false }
 }
 
+/**
+ * POST a batch of login screencast frames to the backend.
+ *
+ * Deliberately its own endpoint rather than a command result or an event:
+ * frames must not ride the command channel (they answer no command) and
+ * must not ride the event bus (which would fan a picture of the user's
+ * password out to every other subscriber). The backend buffers them for
+ * the desktop viewer alone.
+ *
+ * `sessionActive: false` means the session ended without this extension
+ * hearing about it (the operator clicked Done, the time limit passed, the
+ * thread was aborted). It is the ONLY downward signal for that, so callers
+ * must treat it as "stop capturing", not as a soft warning.
+ */
+export async function postLoginFrames(
+  sessionId: string,
+  frames: { data: string; metadata?: Record<string, unknown> }[],
+): Promise<{ accepted: number; sessionActive: boolean }> {
+  const { baseUrl, token, clientId } = await getConfig()
+  if (!baseUrl || !token) {
+    throw new Error('postLoginFrames called without configured baseUrl/token')
+  }
+  const resp = await nymFetch({
+    baseUrl,
+    token,
+    clientId,
+    path: `/browser-login/${encodeURIComponent(sessionId)}/frame`,
+    init: {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ frames }),
+    },
+  })
+  if (!resp.ok) {
+    // A 404 is the session being gone entirely, which is also "stop".
+    if (resp.status === 404) return { accepted: 0, sessionActive: false }
+    throw new HttpError(resp.status, await resp.text().catch(() => ''))
+  }
+  const body = (await resp.json().catch(() => ({}))) as {
+    accepted?: number
+    session_active?: boolean
+  }
+  return { accepted: body.accepted ?? 0, sessionActive: body.session_active !== false }
+}
+
 export { nymFetch }

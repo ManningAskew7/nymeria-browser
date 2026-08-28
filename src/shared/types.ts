@@ -28,6 +28,8 @@ export type CommandType =
   | 'health'
   | 'cdp'
   | 'reload_extension'
+  | 'login_session_start'
+  | 'login_session_stop'
 
 export interface BrowserCommandEvent extends AutonomousEvent {
   type: 'browser_command'

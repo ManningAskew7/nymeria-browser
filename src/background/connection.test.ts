@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import { describeConnectFailure, ensureConnected, startConnection, stopConnection } from './connection'
 import { HttpError, whoami } from './api'
 import { dispatchBrowserCommand } from './commands'
+import { handleLoginInput } from './commands/login_session'
 import { recordEvent } from './state'
 import { backgroundLogger } from '../utils/logger'
 import type { BrowserCommandEvent } from '../shared/types'
@@ -26,6 +27,7 @@ vi.mock('./state', () => ({
   recordEvent: vi.fn(async () => {}),
 }))
 vi.mock('./commands', () => ({ dispatchBrowserCommand: vi.fn(async () => {}) }))
+vi.mock('./commands/login_session', () => ({ handleLoginInput: vi.fn(async () => {}) }))
 
 /**
  * The string these produce is rendered verbatim in the popup's status card,
@@ -210,5 +212,65 @@ describe('heartbeat vs backoff', () => {
     await ensureConnected()
 
     expect(vi.mocked(whoami), 'the alarm must retry now, not defer to the backoff').toHaveBeenCalledTimes(2)
+  })
+})
+
+
+/**
+ * An operator's keystrokes reach the extension over this same stream while
+ * they sign the browser into a site. The journal writes to
+ * `chrome.storage.local`, which PERSISTS across restarts, so journalling
+ * this one event type would leave the characters of somebody's password
+ * sitting in extension storage: exactly what the login handoff exists to
+ * prevent, and invisible if it ever regressed.
+ */
+describe('login input is handled but never journalled', () => {
+  afterEach(async () => {
+    await stopConnection()
+    vi.mocked(whoami).mockReset()
+    vi.mocked(recordEvent).mockReset()
+    vi.mocked(handleLoginInput).mockReset()
+    vi.unstubAllGlobals()
+  })
+
+  async function deliver(...frames: string[]): Promise<void> {
+    vi.mocked(whoami).mockResolvedValue({ user_id: 'u1' } as never)
+    const encoder = new TextEncoder()
+    const body = new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const frame of frames) controller.enqueue(encoder.encode(frame))
+        controller.close()
+      },
+    })
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, body }) as unknown as Response))
+    await startConnection()
+  }
+
+  const loginInput = {
+    type: 'browser_login_input',
+    thread_id: 't1',
+    data: {
+      session_id: 'blogin_abc',
+      tab_id: 7,
+      events: [{ type: 'key', key: 'h' }],
+    },
+  }
+
+  it('replays the input and keeps it out of the journal', async () => {
+    await deliver(`data: ${JSON.stringify(loginInput)}\n\n`)
+
+    expect(vi.mocked(handleLoginInput)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(handleLoginInput).mock.calls[0]![0]).toMatchObject({
+      session_id: 'blogin_abc',
+      tab_id: 7,
+    })
+    expect(vi.mocked(recordEvent)).not.toHaveBeenCalled()
+  })
+
+  it('still journals ordinary events, so the skip is this type alone', async () => {
+    await deliver(`data: ${JSON.stringify({ type: 'todo_completed', thread_id: 't1' })}\n\n`)
+
+    expect(vi.mocked(recordEvent)).toHaveBeenCalledTimes(1)
+    expect(vi.mocked(handleLoginInput)).not.toHaveBeenCalled()
   })
 })

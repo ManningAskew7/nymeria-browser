@@ -2,6 +2,7 @@ import { backgroundLogger as logger } from '../utils/logger'
 import { getConfig } from '../utils/storage'
 import { HttpError, whoami } from './api'
 import { dispatchBrowserCommand } from './commands'
+import { handleLoginInput } from './commands/login_session'
 import { releaseAllHolds } from './debuggerSession'
 import { frameToData, parseSseFrames } from './sse'
 import { recordEvent, setStatus } from './state'
@@ -154,6 +155,16 @@ async function connectOnce(): Promise<void> {
         if (event.type === 'browser_command') {
           // Fire-and-forget; per-command try/catch is inside the dispatcher.
           void dispatchBrowserCommand(event as BrowserCommandEvent)
+        } else if (event.type === 'browser_login_input') {
+          // The operator is typing into a tab they are signing into. Replay
+          // is fire-and-forget by design: there is no result to POST, and a
+          // round trip per keystroke would put the typing latency on the
+          // wrong side of the network. What confirms the input landed is the
+          // next screencast frame, which the operator is already watching.
+          void handleLoginInput(
+            (event as { data?: Record<string, unknown> }).data ??
+              (event as unknown as Record<string, unknown>),
+          )
         } else if (event.type === 'browser_session_release') {
           // Turn-end signal (#191): the agent has answered, so idle debugger
           // holds end NOW and the banner drops, instead of riding out the
@@ -162,6 +173,13 @@ async function connectOnce(): Promise<void> {
           // fire-and-forget inside it), so no guard here.
           releaseAllHolds()
         }
+        // NEVER journal an operator's keystrokes. The journal writes to
+        // `chrome.storage.local`, which persists across restarts, so
+        // journalling this event type would leave the characters of
+        // somebody's password sitting in extension storage: the one thing
+        // the whole login handoff exists to prevent. The event is handled
+        // above and then deliberately forgotten.
+        if (event.type === 'browser_login_input') continue
         // Journal AFTER dispatch, and never on its critical path. The journal
         // writes to `chrome.storage.local`, whose 10MB quota REJECTS a large
         // upload envelope: with the write first and inside the same try, that
