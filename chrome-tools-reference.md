@@ -652,7 +652,14 @@ Do one thing to a Chrome page: click, type, choose, scroll, drag, wait.
         in a picture. A region capture is the exception: it publishes a
         "[Frame]" line, and that box is the conversion for that image, so
         use it instead of the two sizes. Whole numbers only, a fractional
-        pair is rejected.
+        pair is rejected. A pointer-verb coordinate (click, hover, drag) is
+        checked against the viewport the tab's LAST screenshot was taken
+        in: when the viewport has changed since (Chrome's own debugging
+        banner coming or going, zoom, a resize), the act refuses with
+        "viewport_changed" naming both sizes instead of clicking a point
+        that has moved. Take a fresh screenshot and re-aim; "@eN" and
+        "css=" targets re-resolve and never need this. A scroll coordinate
+        is exempt: its scroll_moved report verifies the effect instead.
     modifiers: any of ["Ctrl", "Shift", "Alt", "Meta"].
     direction / amount_px: for scroll (default down, 500px). action="scroll"
         with a ref wheels AT that element (at its visible point), which
