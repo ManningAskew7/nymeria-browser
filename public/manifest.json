@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Nymeria Browser",
-  "version": "0.25.0",
+  "version": "0.26.0",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAqXEIozPy94a5hPDtoencdvXidM7JlP7Y3VegfuVmEIfqlChOq/XAyOGm5YzLzAbeAvxopYBhvLVHAvlsYWM54K53cvVg2jEeNTj1o7tdtHiwrMlSXDAIr8mNFFNcNHQZpWjDdTGW/UPG3cOypaT+DizbgNxixB8cLjfblkG5zTbU2Q+fE+CD72HOxRjJCZBcUCtqFBFLGnD/l3Wp8akap1f9DCAZ/FwQk8lQmPjKB6Ibqux3TOKaH8xSG/tz3+MEfhDYjKopo7uDx1NiX4eOpVibaxmiX8f1CWyoOVTdjGClzW+VON8KqBLSYrSXUyRGig0KiXjer/icU+mgdP8h5QIDAQAB",
   "description": "Lets the Nymeria assistant read and act in your logged-in browser, while you watch.",
   "permissions": [

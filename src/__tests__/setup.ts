@@ -48,6 +48,7 @@ interface MockChrome {
     sendMessage: ReturnType<typeof vi.fn>
     reload: ReturnType<typeof vi.fn>
     getManifest: ReturnType<typeof vi.fn>
+    getURL: ReturnType<typeof vi.fn>
     onMessage: { addListener: ReturnType<typeof vi.fn>; removeListener: ReturnType<typeof vi.fn> }
     onInstalled: { addListener: ReturnType<typeof vi.fn> }
     onStartup: { addListener: ReturnType<typeof vi.fn> }
@@ -102,6 +103,7 @@ function makeMockChrome(): MockChrome {
       sendMessage: vi.fn().mockResolvedValue(undefined),
       reload: vi.fn(),
       getManifest: vi.fn(() => ({ version: '9.9.9' })),
+      getURL: vi.fn((path: string) => `chrome-extension://test-extension-id/${path}`),
       onMessage: { addListener: vi.fn(), removeListener: vi.fn() },
       onInstalled: { addListener: vi.fn() },
       onStartup: { addListener: vi.fn() },

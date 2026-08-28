@@ -1,6 +1,7 @@
 import { backgroundLogger as logger } from '../utils/logger'
 import { clearConfig, ensureClientId, getConfig, setConfig } from '../utils/storage'
 import { HttpError, ping, whoami } from './api'
+import { adoptBakedConfigIfUnconfigured } from './bakedConfig'
 import { setDispatchHooks } from './commands'
 import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs, forgetTab as forgetDebuggerTab } from './debuggerSession'
@@ -119,6 +120,9 @@ async function bootstrap(): Promise<void> {
   void refsReady()
   await loadFromStorage()
   await ensureClientId()
+  // Unattended installs (browser-beta stage 2): a packaged config.json
+  // configures the extension with no popup click; storage wins once set.
+  await adoptBakedConfigIfUnconfigured()
   // 1 minute is Chrome's floor for a packed extension; asking for less does
   // not go faster, it just makes the real interval a surprise.
   chrome.alarms.create(HEARTBEAT_NAME, { periodInMinutes: 1 })

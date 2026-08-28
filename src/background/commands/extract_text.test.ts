@@ -29,6 +29,8 @@ interface PageFixture {
   matched?: string | null
   /** How many elements the whole selector matched (#193). */
   matchCount?: number | null
+  /** The engine refused the selector string itself (SyntaxError). */
+  invalid?: boolean
 }
 
 function installCdpMock(page: PageFixture = {}) {
@@ -43,8 +45,9 @@ function installCdpMock(page: PageFixture = {}) {
       return {
         result: {
           value: {
-            found: !page.missing,
-            text: page.missing ? '' : (page.text ?? 'hello page'),
+            found: !page.missing && !page.invalid,
+            ...(page.invalid ? { invalid: true } : {}),
+            text: page.missing || page.invalid ? '' : (page.text ?? 'hello page'),
             url: page.url ?? 'https://example.com/',
             title: page.title ?? 'Example',
             // Defaults match a healthy ordinary page: a known-good status and
@@ -151,6 +154,48 @@ describe('execExtractText', () => {
     // The empty-page answer is untouched: this is about selectors only.
     const empty = await execExtractText({ tab_id: TAB })
     expect(empty.error).not.toMatch(/shadow root/i)
+  })
+
+  it('names a refused selector instead of blaming the page (2026-08-28 QA drive)', async () => {
+    // querySelector throwing SyntaxError used to escape into exceptionDetails
+    // and render as "read failed inside the page; retry", advice that can
+    // never help a selector the engine refuses. The refusal is its own
+    // answer, echoing the caller's exact spelling.
+    installCdpMock({ invalid: true })
+
+    const result = await execExtractText({ tab_id: TAB, selector: '@@nope' })
+
+    expect(result.ok).toBe(false)
+    expect(result.error).toContain('invalid selector: @@nope')
+    expect(result.error).toMatch(/retrying cannot help/)
+    expect(result.error).not.toMatch(/failed inside the page/)
+  })
+
+  it('accepts the act-target css= prefix, reading the same region as the bare selector', async () => {
+    // chrome_read_page takes css= for its region scope, so the kit teaches a
+    // prefix this reader used to refuse as an invalid selector.
+    const mock = installCdpMock({ text: 'scoped' })
+
+    const result = await execExtractText({ tab_id: TAB, selector: 'css=h1' })
+
+    expect(result.ok).toBe(true)
+    const expression = String((evaluates(mock)[0][2] as { expression: string }).expression)
+    expect(expression).toContain('const sel = "h1"')
+    expect(expression).not.toContain('css=h1')
+  })
+
+  it('classifies a refused selector IN the page expression (executed for real)', async () => {
+    // The classification lives in the in-page expression, so this runs it,
+    // not a mock of it: a selector the engine refuses must come back as the
+    // invalid marker, never as a thrown evaluation.
+    const mock = installCdpMock()
+    await execExtractText({ tab_id: TAB, selector: '@@nope' })
+    const expression = String((evaluates(mock)[0][2] as { expression: string }).expression)
+
+    const value = (new Function(`return (${expression})`) as () => { found: boolean; invalid?: boolean })()
+
+    expect(value.found).toBe(false)
+    expect(value.invalid).toBe(true)
   })
 
   it('carries the selector as a literal, so a quoted selector cannot break the read', async () => {

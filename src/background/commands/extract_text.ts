@@ -65,6 +65,8 @@ interface PageText {
   matched: string | null
   /** How many elements the whole selector matched; null for a whole-page read. */
   matchCount: number | null
+  /** The selector string itself was refused by the engine (SyntaxError). */
+  invalid?: boolean
 }
 
 /**
@@ -180,7 +182,16 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
   const a = args as ExtractTextArgs
   if (typeof a.tab_id !== 'number') return { ok: false, status: 'error', error: 'tab_id required' }
   const limit = typeof a.max_chars === 'number' && a.max_chars > 0 ? a.max_chars : 50_000
-  const selectorLiteral = a.selector ? JSON.stringify(a.selector) : 'null'
+  // Accept the act-target spelling: `css=h1` and `h1` scope the same read.
+  // chrome_read_page already takes css= for its region scope, so the kit
+  // taught a prefix this reader then refused; a QA drive fed it straight in
+  // (2026-08-28) and got the misleading in-page-failure error below. The
+  // bare prefix can never collide: `css=` is not valid CSS.
+  const selector =
+    typeof a.selector === 'string' && a.selector.startsWith('css=')
+      ? a.selector.slice(4)
+      : a.selector
+  const selectorLiteral = selector ? JSON.stringify(selector) : 'null'
 
   const resp = await withProbeWorld(a.tab_id, (contextId) =>
     sendCommand<{ result?: { value?: PageText }; exceptionDetails?: unknown }>(
@@ -200,13 +211,21 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
       const rawTitle = read(Document.prototype, 'title', document);
       const title = typeof rawTitle === 'string' ? rawTitle : '';
       const status = nymDocStatus();
-      const root = sel
-        ? Document.prototype.querySelector.call(document, sel)
-        : read(Document.prototype, 'body', document);
+      // An invalid selector is ANSWERED, not thrown: letting it escape into
+      // exceptionDetails conflated "you sent a malformed selector" with a
+      // genuine in-page failure, and the generic error's retry advice can
+      // never help a selector the engine refuses (measured 2026-08-28: a QA
+      // drive read that copy and re-tried a hopeless call).
+      var root = null;
+      var invalidSelector = false;
+      if (sel) {
+        try { root = Document.prototype.querySelector.call(document, sel); }
+        catch (e) { invalidSelector = true; }
+      } else {
+        root = read(Document.prototype, 'body', document);
+      }
+      if (invalidSelector) return { found: false, invalid: true, text: '', url: url, title: title, status: null, dropped: null, matched: null, matchCount: 0 };
       if (!root) return { found: false, text: '', url: url, title: title, status: null, dropped: null, matched: null, matchCount: 0 };
-      // No try needed: an invalid selector already threw at the querySelector
-      // above, taking the whole evaluation into exceptionDetails, so this can
-      // only run on a selector the engine accepted (review round).
       var matchCount = sel ? Document.prototype.querySelectorAll.call(document, sel).length : null;
       const raw =
         root instanceof HTMLElement
@@ -246,6 +265,18 @@ export async function execExtractText(args: unknown): Promise<CommandResult> {
       error:
         'the page text read failed inside the page; retry, and if it repeats ' +
         'use chrome_read_page instead',
+    }
+  }
+  if (!value.found && value.invalid) {
+    // The caller's spelling is echoed, not the stripped one: the fix for a
+    // refused selector is editing the string they actually sent.
+    return {
+      ok: false,
+      status: 'error',
+      error:
+        `invalid selector: ${a.selector} (the engine refused it, so retrying ` +
+        'cannot help; this argument takes a CSS selector like "h1" or ' +
+        '".price", with or without the css= prefix acts use)',
     }
   }
   if (!value.found) {
