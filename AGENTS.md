@@ -242,7 +242,16 @@ POSTs results. Consequences:
   `optional_host_permissions` are `https://*/*` + loopback, so Connect to
   `http://<ip>:8000` fails BEFORE reaching Nymeria. Deliberate (bearer
   token in a logged-in browser); remote setups use Tailscale/Cloudflare/
-  Caddy HTTPS.
+  Caddy HTTPS, or the SSH-tunnel + localhost fallback.
+- The extension ID is PINNED to `hfjpeeimhfbkpidpeabpdppddahckhgp` (manifest
+  `key`, since v0.25.0; private key host-local in
+  `~/nymeria-browser-keys/`, never in this repo). A pre-pin install is a
+  DIFFERENT extension to Chrome: remove + re-load unpacked once, then
+  re-Connect and re-grant page status. Backend CORS accepts any
+  well-formed extension origin by pattern since backend 2026-08-28
+  (measured: ungranted SW fetches follow ordinary CORS, granted ones
+  bypass it entirely; `Nymeria/tests/test_cors_extension_origin.py` pins
+  the server side).
 - Page-status reporting (#175) is OPT-IN: the `webRequest` host grant comes
   from a dedicated popup button ("Page status reporting" row, Enable), NOT
   from Connect (`permissions.request` needs a direct user click; Connect's

@@ -141,7 +141,16 @@ async function handleConnect(baseUrl: string, token: string): Promise<PopupRespo
   try {
     await ping(trimmedUrl)
   } catch (error) {
-    const msg = error instanceof HttpError ? `Health check failed (${error.status}).` : 'Cannot reach the Nymeria API.'
+    // Nothing has authenticated yet, so a network failure here means the
+    // request never completed at all: name the classes this collapses so
+    // the diagnosis starts on the right machine (backlog 12 entry 35: this
+    // copy once sent a client-side failure on a server-side goose chase).
+    const msg =
+      error instanceof HttpError
+        ? `Health check failed (${error.status}).`
+        : 'Cannot reach the Nymeria API: the health check never completed ' +
+          '(DNS, TLS, offline, or the host permission was not granted). ' +
+          'Nothing reached the server.'
     return { ok: false, error: msg }
   }
   const { clientId } = await ensureClientId()
@@ -149,12 +158,19 @@ async function handleConnect(baseUrl: string, token: string): Promise<PopupRespo
   try {
     identity = await whoami({ baseUrl: trimmedUrl, token: trimmedToken, clientId })
   } catch (error) {
+    // The health check just SUCCEEDED on this same URL, so a network-level
+    // failure on the authenticated call is client-side by construction:
+    // the extra Authorization header is what makes this request different
+    // (CORS preflight on an older backend, or a host-permission gap).
     const msg =
       error instanceof HttpError
         ? error.status === 401 || error.status === 403
           ? 'Token rejected. Mint a new one via POST /me/tokens.'
           : `whoami failed (${error.status}).`
-        : 'whoami failed (network).'
+        : 'Reached the server, but the authenticated call was blocked ' +
+          'inside this browser (health passed, so the server is fine: ' +
+          'usually the host-permission grant, or a pre-2026-08 backend ' +
+          'refusing extension CORS). Debug this machine, not the server.'
     return { ok: false, error: msg }
   }
   await setConfig({ baseUrl: trimmedUrl, token: trimmedToken })

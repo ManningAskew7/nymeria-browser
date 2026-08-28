@@ -73,7 +73,12 @@ Load the unpacked extension from `dist/`:
 
 1. Open `chrome://extensions`, enable Developer Mode.
 2. Click **Load unpacked** and pick the `dist/` directory.
-3. Note the extension ID Chrome assigns. You'll need it for the backend CORS allowlist.
+3. The extension ID is `hfjpeeimhfbkpidpeabpdppddahckhgp` on every install:
+   the manifest pins a public key (since v0.25.0), so the ID no longer
+   depends on the install path. If you installed a pre-v0.25.0 build,
+   Chrome treats the pinned build as a NEW extension: remove the old
+   entry, load unpacked again, then reconnect and re-enable page status
+   (one-time migration).
 
 ## Connecting to a Nymeria backend
 
@@ -84,14 +89,23 @@ matches neither, so Connect fails before it reaches Nymeria. That is
 intentional: the extension holds an account token AND acts in your logged-in
 browser, so it is not a place to accept a clear-text bearer token. Tailscale
 MagicDNS, a Cloudflare Tunnel, and any domain behind the stack's Caddy all
-give you HTTPS for free; see the backend's remote-access guide.
+give you HTTPS for free; see the backend's remote-access guide. The always
+works fallback for a remote backend is an SSH tunnel
+(`ssh -L 8000:127.0.0.1:8000 user@host`) plus `http://localhost:8000` in
+the popup, which rides the extension's loopback permission.
 
 1. Make sure your Nymeria API is reachable (default `http://localhost:8000`).
-2. Add the extension's origin to `CORS_ORIGINS` in `Nymeria/.env.docker`:
+2. CORS is zero-config on backends from 2026-08-28 on: the API accepts any
+   well-formed `chrome-extension://` origin by pattern, so there is nothing
+   to allowlist and no restart. On an OLDER backend, add the extension's
+   origin to `CORS_ORIGINS` in `Nymeria/.env.docker`:
    ```
-   CORS_ORIGINS=...,chrome-extension://<the-extension-id-from-step-3-above>
+   CORS_ORIGINS=...,chrome-extension://hfjpeeimhfbkpidpeabpdppddahckhgp
    ```
-   Then `docker compose --env-file .env.docker restart api`.
+   Then `docker compose --env-file .env.docker restart api`. The popup's
+   connect errors say which side failed: "health passed but the
+   authenticated call was blocked inside this browser" is the old-backend
+   CORS shape (or a missing host-permission grant), never a server fault.
 3. Mint a token (one-time):
    ```bash
    curl -X POST http://localhost:8000/me/tokens \
