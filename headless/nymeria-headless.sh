@@ -129,15 +129,21 @@ EOF
   echo "Staged extension at $EXT_DIR (config.json baked, mode 600)."
   echo "NOTE: a fresh profile adopts the bake on first run; to apply a"
   echo "CHANGED config to an existing profile, remove the profile dir."
+  echo "WARNING: an existing profile can serve the OLD service-worker script"
+  echo "from its cache even across a full browser restart, while announcing"
+  echo "the NEW manifest version (measured 2026-08-28: a whole QA round ran"
+  echo "on stale code that reported the new build). After staging a NEW"
+  echo "build, launch with: run --fresh-profile (costs site logins/cookies)."
 }
 
 cmd_run() {
-  local profile="$PROFILE_DIR_DEFAULT" port=9222 sandbox_flag=""
+  local profile="$PROFILE_DIR_DEFAULT" port=9222 sandbox_flag="" fresh_profile=""
   while [ $# -gt 0 ]; do
     case "$1" in
       --profile) profile="$2"; shift 2 ;;
       --debug-port) port="$2"; shift 2 ;;
       --no-sandbox) sandbox_flag="--no-sandbox"; shift ;;
+      --fresh-profile) fresh_profile=1; shift ;;
       *) die "unknown run option: $1" ;;
     esac
   done
@@ -150,6 +156,15 @@ cmd_run() {
   # 2026-08-28: non-deterministic tab routing, probe showing only one).
   if pgrep -f "$HOME_DIR/cft/.*chrome-linux64/chrome" >/dev/null; then
     die "an instance from $HOME_DIR is already running; use: $0 stop"
+  fi
+  # A pre-existing profile can hand Chrome the OLD service-worker script from
+  # its cache even across a full restart, while the manifest (read fresh)
+  # announces the NEW version: the deploy looks landed and the code is stale.
+  # Measured 2026-08-28; the wipe is the reliable invalidation. Opt-in
+  # because a profile also carries the agent's site logins.
+  if [ -n "$fresh_profile" ]; then
+    echo "Removing profile dir ($profile): stale-SW-cache guard; the baked config re-adopts on first run."
+    rm -rf "$profile"
   fi
   mkdir -p "$profile"
   if [ -n "$sandbox_flag" ]; then

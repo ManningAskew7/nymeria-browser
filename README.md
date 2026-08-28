@@ -152,6 +152,12 @@ Notes:
   AppArmor, so stock Chrome aborts at launch. Install the one-time
   AppArmor profile from Chromium's apparmor-userns-restrictions doc
   (root), or pass `run --no-sandbox` as an explicit, logged opt-out.
+- Upgrading the extension: after re-staging a NEW build with `configure`,
+  launch with `run --fresh-profile`. An existing profile can serve the OLD
+  service-worker script from its cache even across a full browser restart,
+  while announcing the NEW manifest version (measured 2026-08-28: a QA
+  round ran entirely on stale code that reported the new build). The wipe
+  costs site logins/cookies; the baked config re-adopts automatically.
 - One browser per account: browser commands are broadcast to every
   extension connected on the account, so two connected browsers would BOTH
   execute every command. Give a headless server its own Nymeria account.

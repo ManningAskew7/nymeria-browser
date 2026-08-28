@@ -40,7 +40,17 @@ POSTs results. Consequences:
   tab-free `chrome_health` reports the ANNOUNCED build and its age with
   NO dispatch, so the driver can poll for the rebuild's announce cheaply
   before firing the reload; it proves subscription, not execution, so
-  `version_after` stays the execution-grade confirmation. Bump the
+  `version_after` stays the execution-grade confirmation. CAVEAT, measured
+  2026-08-28 on the headless rig: BOTH numbers are MANIFEST truth, not
+  script truth. Chrome can pair a freshly-read manifest with a STALE
+  cached service-worker script (a whole QA round announced 0.27.0 while
+  running 0.26.0 code; every new-feature leg silently tested nothing),
+  so when a "shipped" behavior is absent live, suspect the script cache
+  before the code, and verify with behavior, not the version fields.
+  Script-truth build stamping is filed as #285. On the RIG the reliable
+  invalidation is `nymeria-headless.sh run --fresh-profile` after any
+  configure that staged a new build (chrome_reload_extension stranded the
+  headless extension outright when tried, same session). Bump the
   manifest version each shipped
   pass: `version_after` in the reload result is the build confirmation,
   and a stale value means the rebuild has not landed yet (measured
