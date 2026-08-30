@@ -1400,7 +1400,10 @@ One read that says whether a Chrome tab is healthy and what state it is in.
     entirely from the backend's own records, nothing is sent to the extension,
     so it works before any tab exists and cannot disturb driving state. It
     reports whether an extension event stream is subscribed, the build it
-    announced, and how long ago; that proves subscription, NOT execution (the
+    announced, and how long ago, plus a ``browsers`` roster listing EVERY
+    known browser on the account (label, id, connected state, version) when
+    more than one Chrome runs the extension; which one commands drive is
+    chrome_target's job. The probe proves subscription, NOT execution (the
     result says so), so use it to poll for a connection or a new build after a
     deploy without paying a reload, and pass a tab_id when you need proof that
     commands execute.
@@ -1670,4 +1673,55 @@ End a live login handoff early, before the user finishes.
 
     session_id: which session to end. Omit it to end the user's one active
         session (only one can be open at a time).
+````
+
+---
+
+## chrome_target
+
+Args schema:
+
+```json
+{
+  "browser": {
+    "anyOf": [
+      {
+        "type": "string"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Browser"
+  }
+}
+```
+
+Description (verbatim docstring):
+
+````
+Which browser this thread's chrome_* commands drive; switch it here.
+
+    More than one Nymeria browser extension can be connected on one account
+    (personal desktop Chrome, a headless rig, another machine). Every
+    command routes to exactly ONE: this thread's target if set, else the
+    account default, else automatically when exactly one is connected.
+
+    Call with no arguments to see the current resolution and every known
+    browser (label, id, connected state, version). Pass ``browser`` (a
+    label, an id, or a unique fragment of either) to set THIS THREAD's
+    target, or "clear" to remove the override and fall back to the account
+    default. Only the user can change the account default (/browser
+    default), so never present a thread switch as account-wide.
+
+    Switching is consequential: ALWAYS tell the user which browser you
+    switched to and why, in the same reply. Tab ids do not survive a
+    switch (they belong to the browser that minted them), so list tabs
+    after switching; the first tab-addressed call after a switch is
+    refused once as a guard. A switch is refused while a human login
+    handoff is live on this thread: finish or cancel it first.
+
+    Fails with the roster when the named browser matches nothing or
+    several browsers; nothing changes on a failed call.
 ````

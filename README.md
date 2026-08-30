@@ -192,9 +192,15 @@ Notes:
   while announcing the NEW manifest version (measured 2026-08-28: a QA
   round ran entirely on stale code that reported the new build). The wipe
   costs site logins/cookies; the baked config re-adopts automatically.
-- One browser per account: browser commands are broadcast to every
-  extension connected on the account, so two connected browsers would BOTH
-  execute every command. Give a headless server its own Nymeria account.
+- Several browsers per account are SUPPORTED since backend 2026-08-30
+  (single-browser routing, backlog #282): commands route to exactly one
+  selected browser (thread target > account default > auto when one is
+  connected; `/browser list|switch|default|rename`, agent-side
+  `chrome_target`), so a headless rig can share the account with a desktop
+  Chrome. The launcher's single-instance guard still matters: a stale twin
+  of the SAME staged profile shares its client_id, which routing cannot
+  tell apart (the backend's result-side client check makes it mostly
+  harmless, but kill the old instance properly with `stop`).
 - The baked token is a full account token sitting on the server (0600).
   Use a dedicated account and rotate like any credential.
 - Systemd shape: a simple service with
