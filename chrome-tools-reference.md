@@ -1725,3 +1725,68 @@ Which browser this thread's chrome_* commands drive; switch it here.
     Fails with the roster when the named browser matches nothing or
     several browsers; nothing changes on a failed call.
 ````
+
+---
+
+## chrome_browsers
+
+Args schema:
+
+```json
+{
+  "action": {
+    "default": "list",
+    "title": "Action",
+    "type": "string"
+  },
+  "browser": {
+    "anyOf": [
+      {
+        "type": "string"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Browser"
+  },
+  "label": {
+    "anyOf": [
+      {
+        "type": "string"
+      },
+      {
+        "type": "null"
+      }
+    ],
+    "default": null,
+    "title": "Label"
+  }
+}
+```
+
+Description (verbatim docstring):
+
+````
+Manage the account's browser fleet: list every known browser, name one.
+
+    An account can have several Nymeria browser extensions connected (a
+    desktop Chrome, a headless rig, another machine), each with a
+    persistent id. This tool manages that FLEET; which browser THIS
+    THREAD's commands drive is chrome_target's job, not this one's.
+
+    action="list" (default): one row per browser known this process (id,
+        label, connected state, streams, version, connect/disconnect
+        ages), plus the account default, so the ownership picture is
+        complete. Disconnected browsers stay listed with their age.
+    action="rename": name (or unname) one browser so it is easy to pick
+        in chrome_target and /browser commands. browser: which one, by
+        label, id, or unique fragment. label: the new name (plain text,
+        one line, up to 60 characters); OMIT it to remove the current
+        name. Renaming never moves any thread's target: targets store the
+        id, labels are display names on top.
+
+    Fails with the roster when `browser` matches nothing or several
+    browsers; nothing changes on a failed call.
+````
