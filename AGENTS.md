@@ -264,7 +264,16 @@ rosters and refusals can tell the two kinds apart. Consequences:
   Locally, `scripts/package.sh` (optionally `--build`) zips dist into the
   gitignored `release/nymeria-browser-v<version>.zip` (one top-level
   folder inside, sha256 printed); `nymeria browser configure --source`
-  accepts that zip directly. Web Store lodgement is backlog #283. Module invariants live in module docstrings: read
+  accepts that zip directly. The zip is written by `scripts/make_zip.py`,
+  which the backend's pinned sha256 leans on twice: members carry CONSTANT
+  timestamps and modes, so the same `dist/` always digests the same (plain
+  `ZipFile.write` stores mtimes, so a re-run release breaks configure on
+  every host that has not cached the old zip), and a credential-shaped file
+  in the tree (`config.json` above all: a baked one carries a full account
+  token, and these zips go to a PUBLIC Release) FAILS the build loudly
+  rather than being quietly excluded. Both pinned by
+  `scripts/makeZip.test.ts`, the one test outside `src/`.
+  Web Store lodgement is backlog #283. Module invariants live in module docstrings: read
   them before editing; this file is the standing map, not their
   replacement. Commits need a `Co-Authored-By:` trailer naming the model that
   actually did the work (`<noreply@anthropic.com>`). This line used to pin
@@ -295,20 +304,36 @@ rosters and refusals can tell the two kinds apart. Consequences:
   bypass it entirely; `Nymeria/tests/test_cors_extension_origin.py` pins
   the server side).
 - Baked config (v0.29.0, the server browser; `bakedConfig.ts`): a
-  `config.json` beside the manifest carries `baseUrl`, `token`, and
-  optionally `clientId` (must start with `nymeria-browser-`, non-empty
-  after it), `kind` (`server` | `desktop`) and `label` (one printable
-  line, trimmed, max 60 chars). Each optional field degrades FIELD-WISE:
-  invalid = ignored with one warn line, the rest of the bake applies.
+  `config.json` beside the manifest carries `baseUrl` (REQUIRED to be an
+  absolute http(s) URL, or the whole file is refused: the bake path pings
+  nothing, and a schemeless one resolves against the extension origin and
+  retries forever as "cannot reach the backend"), `token`, and
+  optionally `clientId` (`nymeria-browser-` + `[A-Za-z0-9._-]`, max 128;
+  it is an HTTP HEADER value, so a CR/LF would make `fetch` itself reject
+  every request), `kind` (`server` | `desktop`) and `label` (one printable
+  line: no Cc, no Cf, no U+2028/2029, trimmed, max 60 chars). Each optional
+  field degrades FIELD-WISE: invalid = ignored with one warn line, the rest
+  of the bake applies.
   Adoption rule: adopt when storage is unconfigured OR when the file's
   SHA-256 (raw text, `crypto.subtle`) differs from the stored `bakedHash`.
   A re-adoption overwrites baseUrl/token/kind/label, takes the baked
   clientId when present and otherwise KEEPS the stored one (a re-bake
   without an id must not re-identify the browser to the roster). Forget
   clears `bakedHash` with the config, so the next worker start re-adopts:
-  that is the "apply a changed config" path. Desktop builds ship no
+  that is the "apply a changed config" path. A config TYPED into the popup
+  claims the bake instead (`recordBakeOverride`, called from handleConnect
+  after setConfig): it stores the current file's hash, so the override
+  survives the next worker start and only a genuinely NEW bake wins. That
+  is the Forget-then-Connect rescue for a revoked baked token; without it
+  the next restart restored the dead token. Adoption runs ONLY in
+  `bootstrap()`, before the first connect (so nothing stops a live
+  connection, and the heartbeat alarm never re-reads the package); making
+  a re-bake land on a RUNNING rig is the backend's job, `nymeria browser
+  configure` restarts it. Desktop builds ship no
   config.json and are untouched (pinned by test); a v0.28.0 rig upgrading
-  re-adopts once (no stored hash) and keeps its clientId. Wire:
+  re-adopts once (no stored hash) and keeps its clientId, and so does a rig
+  whose stored token stopped decrypting (that is what the `configured`
+  conjunct is for). Wire:
   `client_kind` is on every subscribe (`desktop` by default),
   `client_label` only when a label is stored; kind is information for
   rosters and refusals, never a routing rule.
@@ -877,9 +902,13 @@ rosters and refusals can tell the two kinds apart. Consequences:
 
 ## Check commands
 
-Extension (from this repo root):
-`npx vitest run`; `npx tsc --noEmit -p tsconfig.app.json`;
-`npx eslint src --max-warnings 0`; `npm run build`.
+Extension (from this repo root): `npm run check` is all three
+(`vitest run && tsc -b && eslint . --max-warnings 0`, the same command CI
+runs), then `npm run build`. Individually: `npx vitest run`;
+`npx tsc --noEmit -p tsconfig.app.json`; `npx eslint . --max-warnings 0`.
+Note `tsc -b` covers TWO projects: `tsconfig.app.json` (src, chrome types
+only) and `tsconfig.node.json` (vite.config.ts plus `scripts/**/*.test.ts`,
+where the node-API tests live).
 
 Backend (from `Nymeria/`):
 `env -u NYMERIA_PROJECT_ROOT python3 -m pytest tests/test_chrome_browser_tools.py -q`;

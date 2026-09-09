@@ -34,7 +34,9 @@ const KEYS: Array<keyof StoredShape> = ['baseUrl', 'clientId', 'encryptedToken',
  * SHA-256 of the packaged `config.json` last adopted (`bakedConfig.ts`).
  * Owned here because Forget must clear it with the config: a headless
  * install that forgets its token re-adopts the bake on the next worker
- * start, which is the documented way to apply a changed config.
+ * start, which is the documented way to apply a changed config. The popup's
+ * Connect writes it back (`recordBakeOverride`), so a config a person typed
+ * after that Forget is not undone by the file they were working around.
  */
 export const BAKED_HASH_KEY = 'bakedHash'
 

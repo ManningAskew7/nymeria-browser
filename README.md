@@ -175,8 +175,12 @@ the next worker start whenever it has CHANGED (it keeps the SHA-256 of the
 file it adopted), so a re-bake with a new port or a rotated token takes
 effect without wiping the profile. An invalid optional field is ignored
 with one log line and the rest of the bake still applies; **Forget** clears
-the stored hash, so it too re-adopts on the next start. The bake announces
-itself on the stream as `client_kind=server` plus its `client_label`.
+the stored hash, so it too re-adopts on the next start. A URL and token you
+type into the popup on such a rig WIN, though: the extension records which
+bake they overrode, so the next worker start leaves them alone and only a
+genuinely new bake takes over. That is what makes the popup a usable rescue
+when a baked token is revoked. The bake announces itself on the stream as
+`client_kind=server` plus its `client_label`.
 
 Several browsers can share one account (the server browser plus your own
 Chrome): the backend routes each command to exactly one selected browser

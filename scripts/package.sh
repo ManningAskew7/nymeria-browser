@@ -7,10 +7,17 @@
 # to "Load unpacked". The same artifact feeds the headless launcher:
 # `nymeria-headless.sh configure --source <the zip>` accepts it directly.
 #
-# The zip is built with python3's zipfile (no zip binary assumed, matching
-# the launcher's bash+python3 rule) and the sha256 is printed so a release
-# note can pin it. Zips are NOT committed: release/ is gitignored, the
-# build is reproducible from the tag.
+# The zip is built by scripts/make_zip.py (python3, no zip binary assumed,
+# matching the launcher's bash+python3 rule) and the sha256 is printed so a
+# release note can pin it. Zips are NOT committed: release/ is gitignored.
+# What make_zip.py guarantees, and this script therefore inherits: the same
+# dist/ always produces the same bytes (constant member timestamps and
+# permissions, so a re-run or a fresh checkout reproduces the digest the
+# backend pins), and a dist/ holding a credential-shaped file (a baked
+# config.json carries a full account token) fails the build instead of
+# publishing it. Reproducing a digest from a TAG additionally needs the
+# build itself to be reproducible, which is vite's business, not this
+# script's.
 #
 # Usage: scripts/package.sh          # requires an existing dist/ build
 #        scripts/package.sh --build  # runs npm run build first
@@ -31,20 +38,7 @@ version=$(python3 -c "import json; print(json.load(open('dist/manifest.json'))['
 mkdir -p release
 out="release/nymeria-browser-v${version}.zip"
 
-python3 - "$out" "$version" <<'EOF'
-import json, os, sys, zipfile
-
-out, version = sys.argv[1], sys.argv[2]
-top = f"nymeria-browser-v{version}"
-with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
-    for root, dirs, files in os.walk("dist"):
-        dirs.sort()
-        for name in sorted(files):
-            path = os.path.join(root, name)
-            rel = os.path.relpath(path, "dist")
-            z.write(path, f"{top}/{rel}")
-print(out)
-EOF
+python3 scripts/make_zip.py dist "$out" "nymeria-browser-v${version}"
 
 echo "sha256: $(sha256sum "$out" | cut -d' ' -f1)"
 echo "version: ${version}"

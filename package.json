@@ -7,10 +7,10 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
-    "lint": "eslint .",
+    "lint": "eslint . --max-warnings 0",
     "preview": "vite preview",
     "test": "vitest run",
-    "check": "vitest run && tsc -b && eslint .",
+    "check": "vitest run && tsc -b && eslint . --max-warnings 0",
     "test:watch": "vitest"
   },
   "dependencies": {

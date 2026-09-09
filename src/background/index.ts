@@ -1,9 +1,9 @@
 import { backgroundLogger as logger } from '../utils/logger'
 import { clearConfig, ensureClientId, getConfig, setConfig } from '../utils/storage'
 import { HttpError, ping, whoami } from './api'
-import { adoptBakedConfig } from './bakedConfig'
+import { adoptBakedConfig, recordBakeOverride } from './bakedConfig'
 import { setDispatchHooks } from './commands'
-import { ensureConnected, isRunning, startConnection, stopConnection } from './connection'
+import { ensureConnected, startConnection, stopConnection } from './connection'
 import { activeTabs as activeDebuggerTabs, forgetTab as forgetDebuggerTab } from './debuggerSession'
 import { clearProvenDelivery, clearSwallowedInput } from './delivery'
 import { clearTabDialogState, installDialogOwnership } from './dialogs'
@@ -125,11 +125,22 @@ async function bootstrap(): Promise<void> {
   await ensureClientId()
   // Unattended installs (the server browser): a packaged config.json
   // configures the extension with no popup click, and a CHANGED file
-  // re-adopts on the next worker start (bakedConfig.ts), so a re-bake with
-  // a new port or token takes effect without wiping the profile. A live
-  // connection is stopped first so ensureConnected below opens a fresh one
-  // on the new URL and token.
-  if ((await adoptBakedConfig()) && isRunning()) await stopConnection()
+  // re-adopts here (bakedConfig.ts), so a re-bake with a new port or token
+  // takes effect without wiping the profile. This runs ONLY at worker
+  // start, before ensureConnected below opens the first stream, so there is
+  // never a live connection to stop: what makes a re-bake land on a RUNNING
+  // rig is `nymeria browser configure` restarting it, not anything here (an
+  // SSE-connected MV3 worker does not recycle on its own).
+  //
+  // Wrapped because everything after it is the worker's whole job: a
+  // chrome.storage rejection here must not cost the heartbeat alarm and the
+  // connect, which would leave the rig silently dead rather than running on
+  // the previous config.
+  try {
+    await adoptBakedConfig()
+  } catch (error) {
+    logger.error('baked config adoption failed:', error)
+  }
   // 1 minute is Chrome's floor for a packed extension; asking for less does
   // not go faster, it just makes the real interval a surprise.
   chrome.alarms.create(HEARTBEAT_NAME, { periodInMinutes: 1 })
@@ -185,6 +196,11 @@ async function handleConnect(baseUrl: string, token: string): Promise<PopupRespo
     return { ok: false, error: msg }
   }
   await setConfig({ baseUrl: trimmedUrl, token: trimmedToken })
+  // A person typing into the popup on a baked rig is overriding the bake
+  // (a revoked token, a moved backend). Record which bake they overrode, or
+  // the next worker start re-adopts the file they were fixing around and
+  // the manual fix un-does itself (bakedConfig.ts).
+  await recordBakeOverride()
   await stopConnection()
   void startConnection()
   return { ok: true, identity }

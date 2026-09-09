@@ -39,7 +39,10 @@ jobs:
           zip="nymeria-browser-v${GITHUB_REF_NAME#v}.zip"
           sha256sum "$zip" > "$zip.sha256"
           cat "$zip.sha256"
-      - uses: softprops/action-gh-release@v2
+      # Pinned to the commit v2 pointed at (v2.6.2): this workflow holds
+      # `contents: write` and publishes the artifact the backend pins by
+      # digest, so a mutable tag would let the action change under it.
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: |
             release/nymeria-browser-v*.zip
