@@ -1,0 +1,46 @@
+# Tag-driven release: push `v<version>` (matching public/manifest.json) and
+# this checks, builds, packages, and attaches the zip plus its sha256 to a
+# GitHub Release for the tag. The backend pins one release by version and
+# sha256 for `nymeria browser configure`; a manual `gh release create` with
+# the same two files remains valid.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run check
+      - run: npm run build
+      - name: Verify the built manifest version matches the tag
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          built="$(python3 -c "import json; print(json.load(open('dist/manifest.json'))['version'])")"
+          if [ "$built" != "$tag" ]; then
+            echo "dist/manifest.json is version $built but the tag is v$tag" >&2
+            exit 1
+          fi
+      - run: scripts/package.sh
+      - name: Write the sha256 sidecar
+        run: |
+          cd release
+          zip="nymeria-browser-v${GITHUB_REF_NAME#v}.zip"
+          sha256sum "$zip" > "$zip.sha256"
+          cat "$zip.sha256"
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            release/nymeria-browser-v*.zip
+            release/nymeria-browser-v*.zip.sha256
