@@ -261,6 +261,10 @@ rosters and refusals can tell the two kinds apart. Consequences:
   `npm run build`, verifies `dist/manifest.json` equals the tag, runs
   `scripts/package.sh`, and attaches the zip plus its `.zip.sha256` to a
   GitHub Release (the backend pins one release by version and sha256).
+  Trap (v0.29.0): a tag pushed in the SAME `git push` as the commit that
+  first put the workflow on main fired no run at all; `git push --delete
+  origin <tag>` then re-push the tag, and it runs. Verify with `gh run list`
+  within a minute of tagging rather than assuming.
   Locally, `scripts/package.sh` (optionally `--build`) zips dist into the
   gitignored `release/nymeria-browser-v<version>.zip` (one top-level
   folder inside, sha256 printed); `nymeria browser configure --source`
