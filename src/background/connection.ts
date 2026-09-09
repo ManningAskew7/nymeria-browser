@@ -72,7 +72,7 @@ function scheduleRetry(reason: string): void {
 
 async function connectOnce(): Promise<void> {
   if (!running) return
-  const { baseUrl, token, clientId } = await getConfig()
+  const { baseUrl, token, clientId, kind, label } = await getConfig()
   if (!baseUrl || !token) {
     logger.log('No config; staying unconfigured')
     await setStatus({ kind: 'unconfigured' })
@@ -97,6 +97,12 @@ async function connectOnce(): Promise<void> {
   // live" (#176 rider: chrome_reload_extension reports version_after from
   // the post-reload resubscribe instead of leaving the deploy unverified).
   url.searchParams.set('client_version', chrome.runtime.getManifest().version)
+  // Which kind of browser this is (the server browser beside the backend,
+  // or the user's own Chrome) and, only when one is stored, the roster
+  // label hint. Kind is information for rosters and refusals, never a
+  // routing rule; the backend's ladder is unchanged by it.
+  url.searchParams.set('client_kind', kind)
+  if (label) url.searchParams.set('client_label', label)
 
   activeController = new AbortController()
   let resp: Response

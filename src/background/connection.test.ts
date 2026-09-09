@@ -5,7 +5,18 @@ import { dispatchBrowserCommand } from './commands'
 import { handleLoginInput } from './commands/login_session'
 import { recordEvent } from './state'
 import { backgroundLogger } from '../utils/logger'
+import { getConfig } from '../utils/storage'
 import type { BrowserCommandEvent } from '../shared/types'
+
+/** What getConfig answers for an ordinary popup-configured install. */
+const DESKTOP_CONFIG = {
+  baseUrl: 'http://localhost:1',
+  token: 'tok',
+  clientId: 'nymeria-browser-test',
+  hasToken: true,
+  kind: 'desktop' as const,
+  label: '',
+}
 
 vi.mock('./api', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./api')>()
@@ -15,11 +26,7 @@ vi.mock('../utils/storage', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../utils/storage')>()
   return {
     ...actual,
-    getConfig: vi.fn(async () => ({
-      baseUrl: 'http://localhost:1',
-      token: 'tok',
-      clientId: 'nymeria-browser-test',
-    })),
+    getConfig: vi.fn(async () => DESKTOP_CONFIG),
   }
 })
 vi.mock('./state', () => ({
@@ -58,13 +65,12 @@ describe('subscribe URL', () => {
   afterEach(async () => {
     await stopConnection()
     vi.mocked(whoami).mockReset()
+    vi.mocked(getConfig).mockClear()
     vi.unstubAllGlobals()
   })
 
-  it('announces the running build version on the subscribe (#176 rider)', async () => {
-    // The backend records this per subscriber so chrome_reload_extension can
-    // report which build reconnected after a reload; without the param the
-    // deploy-verification loop stays open.
+  /** Run one connect attempt and return the stream URL it opened. */
+  async function subscribeUrl(): Promise<URL> {
     vi.mocked(whoami).mockResolvedValue({ user_id: 'u1' } as never)
     const fetchSpy = vi.fn<(input: RequestInfo | URL, init?: RequestInit) => Promise<Response>>(
       async () => new Response(null, { status: 500 }),
@@ -74,10 +80,34 @@ describe('subscribe URL', () => {
     await startConnection()
 
     expect(fetchSpy).toHaveBeenCalledTimes(1)
-    const url = new URL(String(fetchSpy.mock.calls[0]![0]))
+    return new URL(String(fetchSpy.mock.calls[0]![0]))
+  }
+
+  it('announces the running build version on the subscribe (#176 rider)', async () => {
+    // The backend records this per subscriber so chrome_reload_extension can
+    // report which build reconnected after a reload; without the param the
+    // deploy-verification loop stays open.
+    const url = await subscribeUrl()
     expect(url.pathname).toBe('/autonomous/stream')
     expect(url.searchParams.get('client_id')).toBe('nymeria-browser-test')
     expect(url.searchParams.get('client_version')).toBe('9.9.9')
+  })
+
+  it('always announces client_kind, and omits client_label when none is stored', async () => {
+    // Every existing install reads as a desktop browser on the backend's
+    // roster; an absent label must not arrive as an empty string that a
+    // profile could be seeded with.
+    const url = await subscribeUrl()
+    expect(url.searchParams.get('client_kind')).toBe('desktop')
+    expect(url.searchParams.has('client_label')).toBe(false)
+  })
+
+  it('a server browser announces client_kind=server and its baked label', async () => {
+    vi.mocked(getConfig).mockResolvedValueOnce({ ...DESKTOP_CONFIG, kind: 'server', label: 'server browser' })
+
+    const url = await subscribeUrl()
+    expect(url.searchParams.get('client_kind')).toBe('server')
+    expect(url.searchParams.get('client_label')).toBe('server browser')
   })
 })
 

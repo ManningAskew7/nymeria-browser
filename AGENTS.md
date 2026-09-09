@@ -26,11 +26,16 @@ Design and review decisions in this stack weigh in this ORDER:
 
 ## The one picture to hold
 
-The EXTENSION runs in the USER'S Chrome on THEIR machine, not on the VPS.
-The BACKEND (chrome_* tools in `Nymeria/nymeria/tools/chrome_browser.py`)
-runs on the VPS, in the Docker stack (port 8000). The two halves meet over
-SSE: backend publishes browser commands, the user's extension executes and
-POSTs results. Consequences:
+The EXTENSION runs in ONE of two places: in the USER'S Chrome on THEIR
+machine (kind `desktop`, configured through the popup), or beside the
+backend as the SERVER BROWSER (kind `server`: a headless Chrome for Testing
+on the Nymeria host, configured by a baked `config.json`, no popup at all,
+installed and run by the backend's `nymeria browser` command). The BACKEND
+(chrome_* tools in `Nymeria/nymeria/tools/chrome_browser.py`) runs on the
+VPS, in the Docker stack (port 8000). The two halves meet over SSE: backend
+publishes browser commands, the extension executes and POSTs results; every
+subscribe announces its `client_kind` (and `client_label` when baked) so
+rosters and refusals can tell the two kinds apart. Consequences:
 
 - Extension deploy flow (live 2026-08-16): after pushing this repo, wait
   EXACTLY 3 minutes (the user's machine auto-pulls and rebuilds on its own
@@ -249,13 +254,17 @@ POSTs results. Consequences:
   rotating tokens). Derivation, measurements and sources:
   `Nymeria/docs/private/browser-login-research.md`.
 - Extension: `/opt/Project-Nymeria/nymeria-browser/`. Its OWN git repo
-  (`github.com/ManningAskew7/nymeria-browser`), gitignored inside the main
-  tree, push separately. Beta distribution artifact:
-  `scripts/package.sh` (optionally `--build`) zips dist into the
+  (`github.com/ManningAskew7/nymeria-browser`, PUBLIC since 2026-09-09, so
+  nothing private may land in it), gitignored inside the main tree, push
+  separately. Release: push a tag `v<manifest version>` and
+  `.github/workflows/release.yml` runs `npm ci`, `npm run check`,
+  `npm run build`, verifies `dist/manifest.json` equals the tag, runs
+  `scripts/package.sh`, and attaches the zip plus its `.zip.sha256` to a
+  GitHub Release (the backend pins one release by version and sha256).
+  Locally, `scripts/package.sh` (optionally `--build`) zips dist into the
   gitignored `release/nymeria-browser-v<version>.zip` (one top-level
-  folder inside, sha256 printed); the headless launcher's
-  `configure --source` accepts that zip directly. Web Store lodgement is
-  backlog #283. Module invariants live in module docstrings: read
+  folder inside, sha256 printed); `nymeria browser configure --source`
+  accepts that zip directly. Web Store lodgement is backlog #283. Module invariants live in module docstrings: read
   them before editing; this file is the standing map, not their
   replacement. Commits need a `Co-Authored-By:` trailer naming the model that
   actually did the work (`<noreply@anthropic.com>`). This line used to pin
@@ -285,6 +294,24 @@ POSTs results. Consequences:
   (measured: ungranted SW fetches follow ordinary CORS, granted ones
   bypass it entirely; `Nymeria/tests/test_cors_extension_origin.py` pins
   the server side).
+- Baked config (v0.29.0, the server browser; `bakedConfig.ts`): a
+  `config.json` beside the manifest carries `baseUrl`, `token`, and
+  optionally `clientId` (must start with `nymeria-browser-`, non-empty
+  after it), `kind` (`server` | `desktop`) and `label` (one printable
+  line, trimmed, max 60 chars). Each optional field degrades FIELD-WISE:
+  invalid = ignored with one warn line, the rest of the bake applies.
+  Adoption rule: adopt when storage is unconfigured OR when the file's
+  SHA-256 (raw text, `crypto.subtle`) differs from the stored `bakedHash`.
+  A re-adoption overwrites baseUrl/token/kind/label, takes the baked
+  clientId when present and otherwise KEEPS the stored one (a re-bake
+  without an id must not re-identify the browser to the roster). Forget
+  clears `bakedHash` with the config, so the next worker start re-adopts:
+  that is the "apply a changed config" path. Desktop builds ship no
+  config.json and are untouched (pinned by test); a v0.28.0 rig upgrading
+  re-adopts once (no stored hash) and keeps its clientId. Wire:
+  `client_kind` is on every subscribe (`desktop` by default),
+  `client_label` only when a label is stored; kind is information for
+  rosters and refusals, never a routing rule.
 - Page-status reporting (#175) is OPT-IN: the `webRequest` host grant comes
   from a dedicated popup button ("Page status reporting" row, Enable), NOT
   from Connect (`permissions.request` needs a direct user click; Connect's

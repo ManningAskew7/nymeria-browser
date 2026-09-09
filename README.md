@@ -15,7 +15,7 @@ Popup (React)  ──messages──►  Background service worker  ──fetch +
 ```
 
 - **Auth:** `Authorization: Bearer nym_…` against the user's personal Nymeria token (issued via `POST /me/tokens` on the backend).
-- **Push channel:** `/autonomous/stream?client_id=<ext-instance>` — same per-user firehose the desktop and mobile apps consume. The `client_id` round-trip prevents the extension from receiving the echo of its own publishes (none yet — relevant in Phase 2).
+- **Push channel:** `/autonomous/stream?client_id=<ext-instance>&client_kind=<server|desktop>`, the same per-user firehose the desktop and mobile apps consume. The `client_id` round-trip prevents the extension from receiving the echo of its own publishes (none yet; relevant in Phase 2). `client_kind` tells the backend's browser roster whether this is the server browser or your own Chrome (`desktop` unless a baked config says otherwise), and `client_label` rides along only when the bake set one.
 - **Reconnect:** exponential backoff with jitter, 1s floor, 60s ceiling, resets on the first successful event.
 - **SW lifecycle:** an SSE in-flight `fetch` keeps the service worker alive. A `chrome.alarms` heartbeat re-establishes the connection if the worker is recycled. The period is 1 minute because that is Chrome's floor for a packed extension; asking for less does not go faster, it just makes the real interval a surprise.
 - **Page control:** `chrome.debugger` (CDP), not content scripts. Input goes through `Input.dispatchMouseEvent`/`dispatchKeyEvent`, so events carry `isTrusted: true` and survive the payment and anti-bot layers that reject page-synthesized clicks. Out-of-process iframes are reached with flattened `Target.setAutoAttach` and per-frame `sessionId`s.
@@ -82,7 +82,10 @@ Load the unpacked extension from `dist/`:
 
 ## Install from the release zip (beta)
 
-Beta distribution is a packaged zip: no node, no build step.
+Beta distribution is a packaged zip: no node, no build step. This repo is
+public, and every tagged version is attached to a GitHub Release at
+<https://github.com/ManningAskew7/nymeria-browser/releases> as
+`nymeria-browser-v<version>.zip` beside its `.zip.sha256`.
 
 1. Unzip `nymeria-browser-v<version>.zip` anywhere permanent (Chrome loads
    the extension from that folder from then on; do not delete it).
@@ -96,10 +99,15 @@ Beta distribution is a packaged zip: no node, no build step.
    the new folder (the pinned ID keeps it the same extension to the
    backend), reconnect, and re-enable page status.
 
-Maintainer side: `scripts/package.sh` (optionally `--build`) zips `dist/`
-into `release/nymeria-browser-v<version>.zip` (gitignored) and prints its
-sha256. The headless launcher accepts the same zip via
-`configure --source <zip>`.
+Maintainer side: pushing a tag `v<version>` that matches
+`public/manifest.json` runs `.github/workflows/release.yml`, which checks,
+builds, verifies the built manifest version equals the tag, packages, and
+attaches the zip plus its `.zip.sha256` to a GitHub Release for that tag.
+The same packaging runs locally as `scripts/package.sh` (optionally
+`--build`), which zips `dist/` into the gitignored
+`release/nymeria-browser-v<version>.zip` and prints its sha256. The
+backend's `nymeria browser configure --source <zip>` accepts either zip
+directly.
 
 ## Connecting to a Nymeria backend
 
@@ -145,68 +153,36 @@ the popup, which rides the extension's loopback permission.
 
 On success the popup shows your identity, "Connected", and a running event counter. Send a chat via the CLI (`cd Nymeria && python3 run.py cli`) or another client — you'll see events tick over in the popup's "Last event" panel.
 
-## Headless server install (no display, no popup)
+## Headless server install: the server browser
 
-A VPS can run this extension in headless Chrome so a server-hosted Nymeria
-gets a fully driveable browser: `headless/nymeria-headless.sh` owns the
-whole flow (bash, curl, python3 only; no node on the server). Verified
-end-to-end on Chrome for Testing 152 (branded Google Chrome dropped
-`--load-extension` in v137, so the launcher installs Chrome for Testing).
+A Nymeria host can run this extension in a headless Chrome for Testing
+beside the backend, so a server-hosted Nymeria has a driveable browser out
+of the box. That browser is the **server browser**; the other kind is the
+extension in **your own Chrome**. The backend owns the flow now: the setup
+wizard (`nymeria init`) offers to install it, and `nymeria browser
+install|configure|run|stop|status|service` manages it afterwards
+(documented with the backend's deployment guides). `headless/nymeria-headless.sh`
+in this repo is the legacy bash launcher that command was ported from: it
+still runs on Linux but is no longer maintained and will be removed.
 
-```bash
-./headless/nymeria-headless.sh install     # fetch current stable Chrome for Testing
-./headless/nymeria-headless.sh configure \
-    --base-url https://nymeria.example.com --token <account-token> \
-    --source ./dist                        # a build dir, or a release zip
-./headless/nymeria-headless.sh run         # foreground; wrap in systemd
-./headless/nymeria-headless.sh status      # is Chrome up, is the worker there
-```
+What the extension does for it: the installer stages a copy of the release
+zip with the host permissions made required (no popup clicks) and bakes a
+`config.json` beside the manifest carrying `baseUrl`, `token`, and
+optionally `clientId` (must start with `nymeria-browser-`), `kind`
+(`server` or `desktop`) and `label` (one line, at most 60 characters). The
+worker adopts the file on first start and, since v0.29.0, re-adopts it on
+the next worker start whenever it has CHANGED (it keeps the SHA-256 of the
+file it adopted), so a re-bake with a new port or a rotated token takes
+effect without wiping the profile. An invalid optional field is ignored
+with one log line and the rest of the bake still applies; **Forget** clears
+the stored hash, so it too re-adopts on the next start. The bake announces
+itself on the stream as `client_kind=server` plus its `client_label`.
 
-How it works: `configure` copies the build, rewrites the manifest so the
-host permissions are REQUIRED (auto-granted at unpacked load: this replaces
-every popup click, page-status grant included), and writes a `config.json`
-(mode 600) the worker adopts at first startup. Storage wins once adopted:
-to apply a CHANGED config, remove the profile dir and rerun.
-
-Notes:
-- Sandbox: Ubuntu 23.10+ restricts unprivileged user namespaces via
-  AppArmor, so stock Chrome aborts at launch. Install the one-time
-  AppArmor profile from Chromium's apparmor-userns-restrictions doc
-  (root), or pass `run --no-sandbox` as an explicit, logged opt-out.
-- Sign-in compatibility: `run` overrides the User-Agent with the headful
-  string for the same Chrome build (derived from the binary, so it stays
-  correct across upgrades). Chrome's headless mode otherwise advertises
-  `HeadlessChrome/<v>`, which Google treats as a bot: measured 2026-08-28,
-  the stock UA gets Google's degraded sign-in flow and is refused at the
-  email step ("this browser or app may not be secure"), while the headful UA
-  gets the normal flow and is accepted. The refusal is a verdict on the
-  browser, not on the person typing, so a human driving it by hand is
-  refused identically. `--enable-automation` is never passed for the same
-  reason (it sets `navigator.webdriver`, an independent trigger). If Google
-  changes the rule server-side, `chrome_navigate` and the page reads surface
-  a "[Sign-in refused by Google]" note rather than letting it read as a bad
-  password.
-- Upgrading the extension: after re-staging a NEW build with `configure`,
-  launch with `run --fresh-profile`. An existing profile can serve the OLD
-  service-worker script from its cache even across a full browser restart,
-  while announcing the NEW manifest version (measured 2026-08-28: a QA
-  round ran entirely on stale code that reported the new build). The wipe
-  costs site logins/cookies; the baked config re-adopts automatically.
-- Several browsers per account are SUPPORTED since backend 2026-08-30
-  (single-browser routing, backlog #282): commands route to exactly one
-  selected browser (thread target > account default > auto when one is
-  connected; `/browser list|switch|default|rename`, agent-side
-  `chrome_target`), so a headless rig can share the account with a desktop
-  Chrome. The launcher's single-instance guard still matters: a stale twin
-  of the SAME staged profile shares its client_id, which routing cannot
-  tell apart (the backend's result-side client check makes it mostly
-  harmless, but kill the old instance properly with `stop`).
-- The baked token is a full account token sitting on the server (0600).
-  Use a dedicated account and rotate like any credential.
-- Systemd shape: a simple service with
-  `ExecStart=/path/nymeria-headless.sh run` and `Restart=on-failure`
-  under a linger-enabled user is sufficient; the profile dir keeps
-  identity across restarts.
+Several browsers can share one account (the server browser plus your own
+Chrome): the backend routes each command to exactly one selected browser
+(`/browser list|switch|default|rename`, agent-side `chrome_target`) and
+shows each browser's kind, so the agent can tell them apart and offer to
+switch when you connect your own.
 
 ### Signing the server browser into websites
 

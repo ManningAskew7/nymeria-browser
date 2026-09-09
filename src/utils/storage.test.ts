@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { clearConfig, ensureClientId, getConfig, setConfig } from './storage'
+import { BAKED_HASH_KEY, clearConfig, ensureClientId, getConfig, setConfig } from './storage'
 import { decryptData, encryptData } from './security'
 
 describe('encryptData / decryptData round-trip', () => {
@@ -53,6 +53,57 @@ describe('config storage', () => {
     expect(cfg.baseUrl).toBe('')
     expect(cfg.token).toBe('')
     expect(cfg.hasToken).toBe(false)
+  })
+
+  it('reads kind as desktop and label as empty when nothing stored them (pre-0.29 storage)', async () => {
+    // Storage written by a v0.28.0 worker: no kind or label keys at all.
+    await chrome.storage.local.set({
+      baseUrl: 'http://x',
+      clientId: 'nymeria-browser-old',
+      encryptedToken: await encryptData('nym_y'),
+    })
+    const cfg = await getConfig()
+    expect(cfg.token).toBe('nym_y')
+    expect(cfg.kind).toBe('desktop')
+    expect(cfg.label).toBe('')
+  })
+
+  it('round-trips kind and label', async () => {
+    await setConfig({ baseUrl: 'http://x', token: 'nym_y', kind: 'server', label: 'server browser' })
+    const cfg = await getConfig()
+    expect(cfg.kind).toBe('server')
+    expect(cfg.label).toBe('server browser')
+  })
+
+  it('a later setConfig without kind and label resets them rather than inheriting', async () => {
+    await setConfig({ baseUrl: 'http://x', token: 'nym_y', kind: 'server', label: 'server browser' })
+    await setConfig({ baseUrl: 'http://x', token: 'nym_z' })
+    const cfg = await getConfig()
+    expect(cfg.kind).toBe('desktop')
+    expect(cfg.label).toBe('')
+  })
+
+  it('setConfig with a supplied clientId stores it, and ensureClientId then returns it', async () => {
+    await ensureClientId()
+    await setConfig({ baseUrl: 'http://x', token: 'nym_y', clientId: 'nymeria-browser-rig-1' })
+    expect((await getConfig()).clientId).toBe('nymeria-browser-rig-1')
+    expect((await ensureClientId()).clientId).toBe('nymeria-browser-rig-1')
+  })
+
+  it('setConfig without a clientId keeps the one already stored', async () => {
+    await setConfig({ baseUrl: 'http://x', token: 'nym_y', clientId: 'nymeria-browser-rig-1' })
+    await setConfig({ baseUrl: 'http://x', token: 'nym_z' })
+    expect((await getConfig()).clientId).toBe('nymeria-browser-rig-1')
+  })
+
+  it('clearConfig also removes kind, label, and the baked hash', async () => {
+    await setConfig({ baseUrl: 'http://x', token: 'nym_y', kind: 'server', label: 'server browser' })
+    await chrome.storage.local.set({ [BAKED_HASH_KEY]: 'abc' })
+    await clearConfig()
+    const cfg = await getConfig()
+    expect(cfg.kind).toBe('desktop')
+    expect(cfg.label).toBe('')
+    expect(await chrome.storage.local.get(BAKED_HASH_KEY)).toEqual({})
   })
 
   it('ensureClientId is idempotent — same id on repeat calls', async () => {
